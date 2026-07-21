@@ -6,7 +6,6 @@ import csv
 import time
 import glob
 import multiprocessing
-from functools import partial
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -38,14 +37,12 @@ def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
     tokens = []
     
     with torch.no_grad():
-        # Correctly unpack 2 outputs from encoder
         encoder_outputs, hidden = model.encoder(src_tensor)
         hidden = model._bridge_hidden(hidden)
         
         current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
         
         for _ in range(max_len):
-            # Forward step returns (prediction, hidden)
             prediction, hidden = model.decoder.forward_step(current_token, hidden, encoder_outputs)
             best_guess = prediction.argmax(dim=1).item()
             
@@ -88,9 +85,10 @@ def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
         translated_sentences.append(tokens)
     return translated_sentences
 
+
 def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"⌛ Loading checkpoint: '{os.path.basename(checkpoint_path)}'")
+    print(f"⌛ Loading checkpoint for evaluation: '{os.path.basename(checkpoint_path)}'")
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
@@ -101,22 +99,22 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     src_lang, trg_lang = config.get('src_lang', 'en'), config.get('trg_lang', 'de')
     token_type, experiment_id = config.get('token_type', 'word'), config.get('experiment', 'Unknown')
 
-    # Differentiate max generation length between character and word levels
     max_len = 250 if token_type == "char" else 50
 
     if not test_csv:
         test_csv = os.path.join(ROOT_DIR, "data", "processed", f"test_{src_lang}_{trg_lang}.csv")
         if not os.path.exists(test_csv):
-            # Fallback for legacy files
             legacy_file = "test_sv.csv" if ("sv" in (src_lang, trg_lang)) else "test.csv"
             test_csv = os.path.join(ROOT_DIR, "data", "processed", legacy_file)
             
     if not os.path.exists(test_csv): 
         return
         
-    test_loader, _, _ = get_dataloader(test_csv, batch_size=config.get('batch_size', 2048), shuffle=False, src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type)
+    test_loader, _, _ = get_dataloader(
+        test_csv, batch_size=config.get('batch_size', 2048), shuffle=False, 
+        src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type
+    )
     
-    # Dataset Subsampling Logic
     if sample_size is not None:
         total_len = len(test_loader.dataset)
         if isinstance(sample_size, float) and 0.0 < sample_size <= 1.0:
@@ -168,7 +166,6 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     start_time = time.time()
     for src, trg in test_loader:
         src = src.to(device, non_blocking=True)
-        # Pass the token-type specific max_len to translation batch
         batch_hyps = translate_batch(model, src, trg_vocab, device, max_len=max_len)
         hypotheses.extend(batch_hyps)
         
@@ -251,16 +248,20 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     with open(ledger_path, 'w') as f: 
         json.dump(ledger_data, f, indent=4)
 
+
 def evaluate_all_local_models(token_type=None, sample_size=None, seed=42):
     search_dir = OUTPUT_DIR if os.path.exists(OUTPUT_DIR) else '.'
     for file in sorted(os.listdir(search_dir)):
         if file.startswith("best_model_") and file.endswith(".pt"):
+            if "TUNE_" in file.upper():
+                continue  # Skip hyperparameter tuning runs during bulk model evaluations
             if token_type and f"_{token_type.upper()}_" not in file.upper():
                 continue
             try: 
                 run_evaluation(os.path.join(search_dir, file), sample_size=sample_size, seed=seed)
             except Exception as e: 
                 print(f"⚠️ Skipping corrupt layout {file}: {e}")
+
 
 def visualize_sample_attention(model_path, test_csv, sample_index=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -347,11 +348,13 @@ def visualize_sample_attention(model_path, test_csv, sample_index=0):
         with open(fallback_csv_path, 'w', newline='') as f: 
             csv.writer(f).writerow(["Error", str(e)])
 
+
 def extract_study_id(filename):
     match = re.search(r'best_config_(.+?)_[A-Z]+\.json$', filename)
     if match:
         return match.group(1).upper()
     return filename.replace("best_config_", "").replace(".json", "").upper()
+
 
 def generate_csv_file(filepath, data_dict):
     headers = ["Study", "Model Config Tag", "Hyperparameters (LR / Dropout)", "Best Val Loss", "BLEU (↑)", "METEOR (↑)"]
@@ -390,12 +393,15 @@ def generate_csv_file(filepath, data_dict):
     except Exception: 
         pass
 
+
 def run_compile_results():
     search_dir = OUTPUT_DIR if os.path.exists(OUTPUT_DIR) else '.'
     master_ledger = {"metadata": {"status": "Complete"}, "word_level": {}, "character_level": {}}
     
     for file in sorted(os.listdir(search_dir)):
         if file.startswith("best_config_") and file.endswith(".json"):
+            if "TUNE_" in file.upper():
+                continue  # Exclude tuning run configs from master experiment ledger
             try:
                 with open(os.path.join(search_dir, file), 'r') as f: 
                     config_data = json.load(f)
@@ -431,6 +437,7 @@ def run_compile_results():
     
     generate_csv_file(os.path.join(ROOT_DIR, "word_level_metrics.csv"), master_ledger["word_level"])
     generate_csv_file(os.path.join(ROOT_DIR, "character_level_metrics.csv"), master_ledger["character_level"])
+
 
 if __name__ == "__main__":
     import argparse

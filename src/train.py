@@ -248,12 +248,10 @@ def main():
         )
     elif args.embedding_source == "glove":
         glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
-        # ⚡ Single-pass loading extracts both src and trg embeddings concurrently
         pretrained_src_emb, pretrained_trg_emb = load_glove_embeddings_pair(src_vocab, trg_vocab, glove_path, 300, silent=silent_logging)
         
     num_directions = 2 if args.bidirectional else 1
 
-    # Consistently pass padded_size or len(vocab) across both embeddings and projections
     src_vocab_size = src_vocab.padded_size if hasattr(src_vocab, 'padded_size') else len(src_vocab)
     trg_vocab_size = trg_vocab.padded_size if hasattr(trg_vocab, 'padded_size') else len(trg_vocab)
 
@@ -294,7 +292,6 @@ def main():
         
     if hasattr(torch, "compile"):
         try:
-            # Compile only the encoder (safe and fast!)
             raw_model = model.module if hasattr(model, "module") else model
             raw_model.encoder = torch.compile(raw_model.encoder)
             if rank == 0:
@@ -384,6 +381,7 @@ def main():
                         pass
                 break
 
+    # Automated Backfill Evaluation strictly for Main Study Experiments (Skipped for TUNE_ runs)
     if rank == 0:
         if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
             try:
@@ -393,7 +391,7 @@ def main():
                 
                 evaluate_script = os.path.join(SCRIPT_DIR, "evaluate.py")
                 if os.path.exists(evaluate_script):
-                    print(f"\n⌛ Automated Backfill: Executing evaluation metrics extraction...")
+                    print(f"\n⌛ Automated Backfill: Executing evaluation metrics extraction (BLEU & METEOR)...")
                     cmd = [sys.executable, evaluate_script, "evaluate", "--checkpoint", checkpoint_path]
                     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                     
