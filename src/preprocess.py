@@ -210,14 +210,12 @@ def process_and_save_pair(
     val_df.to_csv(val_path, index=False)
     test_df.to_csv(test_path, index=False)
 
-
 def execute_offline_caching(processed_dir, token_type="word"):
-    """Pre-tokenizes splits into binary tensor files and computes offline Word2Vec matrices."""
     print("\n" + "─" * 75)
     print("⚡ [OFFLINE BINARY CACHING & TENSOR PRE-SERIALIZATION]")
     print("─" * 75)
 
-    pairs = [("de", "en"), ("en", "sv")]
+    pairs = [("de", "en"), ("en", "de"), ("en", "sv")]
     for src, trg in pairs:
         pair_tag = f"{src}_{trg}"
         train_csv = get_split_path(processed_dir, "train", src, trg)
@@ -343,6 +341,15 @@ def main():
         cleaned_de_df,
         src_lang="de",
         trg_lang="en",
+        processed_dir=processed_dir,
+        test_split=test_split,
+        seed=seed,
+        mock=args.mock,
+    )
+    process_and_save_pair(
+        cleaned_de_df,
+        src_lang="en",
+        trg_lang="de",
         processed_dir=processed_dir,
         test_split=test_split,
         seed=seed,
