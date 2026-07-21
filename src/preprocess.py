@@ -178,7 +178,10 @@ def main():
 
     if IS_KAGGLE:
         print("🤖 Kaggle environment detected!")
-        processed_dir = "/kaggle/working/rnn-machine-translation/data/processed"
+        # Dynamically derive project root relative to script location
+        SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+        REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+        processed_dir = os.path.join(REPO_ROOT, "data", "processed")
         found_files = {}
         for root, dirs, files in os.walk("/kaggle/input"):
             for f in files:

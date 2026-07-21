@@ -297,65 +297,6 @@ def get_best_hyperparameters(stage, token_type, rnn_type=None):
         return default_args
 
 
-def generate_study_reports(token_type):
-    print("\n" + "="*80 + f"\n📊 GENERATING ISOLATED STUDY REPORT MATRICES ({token_type.upper()})\n" + "="*80)
-    
-    ledger = {}
-    pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
-    for filepath in glob.glob(pattern):
-        try:
-            with open(filepath, 'r') as f:
-                ledger.update(json.load(f))
-        except Exception: pass
-        
-    if not ledger:
-        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers.")
-        return
-        
-    study_buckets = {}
-    sorted_run_ids = sorted(ledger.keys())
-    for run_id in sorted_run_ids:
-        node = ledger[run_id]
-        cell = node.get("rnn_type", "RNN")
-        bidi = "Bi" if str(node.get("bidirectional", "")).lower() == "true" else "Uni"
-        attn = node.get("attention_type", "none")
-        emb = node.get("embedding_source", "scratch")
-        
-        if "PIVOT" in run_id.upper():
-            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
-            study_group = "PIVOT"
-        else:
-            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
-            if attn != "none":
-                variant_desc += f" w/ {attn.capitalize()} Attn"
-            
-            match = re.search(r'_(A|B|C|D|E)\d*', run_id.upper())
-            study_group = match.group(1) if match else "MISC"
-            
-        bleu = float(node.get("metrics", {}).get("overall_corpus_bleu", 0.0))
-        m2 = float(node.get("metrics", {}).get("mean_meteor", 0.0))
-        tt = node.get("train_time", "N/A")
-        it = node.get("inference_time", "N/A")
-        
-        sid = run_id.split("_")[1] if "_" in run_id else run_id
-        family = f"{token_type.capitalize()}-Level"
-        
-        if study_group not in study_buckets:
-            study_buckets[study_group] = []
-            
-        study_buckets[study_group].append([
-            family, f"Study {sid}", variant_desc, f"{bleu:.2f}", f"{m2:.2f}", tt, it
-        ])
-        
-    for study_group, records in study_buckets.items():
-        report_path = os.path.join(REPO_ROOT, f"study_{study_group}_report_{token_type}.csv")
-        with open(report_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"])
-            writer.writerows(records)
-        print(f"💾 Isolated Study Matrix Saved -> study_{study_group}_report_{token_type}.csv")
-
-
 def get_best_empirical_settings(token_type):
     profile = config.get('profiles', {}).get(token_type, {})
     defaults = {
@@ -436,7 +377,102 @@ def get_best_empirical_settings(token_type):
     except Exception: pass
     return defaults
 
+def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
+    """
+    Single-pass loader: Reads all JSON ledgers for the given token_type once
+    and normalizes them into a unified Pandas DataFrame.
+    """
+    pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
+    ledger_data = {}
+    
+    # Single disk pass to gather all JSON records
+    for filepath in glob.glob(pattern):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                ledger_data.update(json.load(f))
+        except Exception:
+            pass
 
+    if not ledger_data:
+        return pd.DataFrame()
+
+    records = []
+    for run_id, node in ledger_data.items():
+        cell = node.get("rnn_type", "RNN")
+        bidi = "Bi" if str(node.get("bidirectional", "")).lower() == "true" else "Uni"
+        attn = node.get("attention_type", "none")
+        emb = node.get("embedding_source", "scratch")
+
+        if "PIVOT" in run_id.upper():
+            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
+            study_group = "PIVOT"
+        else:
+            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
+            if attn != "none":
+                variant_desc += f" w/ {attn.capitalize()} Attn"
+            match = re.search(r'_(A|B|C|D|E)\d*', run_id.upper())
+            study_group = match.group(1) if match else "MISC"
+
+        metrics = node.get("metrics", {})
+        bleu = float(metrics.get("overall_corpus_bleu", 0.0))
+        meteor = float(metrics.get("mean_meteor", 0.0))
+        sid = run_id.split("_")[1] if "_" in run_id else run_id
+
+        records.append({
+            "Run ID": run_id,
+            "Tokenization": f"{token_type.capitalize()}-Level",
+            "Study ID": f"Study {sid}",
+            "Top Study Run": f"Study {sid}",
+            "Study Group": study_group,
+            "Architectural Variant": variant_desc,
+            "Best Architectural Variant": variant_desc,
+            "BLEU Score": round(bleu, 2),
+            "Metric 2 (METEOR)": round(meteor, 2),
+            "Train Time": node.get("train_time", "N/A"),
+            "Inference Time": node.get("inference_time", "N/A"),
+            # Composite score used for ranking champions
+            "_composite_score": bleu + (meteor * 100.0)
+        })
+
+    return pd.DataFrame(records)
+
+
+def generate_all_reports(token_type: str):
+    """
+    Generates isolated study CSVs, consolidated report CSVs, and best-of-studies
+    reports in a single pass using vectorized DataFrame operations.
+    """
+    df = load_evaluation_ledger_df(token_type)
+    
+    if df.empty:
+        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers.")
+        return
+
+    print("\n" + "="*80 + f"\n📊 GENERATING ALL EVALUATION REPORTS ({token_type.upper()})\n" + "="*80)
+    
+    export_cols = ["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
+
+    # 1. Generate Consolidated Report CSV & Display Table
+    consolidated_path = os.path.join(REPO_ROOT, f"consolidated_evaluation_report_{token_type}.csv")
+    df[export_cols].to_csv(consolidated_path, index=False)
+    print(f"💾 Consolidated Report Saved -> {consolidated_path}")
+
+    # 2. Generate Isolated Study Reports via Vectorized Grouping
+    for group_name, group_df in df.groupby("Study Group"):
+        study_path = os.path.join(REPO_ROOT, f"study_{group_name}_report_{token_type}.csv")
+        group_df[export_cols].to_csv(study_path, index=False)
+        print(f"💾 Isolated Study Matrix Saved -> study_{group_name}_report_{token_type}.csv")
+
+    # 3. Generate Best-Of-Studies Report (Champion per study group)
+    best_idx = df.groupby("Study Group")["_composite_score"].idxmax()
+    best_df = df.loc[best_idx].sort_values("Study Group")
+    
+    best_export_cols = ["Tokenization", "Top Study Run", "Best Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
+    best_path = os.path.join(REPO_ROOT, f"best_of_studies_report_{token_type}.csv")
+    best_df[best_export_cols].to_csv(best_path, index=False)
+    
+    print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
+    
 def execute_preprocessing(token_type="word", mock_mode=False):
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "preprocess.py"), "--token_type", token_type]
     if mock_mode:
@@ -444,71 +480,6 @@ def execute_preprocessing(token_type="word", mock_mode=False):
     
     print(f"⚡ Running preprocessing routine (token_type={token_type}, mock={mock_mode})...")
     subprocess.run(cmd, check=True)
-
-
-def generate_consolidated_report(token_type):
-    print("\n" + "="*80 + f"\n📊 CONSOLIDATING EXPERIMENT REGISTRY REPORT ({token_type.upper()})\n" + "="*80)
-    
-    ledger = {}
-    pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
-    for filepath in glob.glob(pattern):
-        try:
-            with open(filepath, 'r') as f:
-                ledger.update(json.load(f))
-        except Exception: pass
-        
-    table_lines = ["| Tokenization | Study ID | Architectural Variant | BLEU (↑) | Metric 2 (↑) | Train Time | Inference Time |", "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"]
-    csv_records = []
-    
-    if not ledger:
-        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers. Skipping table.")
-        return
-        
-    sorted_run_ids = sorted(ledger.keys())
-    bleu_scores = [float(node.get("metrics", {}).get("overall_corpus_bleu", 0.0)) for node in ledger.values() if "metrics" in node]
-    m2_scores = [float(node.get("metrics", {}).get("mean_meteor", 0.0)) for node in ledger.values() if "metrics" in node]
-    max_bleu = max(bleu_scores) if bleu_scores else -1.0
-    max_m2 = max(m2_scores) if m2_scores else -1.0
-    
-    family = f"{token_type.capitalize()}-Level"
-    for idx, run_id in enumerate(sorted_run_ids):
-        node = ledger[run_id]
-        cell = node.get("rnn_type", "RNN")
-        bidi = "Bi" if str(node.get("bidirectional", "")).lower() == "true" else "Uni"
-        attn = node.get("attention_type", "none")
-        emb = node.get("embedding_source", "scratch")
-        
-        if "PIVOT" in run_id.upper():
-            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
-        else:
-            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
-            if attn != "none":
-                variant_desc += f" w/ {attn.capitalize()} Attn"
-            
-        bleu = float(node.get("metrics", {}).get("overall_corpus_bleu", 0.0))
-        m2 = float(node.get("metrics", {}).get("mean_meteor", 0.0))
-        tt = node.get("train_time", "N/A")
-        it = node.get("inference_time", "N/A")
-        
-        bleu_str = f"{bleu:.2f}"
-        m2_str = f"{m2:.2f}"
-        
-        if bleu == max_bleu and max_bleu > 0:
-            bleu_str = f"**{bleu_str}**"
-        if m2 == max_m2 and max_m2 > 0:
-            m2_str = f"**{m2_str}**"
-            
-        sid = run_id.split("_")[1] if "_" in run_id else run_id
-        table_lines.append(f"| {family if idx == 0 else ''} | Study {sid} | {variant_desc} | {bleu_str} | {m2_str} | {tt} | {it} |")
-        csv_records.append([family, f"Study {sid}", variant_desc, f"{bleu:.2f}", f"{m2:.2f}", tt, it])
-        
-    print("\n".join(table_lines))
-    
-    report_path = os.path.join(REPO_ROOT, f"consolidated_evaluation_report_{token_type}.csv")
-    with open(report_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"])
-        writer.writerows(csv_records)
 
 
 def run_automated_post_processing(token_type, rnn_type):
@@ -546,78 +517,6 @@ def run_automated_post_processing(token_type, rnn_type):
     if os.path.exists(attn_model):
         try: subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "visualize", "--model", attn_model], check=True)
         except Exception: pass
-
-
-def generate_best_of_studies_report(token_type):
-    print("\n" + "="*80 + f"\n🏆 AGGREGATING TOP EXPERIMENT PER STUDY FAMILY ({token_type.upper()})\n" + "="*80)
-    
-    ledger = {}
-    pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
-    for filepath in glob.glob(pattern):
-        try:
-            with open(filepath, 'r') as f:
-                ledger.update(json.load(f))
-        except Exception: pass
-        
-    if not ledger:
-        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers.")
-        return
-
-    study_groups = {}
-    for run_id, node in ledger.items():
-        match = re.search(r'_(A|B|C|D|E)\d*|_(PIVOT)', run_id.upper())
-        group_name = match.group(1) or match.group(2) if match else "MISC"
-        
-        if group_name not in study_groups:
-            study_groups[group_name] = []
-        study_groups[group_name].append((run_id, node))
-
-    best_records = []
-    csv_records = []
-    family = f"{token_type.capitalize()}-Level"
-    
-    for group in sorted(study_groups.keys()):
-        runs_in_group = study_groups[group]
-        
-        best_run_id, best_node = max(
-            runs_in_group, 
-            key=lambda x: float(x[1].get("metrics", {}).get("overall_corpus_bleu", 0.0)) + (float(x[1].get("metrics", {}).get("mean_meteor", 0.0)) * 100.0)
-        )
-        
-        cell = best_node.get("rnn_type", "RNN")
-        bidi = "Bi" if str(best_node.get("bidirectional", "")).lower() == "true" else "Uni"
-        attn = best_node.get("attention_type", "none")
-        emb = best_node.get("embedding_source", "scratch")
-        
-        if "PIVOT" in best_run_id.upper():
-            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
-        else:
-            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
-            if attn != "none":
-                variant_desc += f" w/ {attn.capitalize()} Attn"
-                
-        bleu = float(best_node.get("metrics", {}).get("overall_corpus_bleu", 0.0))
-        m2 = float(best_node.get("metrics", {}).get("mean_meteor", 0.0))
-        tt = best_node.get("train_time", "N/A")
-        it = best_node.get("inference_time", "N/A")
-        
-        sid = best_run_id.split("_")[1] if "_" in best_run_id else best_run_id
-        
-        best_records.append(f"| {family} | Study {sid} | {variant_desc} | **{bleu:.2f}** | **{m2:.2f}** | {tt} | {it} |")
-        csv_records.append([family, f"Study {sid}", variant_desc, f"{bleu:.2f}", f"{m2:.2f}", tt, it])
-
-    table_lines = [
-        "| Tokenization | Top Study Run | Best Architectural Variant | BLEU (↑) | METEOR (↑) | Train Time | Inference Time |", 
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
-    ] + best_records
-    print("\n".join(table_lines))
-    
-    report_path = os.path.join(REPO_ROOT, f"best_of_studies_report_{token_type}.csv")
-    with open(report_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Tokenization", "Top Study Run", "Best Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"])
-        writer.writerows(csv_records)
-    print(f"\n💾 Aggregated champion ledger saved successfully to: {report_path}")
 
 
 def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
@@ -987,8 +886,6 @@ if __name__ == "__main__":
                 best = get_best_empirical_settings(token_type=pathway)
                 
                 run_automated_post_processing(token_type=pathway, rnn_type=best["rnn_type"])
-                generate_consolidated_report(token_type=pathway)
-                generate_study_reports(token_type=pathway)
-                generate_best_of_studies_report(token_type=pathway)
+                generate_all_reports(token_type=pathway)
     finally:
         eval_queue.shutdown()
