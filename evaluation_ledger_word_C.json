@@ -1,21 +1,21 @@
 {
-    "WORD_A1": {
+    "WORD_C1": {
         "rnn_type": "RNN",
         "bidirectional": false,
         "embedding_source": "scratch",
         "freeze_emb": false,
         "attention_type": "none",
-        "train_time": "4.7s",
-        "inference_time": "73.7ms / sent",
+        "train_time": "4.8s",
+        "inference_time": "89.9ms / sent",
         "metrics": {
-            "overall_corpus_bleu": 2.6281999084421073,
-            "mean_meteor": 0.10828625235404894
+            "overall_corpus_bleu": 5.031725704513461,
+            "mean_meteor": 0.11872759856630824
         },
         "length_bucket_analysis": {
             "Short (1-10 tokens)": {
                 "sample_count": 4,
-                "bleu": 2.63,
-                "meteor": 0.1083
+                "bleu": 5.03,
+                "meteor": 0.1187
             },
             "Medium (11-20 tokens)": {
                 "sample_count": 0,
@@ -34,58 +34,23 @@
             }
         }
     },
-    "WORD_A2": {
+    "WORD_C2": {
         "rnn_type": "RNN",
-        "bidirectional": true,
-        "embedding_source": "scratch",
-        "freeze_emb": false,
-        "attention_type": "none",
-        "train_time": "8.4s",
-        "inference_time": "71.5ms / sent",
-        "metrics": {
-            "overall_corpus_bleu": 2.836267819834636,
-            "mean_meteor": 0.2787959502764798
-        },
-        "length_bucket_analysis": {
-            "Short (1-10 tokens)": {
-                "sample_count": 4,
-                "bleu": 2.84,
-                "meteor": 0.2788
-            },
-            "Medium (11-20 tokens)": {
-                "sample_count": 0,
-                "bleu": 0.0,
-                "meteor": 0.0
-            },
-            "Long (21-30 tokens)": {
-                "sample_count": 0,
-                "bleu": 0.0,
-                "meteor": 0.0
-            },
-            "Very Long (31+ tokens)": {
-                "sample_count": 0,
-                "bleu": 0.0,
-                "meteor": 0.0
-            }
-        }
-    },
-    "WORD_A3": {
-        "rnn_type": "GRU",
         "bidirectional": false,
         "embedding_source": "scratch",
         "freeze_emb": false,
         "attention_type": "none",
-        "train_time": "7.7s",
-        "inference_time": "68.7ms / sent",
+        "train_time": "8.0s",
+        "inference_time": "75.7ms / sent",
         "metrics": {
-            "overall_corpus_bleu": 0.8533418657851908,
-            "mean_meteor": 0.06309041835357625
+            "overall_corpus_bleu": 5.031725704513461,
+            "mean_meteor": 0.11872759856630824
         },
         "length_bucket_analysis": {
             "Short (1-10 tokens)": {
                 "sample_count": 4,
-                "bleu": 0.85,
-                "meteor": 0.0631
+                "bleu": 5.03,
+                "meteor": 0.1187
             },
             "Medium (11-20 tokens)": {
                 "sample_count": 0,
@@ -104,23 +69,58 @@
             }
         }
     },
-    "WORD_A4": {
-        "rnn_type": "GRU",
-        "bidirectional": true,
+    "WORD_C3": {
+        "rnn_type": "RNN",
+        "bidirectional": false,
         "embedding_source": "scratch",
         "freeze_emb": false,
-        "attention_type": "none",
+        "attention_type": "luong",
+        "train_time": "9.4s",
+        "inference_time": "79.4ms / sent",
+        "metrics": {
+            "overall_corpus_bleu": 0,
+            "mean_meteor": 0.0
+        },
+        "length_bucket_analysis": {
+            "Short (1-10 tokens)": {
+                "sample_count": 4,
+                "bleu": 0,
+                "meteor": 0.0
+            },
+            "Medium (11-20 tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            },
+            "Long (21-30 tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            },
+            "Very Long (31+ tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            }
+        }
+    },
+    "WORD_C4": {
+        "rnn_type": "RNN",
+        "bidirectional": false,
+        "embedding_source": "scratch",
+        "freeze_emb": false,
+        "attention_type": "bahdanau",
         "train_time": "8.5s",
-        "inference_time": "71.0ms / sent",
+        "inference_time": "94.9ms / sent",
         "metrics": {
-            "overall_corpus_bleu": 2.4481200408873858,
-            "mean_meteor": 0.14131564707222602
+            "overall_corpus_bleu": 1.094832565700752,
+            "mean_meteor": 0.04852556924225457
         },
         "length_bucket_analysis": {
             "Short (1-10 tokens)": {
                 "sample_count": 4,
-                "bleu": 2.45,
-                "meteor": 0.1413
+                "bleu": 1.09,
+                "meteor": 0.0485
             },
             "Medium (11-20 tokens)": {
                 "sample_count": 0,
@@ -139,58 +139,58 @@
             }
         }
     },
-    "WORD_A5": {
-        "rnn_type": "LSTM",
-        "bidirectional": false,
-        "embedding_source": "scratch",
-        "freeze_emb": false,
-        "attention_type": "none",
-        "train_time": "8.2s",
-        "inference_time": "115.4ms / sent",
-        "metrics": {
-            "overall_corpus_bleu": 0.5436610631910919,
-            "mean_meteor": 0.049103737604881764
-        },
-        "length_bucket_analysis": {
-            "Short (1-10 tokens)": {
-                "sample_count": 4,
-                "bleu": 0.54,
-                "meteor": 0.0491
-            },
-            "Medium (11-20 tokens)": {
-                "sample_count": 0,
-                "bleu": 0.0,
-                "meteor": 0.0
-            },
-            "Long (21-30 tokens)": {
-                "sample_count": 0,
-                "bleu": 0.0,
-                "meteor": 0.0
-            },
-            "Very Long (31+ tokens)": {
-                "sample_count": 0,
-                "bleu": 0.0,
-                "meteor": 0.0
-            }
-        }
-    },
-    "WORD_A6": {
-        "rnn_type": "LSTM",
+    "WORD_C5": {
+        "rnn_type": "RNN",
         "bidirectional": true,
         "embedding_source": "scratch",
         "freeze_emb": false,
-        "attention_type": "none",
-        "train_time": "9.1s",
-        "inference_time": "54.2ms / sent",
+        "attention_type": "luong",
+        "train_time": "8.5s",
+        "inference_time": "94.3ms / sent",
         "metrics": {
-            "overall_corpus_bleu": 1.2823362240737008,
-            "mean_meteor": 0.039302382706951605
+            "overall_corpus_bleu": 1.5999026065386828,
+            "mean_meteor": 0.20267016892681783
         },
         "length_bucket_analysis": {
             "Short (1-10 tokens)": {
                 "sample_count": 4,
-                "bleu": 1.28,
-                "meteor": 0.0393
+                "bleu": 1.6,
+                "meteor": 0.2027
+            },
+            "Medium (11-20 tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            },
+            "Long (21-30 tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            },
+            "Very Long (31+ tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            }
+        }
+    },
+    "WORD_C6": {
+        "rnn_type": "RNN",
+        "bidirectional": true,
+        "embedding_source": "scratch",
+        "freeze_emb": false,
+        "attention_type": "bahdanau",
+        "train_time": "7.7s",
+        "inference_time": "61.7ms / sent",
+        "metrics": {
+            "overall_corpus_bleu": 1.5999026065386828,
+            "mean_meteor": 0.20267016892681783
+        },
+        "length_bucket_analysis": {
+            "Short (1-10 tokens)": {
+                "sample_count": 4,
+                "bleu": 1.6,
+                "meteor": 0.2027
             },
             "Medium (11-20 tokens)": {
                 "sample_count": 0,
