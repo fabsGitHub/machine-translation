@@ -133,7 +133,9 @@ def preprocess_data(df, src_col="de", trg_col="en", token_type="word", max_word_
 def process_and_save_pair(df, src_lang, trg_lang, processed_dir, test_split, seed, mock=False, legacy_alias=None):
     """Splits data and saves to standard mutual paths: <split>_<src>_<trg>.csv"""
     if mock:
-        train_df, val_df, test_df = df.iloc[:3], df.iloc[3:4], df.iloc[4:]
+        train_df = df
+        val_df = df.iloc[3:4]
+        test_df = df.iloc[4:]
     else:
         train_val_df, test_df = train_test_split(df, test_size=test_split, random_state=seed)
         train_df, val_df = train_test_split(train_val_df, test_size=0.10, random_state=seed)
