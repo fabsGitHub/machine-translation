@@ -32,7 +32,8 @@ class NoAttention(AttentionStrategy):
     def forward(self, decoder_hidden, encoder_outputs, projected_encoder=None, mask=None):
         batch_size = encoder_outputs.size(0)
         src_len = encoder_outputs.size(1)
-        return torch.zeros(batch_size, 1, src_len, device=encoder_outputs.device)
+        tgt_len = decoder_hidden.size(1) if decoder_hidden.dim() == 3 else 1
+        return torch.zeros(batch_size, tgt_len, src_len, device=encoder_outputs.device)
 
 class LuongAttention(AttentionStrategy):
     def __init__(self, encoder_hidden_dim, decoder_hidden_dim):
@@ -43,10 +44,15 @@ class LuongAttention(AttentionStrategy):
         if projected_encoder is None:
             projected_encoder = self.attn(encoder_outputs)
             
-        scores = torch.bmm(decoder_hidden.unsqueeze(1), projected_encoder.permute(0, 2, 1))
+        if decoder_hidden.dim() == 2:
+            decoder_hidden = decoder_hidden.unsqueeze(1)
+            
+        scores = torch.bmm(decoder_hidden, projected_encoder.permute(0, 2, 1))
         if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(1)
             scores = scores.masked_fill(mask == 0, -1e4)
-        return torch.softmax(scores, dim=2)
+        return torch.softmax(scores, dim=-1)
 
 class BahdanauAttention(AttentionStrategy):
     def __init__(self, encoder_hidden_dim, decoder_hidden_dim):
@@ -56,13 +62,21 @@ class BahdanauAttention(AttentionStrategy):
         self.v_a = nn.Linear(decoder_hidden_dim, 1, bias=False)
         
     def forward(self, decoder_hidden, encoder_outputs, projected_encoder=None, mask=None):
-        query = self.W_a(decoder_hidden).unsqueeze(1)
         keys = projected_encoder if projected_encoder is not None else self.U_a(encoder_outputs)
-        energy = torch.tanh(query + keys)
-        scores = self.v_a(energy).squeeze(2).unsqueeze(1)
+        if decoder_hidden.dim() == 2:
+            query = self.W_a(decoder_hidden).unsqueeze(1)
+            energy = torch.tanh(query.unsqueeze(2) + keys.unsqueeze(1))
+            scores = self.v_a(energy).squeeze(-1)
+        else:
+            query = self.W_a(decoder_hidden)
+            energy = torch.tanh(query.unsqueeze(2) + keys.unsqueeze(1))
+            scores = self.v_a(energy).squeeze(-1)
+            
         if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(1)
             scores = scores.masked_fill(mask == 0, -1e4)
-        return torch.softmax(scores, dim=2)
+        return torch.softmax(scores, dim=-1)
 
 # ============================================================================
 # ENCODER MODULE
@@ -122,6 +136,8 @@ class Decoder(nn.Module):
         self.padded_output_dim = pad_vocab_size(output_dim, multiple=16)
         self.rnn_type = rnn_type
         self.attention_type = attention_type
+        self.encoder_hidden_dim = encoder_hidden_dim
+        self.decoder_hidden_dim = decoder_hidden_dim
         
         if pretrained_embeddings is not None:
             actual_emb_dim = pretrained_embeddings.shape[1]
@@ -154,10 +170,30 @@ class Decoder(nn.Module):
         self.fc_out = nn.Linear(decoder_hidden_dim, self.padded_output_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward_vectorized(self, trg, hidden):
-        """Parallel non-sequential forward pass for Teacher Forcing (100% ratio)."""
+    def forward_vectorized(self, trg, hidden, encoder_outputs=None):
+        """
+        Parallel non-sequential forward pass for Teacher Forcing (100% ratio).
+        Vectorizes teacher-forced attention during training using torch.bmm.
+        """
         embedded = self.dropout(self.project(self.embedding(trg)))
-        output, hidden = self.rnn(embedded, hidden)
+        
+        if self.attention_type != "none" and encoder_outputs is not None:
+            batch_size, seq_len, _ = embedded.shape
+            zeros_context = torch.zeros(
+                batch_size, seq_len, self.encoder_hidden_dim, 
+                device=trg.device, dtype=embedded.dtype
+            )
+            initial_input = torch.cat((embedded, zeros_context), dim=2)
+            initial_outputs, _ = self.rnn(initial_input, hidden)
+            
+            attn_weights = self.attention(initial_outputs, encoder_outputs)
+            context = torch.bmm(attn_weights, encoder_outputs)
+            
+            full_input = torch.cat((embedded, context), dim=2)
+            output, hidden = self.rnn(full_input, hidden)
+        else:
+            output, hidden = self.rnn(embedded, hidden)
+            
         prediction = self.fc_out(output)
         return prediction, hidden
 
@@ -207,10 +243,10 @@ class Seq2Seq(nn.Module):
         encoder_outputs, hidden = self.encoder(src)
         hidden = self._bridge_hidden(hidden)
 
-        # ⚡ OPTIMIZATION: Zero-overhead padding for Fully Vectorized Matrix Pass
-        if teacher_forcing_ratio == 1.0 and self.decoder.attention_type == "none":
+        # ⚡ OPTIMIZATION: Zero-overhead padding for Fully Vectorized Matrix Pass during Teacher Forcing
+        if teacher_forcing_ratio == 1.0:
             trg_input = trg[:, :-1]
-            predictions, _ = self.decoder.forward_vectorized(trg_input, hidden)
+            predictions, _ = self.decoder.forward_vectorized(trg_input, hidden, encoder_outputs)
             # Efficiently pad time dimension on the left without creating & slicing extra tensors
             return F.pad(predictions, (0, 0, 1, 0))
 

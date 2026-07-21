@@ -9,6 +9,7 @@ import time
 import glob
 import itertools
 import random
+import threading
 import matplotlib
 import torch
 import re
@@ -27,6 +28,8 @@ CONFIG_PATH = os.path.join(REPO_ROOT, "config", "config.yaml")
 config = load_config(CONFIG_PATH)
 set_seed(config.get('system', {}).get('seed', 42))
 
+eval_lock = threading.Lock()
+
 
 def get_batch_size(study, token_type):
     """
@@ -43,19 +46,20 @@ def get_batch_size(study, token_type):
 class AsyncEvaluationQueue:
     """
     Offloads evaluation and ledger synchronization to background CPU threads,
-    allowing the GPU to immediately begin training the next model.
+    allowing the GPU to immediately begin training the next model without VRAM contention.
     """
     def __init__(self, max_workers=2):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.futures = []
 
     def submit_evaluation(self, experiment_id, rnn_type, token_type):
-        """Queues evaluation in the background without blocking GPU execution."""
+        """Queues evaluation in the background strictly on CPU without blocking GPU execution."""
         def _task():
-            print(f"\n⚡ [Async Eval Started] -> {experiment_id} ({rnn_type})")
-            run_auto_evaluation(experiment_id, rnn_type)
-            sync_ledger_to_token_type(token_type)
-            print(f"✅ [Async Eval Finished] -> {experiment_id} ({rnn_type})")
+            with eval_lock:
+                print(f"\n⚡ [Async Eval Started] -> {experiment_id} ({rnn_type}) [Forced CPU Mode]")
+                run_auto_evaluation(experiment_id, rnn_type)
+                sync_ledger_to_token_type(token_type)
+                print(f"✅ [Async Eval Finished] -> {experiment_id} ({rnn_type})")
 
         future = self.executor.submit(_task)
         self.futures.append(future)
@@ -181,10 +185,16 @@ def run_cmd(args_list):
 
 
 def run_auto_evaluation(experiment_id, rnn_type):
+    """
+    Executes model evaluation strictly on CPU to eliminate GPU contention and OOM crashes.
+    """
     target_model = os.path.join(OUTPUT_DIR, f"best_model_{experiment_id}_{rnn_type}.pt")
     if os.path.exists(target_model):
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "evaluate", "--checkpoint", target_model]
-        try: subprocess.run(cmd, check=True)
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ""  # Force evaluation processes to run strictly on CPU
+        try: 
+            subprocess.run(cmd, check=True, env=env)
         except subprocess.CalledProcessError:
             print(f"⚠️ Process protection enabled for {experiment_id}. Processing via fallback structures.")
 
@@ -375,6 +385,7 @@ def get_best_empirical_settings(token_type):
     except Exception: pass
     return defaults
 
+
 def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
     pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
     ledger_data = {}
@@ -458,6 +469,7 @@ def generate_all_reports(token_type: str):
     
     print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
 
+
 def execute_preprocessing(token_type="word", mock_mode=False):
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "preprocess.py"), "--token_type", token_type]
     if mock_mode:
@@ -468,15 +480,18 @@ def execute_preprocessing(token_type="word", mock_mode=False):
 
 
 def run_automated_post_processing(token_type, rnn_type):
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+
     try: 
-        subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "evaluate", "--token_type", token_type], check=True)
+        subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "evaluate", "--token_type", token_type], check=True, env=env)
     except Exception: pass
 
     de_en_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_D2_{rnn_type}.pt")
     en_sv_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_E1_{rnn_type}.pt")
     if os.path.exists(de_en_model) and os.path.exists(en_sv_model):
         try: 
-            subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "pivot.py"), "--de_en_model", de_en_model, "--en_sv_model", en_sv_model, "--text", "maschinelles lernen macht unglaublichen spass"], check=True)
+            subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "pivot.py"), "--de_en_model", de_en_model, "--en_sv_model", en_sv_model, "--text", "maschinelles lernen macht unglaublichen spass"], check=True, env=env)
         except Exception: pass
 
         print(f"\n📊 Launching Formal Quantitative Pivot Dataset Evaluation (DE ➔ EN ➔ SV)...")
@@ -488,19 +503,19 @@ def run_automated_post_processing(token_type, rnn_type):
                 "--evaluate",
                 "--token_type", token_type,
                 "--experiment", f"{token_type.upper()}_PIVOT"
-            ], check=True)
+            ], check=True, env=env)
             sync_ledger_to_token_type(token_type)
         except Exception as e:
             print(f"⚠️ Quantitative pivot dataset evaluation interrupted or unsupported: {e}")
 
     try: 
-        subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "compile", "--token_type", token_type], check=True)
+        subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "compile", "--token_type", token_type], check=True, env=env)
     except Exception: pass
 
     attn_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_C4_{rnn_type}.pt")
     if not os.path.exists(attn_model): attn_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_C3_{rnn_type}.pt")
     if os.path.exists(attn_model):
-        try: subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "visualize", "--model", attn_model], check=True)
+        try: subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "visualize", "--model", attn_model], check=True, env=env)
         except Exception: pass
 
 
