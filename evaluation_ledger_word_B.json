@@ -1,0 +1,37 @@
+{
+    "WORD_B1": {
+        "rnn_type": "RNN",
+        "bidirectional": false,
+        "embedding_source": "scratch",
+        "freeze_emb": false,
+        "attention_type": "none",
+        "train_time": "15.2s",
+        "inference_time": "78.8ms / sent",
+        "metrics": {
+            "overall_corpus_bleu": 2.266972787859904,
+            "mean_meteor": 0.08873456790123456
+        },
+        "length_bucket_analysis": {
+            "Short (1-10 tokens)": {
+                "sample_count": 4,
+                "bleu": 2.27,
+                "meteor": 0.0887
+            },
+            "Medium (11-20 tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            },
+            "Long (21-30 tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            },
+            "Very Long (31+ tokens)": {
+                "sample_count": 0,
+                "bleu": 0.0,
+                "meteor": 0.0
+            }
+        }
+    }
+}
