@@ -95,6 +95,16 @@ class Encoder(nn.Module):
         actual_emb_dim = emb_dim
 
         if pretrained_embeddings is not None:
+            # Zero-pad pretrained embedding rows to match padded_input_dim
+            if pretrained_embeddings.shape[0] < padded_input_dim:
+                pad_rows = padded_input_dim - pretrained_embeddings.shape[0]
+                padding_tensor = torch.zeros(
+                    (pad_rows, pretrained_embeddings.shape[1]), 
+                    dtype=pretrained_embeddings.dtype, 
+                    device=pretrained_embeddings.device
+                )
+                pretrained_embeddings = torch.cat([pretrained_embeddings, padding_tensor], dim=0)
+            
             actual_emb_dim = pretrained_embeddings.shape[1]
             self.embedding = nn.Embedding.from_pretrained(
                 pretrained_embeddings, freeze=freeze_embeddings, padding_idx=0
@@ -123,6 +133,7 @@ class Encoder(nn.Module):
         outputs, hidden = self.rnn(embedded)
         return outputs, hidden
 
+
 # ============================================================================
 # DECODER MODULE
 # ============================================================================
@@ -140,6 +151,16 @@ class Decoder(nn.Module):
         self.decoder_hidden_dim = decoder_hidden_dim
         
         if pretrained_embeddings is not None:
+            # Zero-pad pretrained embedding rows to match padded_output_dim
+            if pretrained_embeddings.shape[0] < self.padded_output_dim:
+                pad_rows = self.padded_output_dim - pretrained_embeddings.shape[0]
+                padding_tensor = torch.zeros(
+                    (pad_rows, pretrained_embeddings.shape[1]), 
+                    dtype=pretrained_embeddings.dtype, 
+                    device=pretrained_embeddings.device
+                )
+                pretrained_embeddings = torch.cat([pretrained_embeddings, padding_tensor], dim=0)
+
             actual_emb_dim = pretrained_embeddings.shape[1]
             self.embedding = nn.Embedding.from_pretrained(
                 pretrained_embeddings, freeze=freeze_embeddings, padding_idx=0
@@ -169,51 +190,7 @@ class Decoder(nn.Module):
         
         self.fc_out = nn.Linear(decoder_hidden_dim, self.padded_output_dim)
         self.dropout = nn.Dropout(dropout)
-
-    def forward_vectorized(self, trg, hidden, encoder_outputs=None):
-        """
-        Parallel non-sequential forward pass for Teacher Forcing (100% ratio).
-        Vectorizes teacher-forced attention during training using torch.bmm.
-        """
-        embedded = self.dropout(self.project(self.embedding(trg)))
         
-        if self.attention_type != "none" and encoder_outputs is not None:
-            batch_size, seq_len, _ = embedded.shape
-            zeros_context = torch.zeros(
-                batch_size, seq_len, self.encoder_hidden_dim, 
-                device=trg.device, dtype=embedded.dtype
-            )
-            initial_input = torch.cat((embedded, zeros_context), dim=2)
-            initial_outputs, _ = self.rnn(initial_input, hidden)
-            
-            attn_weights = self.attention(initial_outputs, encoder_outputs)
-            context = torch.bmm(attn_weights, encoder_outputs)
-            
-            full_input = torch.cat((embedded, context), dim=2)
-            output, hidden = self.rnn(full_input, hidden)
-        else:
-            output, hidden = self.rnn(embedded, hidden)
-            
-        prediction = self.fc_out(output)
-        return prediction, hidden
-
-    def forward_step(self, input_step, hidden, encoder_outputs=None):
-        """Step-by-step decoding used for auto-regressive inference or partial forcing."""
-        input_step = input_step.unsqueeze(1)
-        embedded = self.dropout(self.project(self.embedding(input_step)))
-        
-        if self.attention_type != "none" and encoder_outputs is not None:
-            dec_hidden = hidden[0][-1] if self.rnn_type == "LSTM" else hidden[-1]
-            attn_weights = self.attention(dec_hidden, encoder_outputs)
-            context = torch.bmm(attn_weights, encoder_outputs)
-            rnn_input = torch.cat((embedded, context), dim=2)
-        else:
-            rnn_input = embedded
-
-        output, hidden = self.rnn(rnn_input, hidden)
-        prediction = self.fc_out(output.squeeze(1))
-        return prediction, hidden
-
 # ============================================================================
 # SEQ2SEQ WRAPPER
 # ============================================================================
