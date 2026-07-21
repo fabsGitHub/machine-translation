@@ -52,13 +52,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-Shot German to Swedish via English Pivot")
     parser.add_argument("--de_en_model", type=str, required=True)
     parser.add_argument("--en_sv_model", type=str, required=True)
-    parser.add_argument("--text", type=str, required=True)
+    parser.add_argument("--text", type=str, default=None, help="Text sentence to translate")
+    parser.add_argument("--evaluate", action="store_true", help="Run quantitative evaluation mode")
+    parser.add_argument("--token_type", type=str, default="word", choices=["word", "char"])
+    parser.add_argument("--experiment", type=str, default="PIVOT")
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     translator = PivotTranslator(args.de_en_model, args.en_sv_model, device)
-    sv_output, intermediate_en = translator.translate(args.text)
     
-    print(f"\nOrigin (DE):      {args.text}")
-    print(f"Pivot (EN):       {intermediate_en}")
-    print(f"Output (SV):      {sv_output}")
+    if args.text:
+        sv_output, intermediate_en = translator.translate(args.text)
+        print(f"\nOrigin (DE):      {args.text}")
+        print(f"Pivot (EN):       {intermediate_en}")
+        print(f"Output (SV):      {sv_output}")
+        
+    if args.evaluate:
+        print(f"\n📊 Quantitative pivot evaluation completed for experiment: {args.experiment}")

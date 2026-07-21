@@ -33,21 +33,48 @@ def _worker_meteor(pair):
     ref, hyp = pair
     return meteor_score(ref, hyp)
 
+def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
+    model.eval()
+    tokens = []
+    
+    with torch.no_grad():
+        # Correctly unpack 2 outputs from encoder
+        encoder_outputs, hidden = model.encoder(src_tensor)
+        hidden = model._bridge_hidden(hidden)
+        
+        current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
+        
+        for _ in range(max_len):
+            # Forward step returns (prediction, hidden)
+            prediction, hidden = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+            best_guess = prediction.argmax(dim=1).item()
+            
+            if best_guess == EOS_IDX: 
+                break
+            if best_guess != PAD_IDX:
+                tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
+                
+            current_token = torch.tensor([best_guess], dtype=torch.long, device=device)
+            
+    return tokens
+
+
 def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
     model.eval()
     batch_size = src_tensor.size(0)
     
     with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            encoder_outputs, hidden, cell = model.encoder(src_tensor)
-            current_tokens = torch.full((batch_size,), SOS_IDX, dtype=torch.long, device=device)
-            outputs = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
-            
-            for t in range(max_len):
-                prediction, hidden, cell, _ = model.decoder(current_tokens, hidden, cell, encoder_outputs)
-                best_guess = prediction.argmax(dim=1)
-                outputs[:, t] = best_guess
-                current_tokens = best_guess
+        encoder_outputs, hidden = model.encoder(src_tensor)
+        hidden = model._bridge_hidden(hidden)
+        
+        current_tokens = torch.full((batch_size,), SOS_IDX, dtype=torch.long, device=device)
+        outputs = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        
+        for t in range(max_len):
+            prediction, hidden = model.decoder.forward_step(current_tokens, hidden, encoder_outputs)
+            best_guess = prediction.argmax(dim=1)
+            outputs[:, t] = best_guess
+            current_tokens = best_guess
         
     outputs_cpu = outputs.cpu().tolist()
     translated_sentences = []
@@ -60,25 +87,6 @@ def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
                 tokens.append(trg_vocab.itos.get(idx, "<unk>"))
         translated_sentences.append(tokens)
     return translated_sentences
-
-def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
-    model.eval()
-    tokens = []
-    
-    with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            encoder_outputs, hidden, cell = model.encoder(src_tensor)
-            current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
-            
-            for _ in range(max_len):
-                prediction, hidden, cell, _ = model.decoder(current_token, hidden, cell, encoder_outputs)
-                best_guess = prediction.argmax(1).item()
-                if best_guess == EOS_IDX: 
-                    break
-                tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
-                current_token.fill_(best_guess)
-            
-    return tokens
 
 def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
