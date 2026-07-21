@@ -17,16 +17,23 @@ SOS_IDX = 2
 EOS_IDX = 3
 
 class Vocabulary:
-    def __init__(self, token_type="word"):
+    def __init__(self, token_type="word", pad_multiple=16):
         self.token_type = token_type
+        self.pad_multiple = pad_multiple
         self.itos = {PAD_IDX: PAD_TOKEN, UNK_IDX: UNK_TOKEN, SOS_IDX: SOS_TOKEN, EOS_IDX: EOS_TOKEN}
-        self.stoi = {PAD_TOKEN: PAD_IDX, UNK_TOKEN: UNK_IDX, SOS_TOKEN: SOS_IDX, EOS_TOKEN: EOS_IDX}
+        self.stoi = {PAD_TOKEN: PAD_IDX, UNK_TOKEN: UNK_IDX, SOS_TOKEN: SOS_IDX, EOS_IDX: EOS_IDX}
         
     def __len__(self):
+        """Returns the actual unpadded vocabulary size."""
         return len(self.itos)
 
-    def get_padded_size(self, multiple=16):
+    @property
+    def padded_size(self):
         """Returns vocabulary size padded to nearest multiple for Tensor Core optimization."""
+        return pad_vocab_size(len(self.itos), multiple=self.pad_multiple)
+
+    def get_padded_size(self, multiple=16):
+        """Legacy helper for backward compatibility."""
         return pad_vocab_size(len(self.itos), multiple=multiple)
 
     def tokenize(self, text):
@@ -45,7 +52,18 @@ class Vocabulary:
 
     def numericalize(self, text):
         tokenized = self.tokenize(text)
-        return [self.stoi.get(token, UNK_IDX) for token in tokenized]
+        max_valid_idx = len(self.itos) - 1
+        indices = []
+        
+        for token in tokenized:
+            idx = self.stoi.get(token, UNK_IDX)
+            # Guard against any index equal to or exceeding vocab boundary
+            if not (0 <= idx <= max_valid_idx):
+                idx = UNK_IDX
+            indices.append(idx)
+            
+        return indices
+
 
 class PretokenizedNMTDataset(Dataset):
     def __init__(self, csv_path, src_lang="de", trg_lang="en", token_type="word", src_vocab=None, trg_vocab=None):
@@ -73,13 +91,17 @@ class PretokenizedNMTDataset(Dataset):
         for src, trg in zip(src_texts, trg_texts):
             src_num = [SOS_IDX] + self.src_vocab.numericalize(src) + [EOS_IDX]
             trg_num = [SOS_IDX] + self.trg_vocab.numericalize(trg) + [EOS_IDX]
-            self.data.append((torch.tensor(src_num, dtype=torch.long), torch.tensor(trg_num, dtype=torch.long)))
+            self.data.append((
+                torch.tensor(src_num, dtype=torch.long),
+                torch.tensor(trg_num, dtype=torch.long)
+            ))
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         return self.data[idx]
+
 
 class BucketBatchSampler(Sampler):
     """
@@ -103,14 +125,16 @@ class BucketBatchSampler(Sampler):
     def __len__(self):
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
+
 def collate_fn(batch):
     src_list, trg_list = zip(*batch)
     src_padded = pad_sequence(src_list, batch_first=True, padding_value=PAD_IDX)
     trg_padded = pad_sequence(trg_list, batch_first=True, padding_value=PAD_IDX)
     return src_padded, trg_padded
 
+
 def get_dataloader(csv_path, batch_size=512, shuffle=True, src_vocab=None, trg_vocab=None,
-                   src_lang="de", trg_lang="en", token_type="word"):
+                   src_lang="de", trg_lang="en", token_type="word", num_workers=12):
     dataset = PretokenizedNMTDataset(
         csv_path, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type,
         src_vocab=src_vocab, trg_vocab=trg_vocab
@@ -118,14 +142,16 @@ def get_dataloader(csv_path, batch_size=512, shuffle=True, src_vocab=None, trg_v
     
     sampler = BucketBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
     
-    # Highly optimized DataLoader options for AMD EPYC host
+    # Enable worker optimizations safely depending on worker count
+    use_workers = num_workers > 0
+    
     loader = DataLoader(
         dataset,
         batch_sampler=sampler,
         collate_fn=collate_fn,
-        num_workers=12,
+        num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
+        persistent_workers=use_workers,
+        prefetch_factor=4 if use_workers else None
     )
     return loader, dataset.src_vocab, dataset.trg_vocab
