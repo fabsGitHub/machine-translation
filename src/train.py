@@ -271,12 +271,17 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
+    # In train.py (replace full model compilation):
     if hasattr(torch, "compile"):
         try:
-            model = torch.compile(model, dynamic=True)
+            # Compile only the encoder (safe and fast!)
+            raw_model = model.module if hasattr(model, "module") else model
+            raw_model.encoder = torch.compile(raw_model.encoder)
+            if rank == 0:
+                print("⚡ Compiled Encoder with TorchInductor.")
         except Exception as e:
             if rank == 0:
-                print(f"⚠️ torch.compile skipped or failed: {e}")
+                print(f"⚠️ torch.compile skipped: {e}")
         
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
