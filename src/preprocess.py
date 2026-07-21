@@ -67,7 +67,7 @@ def download_and_extract_europarl(raw_dir, lang_pair="de-en"):
     return f1, f2
 
 
-def preprocess_data(df, src_col="de", trg_col="en", token_type="word", max_word_len=50, max_char_len=300):
+def preprocess_data(df, src_col="de", trg_col="en", token_type="word", max_word_len=64, max_char_len=256):
     df = df.copy()
     df[src_col] = df[src_col].astype(str).str.strip()
     df[trg_col] = df[trg_col].astype(str).str.strip()
@@ -170,15 +170,14 @@ def main():
     sample_rate = config.get("data", {}).get("sample_rate", 1.0)
     test_split = config.get("data", {}).get("test_split", 0.1)
     seed = config.get("data", {}).get("seed", 42)
-    max_word_len = config.get("data", {}).get("max_word_len", 50)
-    max_char_len = config.get("data", {}).get("max_char_len", 300)
+    max_word_len = config.get("data", {}).get("max_word_len", 64)
+    max_char_len = config.get("data", {}).get("max_char_len", 256)
 
     IS_KAGGLE = "KAGGLE_KERNEL_RUN_TYPE" in os.environ or os.path.exists("/kaggle/input")
     de_file, en_file, sv_file, en_sv_file = None, None, None, None
 
     if IS_KAGGLE:
         print("🤖 Kaggle environment detected!")
-        # Dynamically derive project root relative to script location
         SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
         REPO_ROOT = os.path.dirname(SCRIPT_DIR)
         processed_dir = os.path.join(REPO_ROOT, "data", "processed")

@@ -32,7 +32,7 @@ set_seed(config.get('system', {}).get('seed', 42))
 def get_batch_size(study, token_type):
     """
     Centralized handler for batch size configuration across studies and token levels.
-    Prioritizes explicit config.yaml overrides if defined.
+    Batch sizes set to powers of 2 (2048 and 1024).
     """
     config_batch = config.get('training', {}).get('batch_size')
     if config_batch is not None:
@@ -74,7 +74,7 @@ class AsyncEvaluationQueue:
 
 
 def get_vocab_sizes(token_type="word"):
-    """Dynamically retrieves vocabulary size from binary dataset cache or defaults to realistic baseline."""
+    """Dynamically retrieves vocabulary size from binary dataset cache or defaults to realistic baseline power of 2."""
     processed_dir = os.path.join(REPO_ROOT, "data", "processed")
     cache_dir = os.path.join(processed_dir, ".matrix_cache")
     if os.path.exists(cache_dir):
@@ -85,7 +85,7 @@ def get_vocab_sizes(token_type="word"):
                     return len(payload['src_vocab']), len(payload['trg_vocab'])
                 except Exception:
                     pass
-    return (10000, 10000) if token_type == "word" else (250, 250)
+    return (8192, 8192) if token_type == "word" else (256, 256)
 
 
 def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, bidirectional, 
@@ -122,7 +122,7 @@ def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, b
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_size_mb = (total_params * 4) / (1024 ** 2)
 
-    seq_len = 150 if token_type == "char" else 50
+    seq_len = 256 if token_type == "char" else 64   # Standardized sequence lengths to powers of 2
     batch_num = int(batch_size)
     batch_memory_mb = (batch_num * seq_len * 8) / (1024 ** 2)
 
@@ -378,14 +378,9 @@ def get_best_empirical_settings(token_type):
     return defaults
 
 def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
-    """
-    Single-pass loader: Reads all JSON ledgers for the given token_type once
-    and normalizes them into a unified Pandas DataFrame.
-    """
     pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
     ledger_data = {}
     
-    # Single disk pass to gather all JSON records
     for filepath in glob.glob(pattern):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
@@ -430,7 +425,6 @@ def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
             "Metric 2 (METEOR)": round(meteor, 2),
             "Train Time": node.get("train_time", "N/A"),
             "Inference Time": node.get("inference_time", "N/A"),
-            # Composite score used for ranking champions
             "_composite_score": bleu + (meteor * 100.0)
         })
 
@@ -438,10 +432,6 @@ def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
 
 
 def generate_all_reports(token_type: str):
-    """
-    Generates isolated study CSVs, consolidated report CSVs, and best-of-studies
-    reports in a single pass using vectorized DataFrame operations.
-    """
     df = load_evaluation_ledger_df(token_type)
     
     if df.empty:
@@ -452,18 +442,15 @@ def generate_all_reports(token_type: str):
     
     export_cols = ["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
 
-    # 1. Generate Consolidated Report CSV & Display Table
     consolidated_path = os.path.join(REPO_ROOT, f"consolidated_evaluation_report_{token_type}.csv")
     df[export_cols].to_csv(consolidated_path, index=False)
     print(f"💾 Consolidated Report Saved -> {consolidated_path}")
 
-    # 2. Generate Isolated Study Reports via Vectorized Grouping
     for group_name, group_df in df.groupby("Study Group"):
         study_path = os.path.join(REPO_ROOT, f"study_{group_name}_report_{token_type}.csv")
         group_df[export_cols].to_csv(study_path, index=False)
         print(f"💾 Isolated Study Matrix Saved -> study_{group_name}_report_{token_type}.csv")
 
-    # 3. Generate Best-Of-Studies Report (Champion per study group)
     best_idx = df.groupby("Study Group")["_composite_score"].idxmax()
     best_df = df.loc[best_idx].sort_values("Study Group")
     
@@ -472,7 +459,7 @@ def generate_all_reports(token_type: str):
     best_df[best_export_cols].to_csv(best_path, index=False)
     
     print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
-    
+
 def execute_preprocessing(token_type="word", mock_mode=False):
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "preprocess.py"), "--token_type", token_type]
     if mock_mode:
@@ -545,7 +532,7 @@ def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
 
 def execute_study_b(epochs, rnn_type, bidirectional, token_type, eval_queue: AsyncEvaluationQueue):
     hparams = get_best_hyperparameters("coarse", token_type, rnn_type=rnn_type)
-    configs = [("B1", "scratch", "False", "256"), ("B2", "word2vec", "True", "256"), ("B3", "word2vec", "False", "256"), ("B4", "scratch", "True", "256"), ("B5", "glove", "True", "256"), ("B6", "glove", "False", "256")] if token_type == "word" else [("B7", "scratch", "False", "32"), ("B8", "scratch", "False", "64"), ("B9", "scratch", "False", "128"), ("B10", "onehot", "True", "100")]
+    configs = [("B1", "scratch", "False", "256"), ("B2", "word2vec", "True", "256"), ("B3", "word2vec", "False", "256"), ("B4", "scratch", "True", "256"), ("B5", "glove", "True", "256"), ("B6", "glove", "False", "256")] if token_type == "word" else [("B7", "scratch", "False", "32"), ("B8", "scratch", "False", "64"), ("B9", "scratch", "False", "128"), ("B10", "onehot", "True", "128")]
     batch_size = get_batch_size("B", token_type)
     
     hidden_dim = hparams[hparams.index("--hidden_dim") + 1] if "--hidden_dim" in hparams else "512"
@@ -664,6 +651,7 @@ def execute_hyperparameter_tuning(stage, token_type, strategy, samples, epochs, 
         
     stage_csv = os.path.join(REPO_ROOT, f"tuning_results_{token_type}_{stage}.csv")
     
+    # Power-of-2 dimension configurations
     if token_type == "word":
         lrs = [0.003, 0.001, 0.0005]
         dropouts = [0.2, 0.3, 0.4]
@@ -693,7 +681,6 @@ def execute_hyperparameter_tuning(stage, token_type, strategy, samples, epochs, 
             exp_id
         ]
         
-        # Centralized artifact check via utils
         cached_config_file, _ = check_artifact_cache(OUTPUT_DIR, candidate_tags)
                 
         if cached_config_file and os.path.exists(cached_config_file):
@@ -794,7 +781,6 @@ if __name__ == "__main__":
     try:
         if args.study == "tune":
             for pathway in target_pathways:
-                # Dynamic epoch multiplier based on tokenization level
                 char_factor = 1.25 if pathway == "char" else 1.0
                 epochs_coarse = max(1, int(runtime_epochs * 0.4 * char_factor)) if not args.mock else 1
                 
@@ -803,18 +789,13 @@ if __name__ == "__main__":
                     
         elif args.study == "all":
             for pathway in target_pathways:
-                # -------------------------------------------------------------
-                # DYNAMIC TIERED EPOCH ALLOCATION STRATEGY
-                # -------------------------------------------------------------
-                # 1. Base Scale: Scaled up by 25% if character-level due to longer sequence dependencies.
                 char_factor = 1.25 if pathway == "char" else 1.0
                 base_scale = max(1, int(runtime_epochs * char_factor)) if not args.mock else 1
                 
-                # 2. Stage-Specific Epoch Calculation
-                epochs_coarse = max(1, int(base_scale * 0.4))  # Rapid rejection (e.g. 40% of base)
-                epochs_abc    = max(1, int(base_scale * 0.8))  # Relative architecture ranking (e.g. 80% of base)
-                epochs_fine   = max(1, int(base_scale * 0.6))  # Refined search around winners (e.g. 60% of base)
-                epochs_de     = max(1, int(base_scale * 1.8))  # Full convergence for production benchmarks (180% of base)
+                epochs_coarse = max(1, int(base_scale * 0.4))
+                epochs_abc    = max(1, int(base_scale * 0.8))
+                epochs_fine   = max(1, int(base_scale * 0.6))
+                epochs_de     = max(1, int(base_scale * 1.8))
                 
                 print(f"\n📊 [DYNAMIC EPOCH TIER PLAN] Pathway: {pathway.upper()}")
                 print(f" ├─ Coarse Sweep Epochs:  {epochs_coarse}")
@@ -822,11 +803,9 @@ if __name__ == "__main__":
                 print(f" ├─ Fine Sweep Epochs:    {epochs_fine}")
                 print(f" └─ Studies D & E:         {epochs_de}\n")
 
-                # Stage 1: Coarse Hyperparameter Search
                 for arch in rnn_architectures:
                     execute_hyperparameter_tuning("coarse", pathway, args.tune_strategy, args.tune_samples, epochs_coarse, ["--rnn_type", arch])
                     
-                # Stage 2: Structural Architecture, Embedding, and Attention Studies
                 execute_study_a(epochs_abc, token_type=pathway, eval_queue=eval_queue)
                 best = get_best_empirical_settings(token_type=pathway)
                 
@@ -836,7 +815,6 @@ if __name__ == "__main__":
                 execute_study_c(epochs_abc, pathway, best["rnn_type"], best["bidirectional"], best["embedding_source"], best["freeze_emb"], best["emb_dim"], eval_queue=eval_queue)
                 best = get_best_empirical_settings(token_type=pathway)
                 
-                # Stage 3: Fine Hyperparameter Optimization
                 execute_hyperparameter_tuning("fine", pathway, args.tune_strategy, args.tune_samples * 2, epochs_fine, [
                     "--rnn_type", best["rnn_type"], 
                     "--bidirectional", best["bidirectional"], 
@@ -846,18 +824,14 @@ if __name__ == "__main__":
                     "--emb_dim", best["emb_dim"]
                 ])
                 
-                # Stage 4: Language Directionality and Cross-Lingual Evaluation Studies
                 execute_study_d(epochs_de, pathway, best["rnn_type"], best["bidirectional"], best["embedding_source"], best["freeze_emb"], best["attention_type"], best["emb_dim"], eval_queue=eval_queue)
                 best = get_best_empirical_settings(token_type=pathway)
                 
                 execute_study_e(epochs_de, pathway, best["rnn_type"], best["bidirectional"], best["embedding_source"], best["freeze_emb"], best["attention_type"], best["emb_dim"], eval_queue=eval_queue)
                 best = get_best_empirical_settings(token_type=pathway)
                 
-                # Post Processing & Reporting
                 run_automated_post_processing(token_type=pathway, rnn_type=best["rnn_type"])
-                generate_consolidated_report(token_type=pathway)
-                generate_study_reports(token_type=pathway)
-                generate_best_of_studies_report(token_type=pathway)
+                generate_all_reports(token_type=pathway)
         else:
             for pathway in target_pathways:
                 best = get_best_empirical_settings(token_type=pathway)
