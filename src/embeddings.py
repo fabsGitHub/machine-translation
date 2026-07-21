@@ -5,16 +5,20 @@ import numpy as np
 import pandas as pd
 import torch
 
-def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache_dir=None, silent=False):
+
+def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache_dir=None, silent=False, pair_prefix=""):
     """
     Offline/Online pre-computation of Gensim Word2Vec weight matrices.
-    Utilizes parallelized host worker threads.
+    Utilizes parallelized host worker threads and disambiguates cache files using `pair_prefix`.
     """
     if cache_dir is None:
         cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
     os.makedirs(cache_dir, exist_ok=True)
 
-    cache_path = os.path.join(cache_dir, f"w2v_{lang_col}_{emb_dim}.pt")
+    # Disambiguate cache file by dataset file/pair prefix
+    prefix_str = f"{pair_prefix}_" if pair_prefix else ""
+    cache_path = os.path.join(cache_dir, f"w2v_{prefix_str}{lang_col}_{emb_dim}.pt")
+
     if os.path.exists(cache_path):
         if not silent:
             print(f"✓ Word2Vec matrix cache present at: {cache_path}")
@@ -44,12 +48,17 @@ def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache
             print(f"⚠️ Word2Vec generation skipped: {e}")
         return None
 
-def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=False):
+
+def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=False, pair_prefix=""):
+    """Loads pre-computed Word2Vec embeddings matrix or triggers pre-computation with pair prefix disambiguation."""
     cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
-    cache_path = os.path.join(cache_dir, f"w2v_{lang_col}_{emb_dim}.pt")
+    prefix_str = f"{pair_prefix}_" if pair_prefix else ""
+    cache_path = os.path.join(cache_dir, f"w2v_{prefix_str}{lang_col}_{emb_dim}.pt")
 
     if not os.path.exists(cache_path):
-        cache_path = precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim, cache_dir, silent=silent)
+        cache_path = precompute_word2vec_embeddings(
+            csv_path, vocab, lang_col, emb_dim=emb_dim, cache_dir=cache_dir, silent=silent, pair_prefix=pair_prefix
+        )
 
     if cache_path and os.path.exists(cache_path):
         try:
@@ -63,6 +72,7 @@ def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=Fals
                 print(f"⚠️ Cache read failed ({e}). Defaulting to standard distributions.")
 
     return None
+
 
 def load_glove_embeddings_pair(src_vocab, trg_vocab, glove_file_path, emb_dim=300, silent=False):
     """
@@ -98,6 +108,7 @@ def load_glove_embeddings_pair(src_vocab, trg_vocab, glove_file_path, emb_dim=30
     return (torch.tensor(src_matrix, dtype=torch.float32).share_memory_(),
             torch.tensor(trg_matrix, dtype=torch.float32).share_memory_())
 
+
 def load_glove_embeddings(vocab, glove_file_path, emb_dim=300, silent=False):
     """Single vocabulary GloVe loader without full-dictionary disk caching."""
     if not silent:
@@ -119,6 +130,7 @@ def load_glove_embeddings(vocab, glove_file_path, emb_dim=300, silent=False):
                     weight_matrix[vocab.stoi[word]] = np.array(parts[1:], dtype=np.float32)
 
     return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
+
 
 def download_and_extract_glove(data_dir):
     glove_target_file = os.path.join(data_dir, "glove.6B.300d.txt")

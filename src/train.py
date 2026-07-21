@@ -237,23 +237,33 @@ def main():
     
     pretrained_src_emb, pretrained_trg_emb = None, None
     silent_logging = rank > 0
+    pair_prefix = f"{args.src_lang}_{args.trg_lang}"
     
     if args.embedding_source == "word2vec":
-        pretrained_src_emb = generate_word2vec_embeddings(src_vocab, train_csv, args.src_lang, args.emb_dim, silent=silent_logging)
-        pretrained_trg_emb = generate_word2vec_embeddings(trg_vocab, train_csv, args.trg_lang, args.emb_dim, silent=silent_logging)
+        pretrained_src_emb = generate_word2vec_embeddings(
+            src_vocab, train_csv, args.src_lang, args.emb_dim, silent=silent_logging, pair_prefix=pair_prefix
+        )
+        pretrained_trg_emb = generate_word2vec_embeddings(
+            trg_vocab, train_csv, args.trg_lang, args.emb_dim, silent=silent_logging, pair_prefix=pair_prefix
+        )
     elif args.embedding_source == "glove":
         glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
         # ⚡ Single-pass loading extracts both src and trg embeddings concurrently
         pretrained_src_emb, pretrained_trg_emb = load_glove_embeddings_pair(src_vocab, trg_vocab, glove_path, 300, silent=silent_logging)
         
     num_directions = 2 if args.bidirectional else 1
+
+    # Consistently pass padded_size or len(vocab) across both embeddings and projections
+    src_vocab_size = src_vocab.padded_size if hasattr(src_vocab, 'padded_size') else len(src_vocab)
+    trg_vocab_size = trg_vocab.padded_size if hasattr(trg_vocab, 'padded_size') else len(trg_vocab)
+
     encoder = Encoder(
-        len(src_vocab), args.emb_dim, args.hidden_dim, 2, args.dropout, 
+        src_vocab_size, args.emb_dim, args.hidden_dim, 2, args.dropout, 
         args.rnn_type, args.bidirectional, pretrained_src_emb, args.freeze_emb, 
         300 if args.embedding_source == "glove" else None
     )
     decoder = Decoder(
-        len(trg_vocab), args.emb_dim, args.hidden_dim * num_directions, args.hidden_dim, 2, 
+        trg_vocab_size, args.emb_dim, args.hidden_dim * num_directions, args.hidden_dim, 2, 
         args.dropout, args.rnn_type, args.attention_type, pretrained_trg_emb, args.freeze_emb, 
         300 if args.embedding_source == "glove" else None
     )
@@ -410,7 +420,6 @@ def main():
                             with open(config_json_path, 'w') as f:
                                 json.dump(c_data, f, indent=4)
                                 
-                            # ⚡ Optimization: Json ledger updated without re-saving binary model checkpoint
                             print(f"✅ Backfill Successful: Saved BLEU={bleu_score} inside local JSON ledger.")
             except Exception as e:
                 print(f"⚠️ Automated metrics backfill skipped: {e}")
