@@ -441,7 +441,7 @@ if __name__ == "__main__":
     eval_p.add_argument("--checkpoint", type=str, default=None)
     eval_p.add_argument("--test_data", type=str, default=None)
     eval_p.add_argument("--token_type", type=str, default=None)
-    eval_p.add_argument("--sample_size", type=float, default=0.2, help="Number of samples (e.g. 500) or fraction (e.g. 0.1 for 10%)")
+    eval_p.add_argument("--sample_size", type=float, default=1000, help="Number of samples (e.g. 500) or fraction (e.g. 0.1 for 10%)")
     eval_p.add_argument("--seed", type=int, default=42, help="Random seed for sampling reproducibility")
     
     viz_p = subparsers.add_parser("visualize")

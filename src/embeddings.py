@@ -8,7 +8,7 @@ import torch
 def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache_dir=None, silent=False):
     """
     Offline/Online pre-computation of Gensim Word2Vec weight matrices.
-    Utilizes 16 EPYC host workers for parallelized training.
+    Utilizes parallelized host worker threads.
     """
     if cache_dir is None:
         cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
@@ -27,7 +27,6 @@ def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache
         df = pd.read_csv(csv_path)
         sentences = [vocab.tokenize(str(text)) for text in df[lang_col].tolist()]
         
-        # Increased workers from 4 to 16 to leverage AMD EPYC 7H12 cores
         w2v_model = Word2Vec(sentences=sentences, vector_size=emb_dim, window=5, min_count=1, workers=16)
 
         weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
@@ -65,33 +64,60 @@ def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=Fals
 
     return None
 
-def load_glove_embeddings(vocab, glove_file_path, emb_dim, silent=False):
+def load_glove_embeddings_pair(src_vocab, trg_vocab, glove_file_path, emb_dim=300, silent=False):
+    """
+    Single-pass parser extracting vectors for both source and target vocabularies.
+    Prevents reading/parsing the GloVe text file twice and eliminates full dictionary RAM/disk caching.
+    """
+    if not silent:
+        print(f"⌛ Single-pass GloVe extraction for SRC & TRG vocabularies from {glove_file_path}...")
+        
+    src_matrix = np.random.normal(scale=0.6, size=(len(src_vocab), emb_dim))
+    trg_matrix = np.random.normal(scale=0.6, size=(len(trg_vocab), emb_dim))
+
+    if not os.path.exists(glove_file_path):
+        if not silent:
+            print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
+        return (torch.tensor(src_matrix, dtype=torch.float32).share_memory_(),
+                torch.tensor(trg_matrix, dtype=torch.float32).share_memory_())
+
+    combined_words = set(src_vocab.stoi.keys()).union(set(trg_vocab.stoi.keys()))
+    
+    with open(glove_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == emb_dim + 1:
+                word = parts[0]
+                if word in combined_words:
+                    vec = np.array(parts[1:], dtype=np.float32)
+                    if word in src_vocab.stoi:
+                        src_matrix[src_vocab.stoi[word]] = vec
+                    if word in trg_vocab.stoi:
+                        trg_matrix[trg_vocab.stoi[word]] = vec
+
+    return (torch.tensor(src_matrix, dtype=torch.float32).share_memory_(),
+            torch.tensor(trg_matrix, dtype=torch.float32).share_memory_())
+
+def load_glove_embeddings(vocab, glove_file_path, emb_dim=300, silent=False):
+    """Single vocabulary GloVe loader without full-dictionary disk caching."""
     if not silent:
         print(f"⌛ Mapping GloVe embeddings from {glove_file_path} to vocabulary...")
     weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
-    glove_cache_bin = glove_file_path + ".matrix_cache.pt"
-    
-    if os.path.exists(glove_cache_bin):
-        glove_dict = torch.load(glove_cache_bin, weights_only=False)
-    else:
-        if not os.path.exists(glove_file_path):
-            if not silent:
-                print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
-            return torch.tensor(weight_matrix, dtype=torch.float32)
-        glove_dict = {}
-        with open(glove_file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) == emb_dim + 1:
-                    glove_dict[parts[0]] = np.array(parts[1:], dtype=np.float32)
-        try:
-            torch.save(glove_dict, glove_cache_bin)
-        except Exception:
-            pass
 
-    for word, idx in vocab.stoi.items():
-        if word in glove_dict:
-            weight_matrix[idx] = glove_dict[word]
+    if not os.path.exists(glove_file_path):
+        if not silent:
+            print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
+        return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
+
+    vocab_words = set(vocab.stoi.keys())
+    with open(glove_file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == emb_dim + 1:
+                word = parts[0]
+                if word in vocab_words:
+                    weight_matrix[vocab.stoi[word]] = np.array(parts[1:], dtype=np.float32)
+
     return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
 
 def download_and_extract_glove(data_dir):

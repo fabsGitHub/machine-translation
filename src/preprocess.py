@@ -130,8 +130,8 @@ def preprocess_data(df, src_col="de", trg_col="en", token_type="word", max_word_
     return df.reset_index(drop=True)
 
 
-def process_and_save_pair(df, src_lang, trg_lang, processed_dir, test_split, seed, mock=False, legacy_alias=None):
-    """Splits data and saves to standard mutual paths: <split>_<src>_<trg>.csv"""
+def process_and_save_pair(df, src_lang, trg_lang, processed_dir, test_split, seed, mock=False):
+    """Splits data and saves to standard mutual paths: <split>_<src>_<trg>.csv once."""
     if mock:
         train_df = df
         val_df = df.iloc[3:4]
@@ -148,14 +148,6 @@ def process_and_save_pair(df, src_lang, trg_lang, processed_dir, test_split, see
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path, index=False)
     test_df.to_csv(test_path, index=False)
-
-    if legacy_alias is not None:
-        legacy_train = os.path.join(processed_dir, f"train{legacy_alias}.csv")
-        legacy_val = os.path.join(processed_dir, f"val{legacy_alias}.csv")
-        legacy_test = os.path.join(processed_dir, f"test{legacy_alias}.csv")
-        train_df.to_csv(legacy_train, index=False)
-        val_df.to_csv(legacy_val, index=False)
-        test_df.to_csv(legacy_test, index=False)
 
 
 def execute_offline_caching(processed_dir, token_type="word"):
@@ -267,7 +259,7 @@ def main():
     process_and_save_pair(
         cleaned_de_df, src_lang="de", trg_lang="en",
         processed_dir=processed_dir, test_split=test_split, seed=seed,
-        mock=args.mock, legacy_alias=""
+        mock=args.mock
     )
 
     # 2. ENGLISH - SWEDISH PATHWAY
@@ -293,7 +285,7 @@ def main():
     process_and_save_pair(
         cleaned_sv_df, src_lang="en", trg_lang="sv",
         processed_dir=processed_dir, test_split=test_split, seed=seed,
-        mock=args.mock, legacy_alias="_sv"
+        mock=args.mock
     )
 
     # 3. OFFLINE BINARY CACHING

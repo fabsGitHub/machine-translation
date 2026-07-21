@@ -2,6 +2,7 @@ import random
 from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from utils import pad_vocab_size
 
 # ============================================================================
@@ -109,7 +110,7 @@ class Encoder(nn.Module):
         return outputs, hidden
 
 # ============================================================================
-# DECODER MODULE (VECTORIZED + JIT-OPTIMIZED)
+# DECODER MODULE
 # ============================================================================
 
 class Decoder(nn.Module):
@@ -118,7 +119,6 @@ class Decoder(nn.Module):
                  pretrained_embeddings=None, freeze_embeddings=False, pretrained_dim=None):
         super().__init__()
         self.output_dim = output_dim
-        # Vocab size padded to multiple of 16 for Ampere XMMA GEMM optimization
         self.padded_output_dim = pad_vocab_size(output_dim, multiple=16)
         self.rnn_type = rnn_type
         self.attention_type = attention_type
@@ -155,10 +155,7 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward_vectorized(self, trg, hidden):
-        """
-        Parallel non-sequential forward pass for Teacher Forcing (100% ratio).
-        Replaces the Python loop with fused matrix operations.
-        """
+        """Parallel non-sequential forward pass for Teacher Forcing (100% ratio)."""
         embedded = self.dropout(self.project(self.embedding(trg)))
         output, hidden = self.rnn(embedded, hidden)
         prediction = self.fc_out(output)
@@ -210,15 +207,12 @@ class Seq2Seq(nn.Module):
         encoder_outputs, hidden = self.encoder(src)
         hidden = self._bridge_hidden(hidden)
 
-        # ⚡ OPTIMIZATION: Fully Vectorized Matrix Pass when Teacher Forcing = 1.0
+        # ⚡ OPTIMIZATION: Zero-overhead padding for Fully Vectorized Matrix Pass
         if teacher_forcing_ratio == 1.0 and self.decoder.attention_type == "none":
-            # Strip last target token for input sequence
             trg_input = trg[:, :-1]
             predictions, _ = self.decoder.forward_vectorized(trg_input, hidden)
-            # Add back zero tensor padding for index matching
-            padded_preds = torch.zeros(batch_size, trg_len, self.decoder.padded_output_dim, device=self.device)
-            padded_preds[:, 1:] = predictions
-            return padded_preds
+            # Efficiently pad time dimension on the left without creating & slicing extra tensors
+            return F.pad(predictions, (0, 0, 1, 0))
 
         # Sequential decoding fallback for partial teacher forcing / inference
         outputs = torch.zeros(batch_size, trg_len, self.decoder.padded_output_dim, device=self.device)

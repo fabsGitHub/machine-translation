@@ -9,12 +9,14 @@ class PivotTranslator:
     def __init__(self, de_en_path, en_sv_path, device):
         self.device = device
         print("Loading DE -> EN Model Layout...")
-        self.de_en_checkpoint = torch.load(de_en_path, map_location=device, weights_only=False)
-        self.de_en_model = self._reconstruct_model(self.de_en_checkpoint)
+        de_en_checkpoint = torch.load(de_en_path, map_location=device, weights_only=False)
+        self.de_en_model, self.de_en_src_vocab, self.de_en_trg_vocab = self._reconstruct_model(de_en_checkpoint)
+        del de_en_checkpoint
         
         print("Loading EN -> SV Model Layout...")
-        self.en_sv_checkpoint = torch.load(en_sv_path, map_location=device, weights_only=False)
-        self.en_sv_model = self._reconstruct_model(self.en_sv_checkpoint)
+        en_sv_checkpoint = torch.load(en_sv_path, map_location=device, weights_only=False)
+        self.en_sv_model, self.en_sv_src_vocab, self.en_sv_trg_vocab = self._reconstruct_model(en_sv_checkpoint)
+        del en_sv_checkpoint
 
     def _reconstruct_model(self, checkpoint):
         config = checkpoint['config']
@@ -29,11 +31,11 @@ class PivotTranslator:
         
         model = Seq2Seq(enc, dec, self.device).to(self.device)
         model.load_state_dict(checkpoint['model_state_dict'])
-        return model
+        return model, src_vocab, trg_vocab
 
     def translate(self, de_sentence):
-        src_vocab = self.de_en_checkpoint['src_vocab']
-        trg_vocab_en = self.de_en_checkpoint['trg_vocab']
+        src_vocab = self.de_en_src_vocab
+        trg_vocab_en = self.de_en_trg_vocab
         
         numericalized = [SOS_IDX] + src_vocab.numericalize(de_sentence) + [EOS_IDX]
         src_tensor = torch.tensor(numericalized, dtype=torch.long, device=self.device).unsqueeze(0)
@@ -41,7 +43,7 @@ class PivotTranslator:
         en_tokens = translate_sentence(self.de_en_model, src_tensor, trg_vocab_en, self.device)
         en_sentence = " ".join(en_tokens)
         
-        trg_vocab_sv = self.en_sv_checkpoint['trg_vocab']
+        trg_vocab_sv = self.en_sv_trg_vocab
         numericalized_en = [SOS_IDX] + trg_vocab_en.numericalize(en_sentence) + [EOS_IDX]
         en_tensor = torch.tensor(numericalized_en, dtype=torch.long, device=self.device).unsqueeze(0)
         

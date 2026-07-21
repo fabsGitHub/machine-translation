@@ -13,7 +13,7 @@ from dataset import get_dataloader, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
 from utils import set_seed
 from config import load_config
-from embeddings import generate_word2vec_embeddings, load_glove_embeddings
+from embeddings import generate_word2vec_embeddings, load_glove_embeddings_pair
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -180,17 +180,6 @@ def main():
     train_csv = os.path.join(processed_dir, f"train_{args.src_lang}_{args.trg_lang}.csv")
     val_csv = os.path.join(processed_dir, f"val_{args.src_lang}_{args.trg_lang}.csv")
 
-    if not os.path.exists(train_csv):
-        legacy_suffix = "_sv" if (args.src_lang == "sv" or args.trg_lang == "sv") else ""
-        legacy_train = os.path.join(processed_dir, f"train{legacy_suffix}.csv")
-        legacy_val = os.path.join(processed_dir, f"val{legacy_suffix}.csv")
-        
-        if os.path.exists(legacy_train):
-            train_csv, val_csv = legacy_train, legacy_val
-        else:
-            train_csv = os.path.join(processed_dir, "train.csv")
-            val_csv = os.path.join(processed_dir, "val.csv")
-
     if rank == 0:
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
@@ -243,8 +232,8 @@ def main():
         pretrained_trg_emb = generate_word2vec_embeddings(trg_vocab, train_csv, args.trg_lang, args.emb_dim, silent=silent_logging)
     elif args.embedding_source == "glove":
         glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
-        pretrained_src_emb = load_glove_embeddings(src_vocab, glove_path, 300, silent=silent_logging)
-        pretrained_trg_emb = load_glove_embeddings(trg_vocab, glove_path, 300, silent=silent_logging)
+        # ⚡ Single-pass loading extracts both src and trg embeddings concurrently
+        pretrained_src_emb, pretrained_trg_emb = load_glove_embeddings_pair(src_vocab, trg_vocab, glove_path, 300, silent=silent_logging)
         
     num_directions = 2 if args.bidirectional else 1
     encoder = Encoder(
@@ -263,10 +252,6 @@ def main():
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         model_size_mb = (total_params * 4) / (1024 ** 2)
-        sample_src, sample_trg = next(iter(train_loader))
-        src_bytes = sample_src.element_size() * sample_src.nelement()
-        trg_bytes = sample_trg.element_size() * sample_trg.nelement()
-        total_batch_bytes = src_bytes + trg_bytes
 
         print("\n" + "─" * 75)
         print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
@@ -274,9 +259,6 @@ def main():
         print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
         print(f" ├─ Global Batch Size (Total):   {args.batch_size * world_size} sequence(s) across {world_size} rank(s)")
-        print(f" ├─ Dynamic 'src' Tensor Shape: {list(sample_src.shape)} -> {src_bytes / (1024 ** 2):.6f} MB")
-        print(f" ├─ Dynamic 'trg' Tensor Shape: {list(sample_trg.shape)} -> {trg_bytes / (1024 ** 2):.6f} MB")
-        print(f" ├─ Total Batch Pair Footprint: {total_batch_bytes / (1024 ** 2):.6f} MB ({total_batch_bytes:,} bytes)")
         print(f" ├─ Total Trainable Parameters: {total_params:,}")
         print(f" └─ Total Model Memory (FP32):  {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
@@ -414,19 +396,7 @@ def main():
                             with open(config_json_path, 'w') as f:
                                 json.dump(c_data, f, indent=4)
                                 
-                            checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-                            checkpoint_payload['config'].update({
-                                "bleu": bleu_score,
-                                "Target Metric (BLEU)": bleu_score,
-                                "bleu_score": bleu_score,
-                                "overall_corpus_bleu": bleu_score
-                            })
-                            if meteor_score is not None:
-                                checkpoint_payload['config'].update({
-                                    "meteor": meteor_score,
-                                    "mean_meteor": meteor_score
-                                })
-                            torch.save(checkpoint_payload, checkpoint_path)
+                            # ⚡ Optimization: Json ledger updated without re-saving binary model checkpoint
                             print(f"✅ Backfill Successful: Saved BLEU={bleu_score} inside local JSON ledger.")
             except Exception as e:
                 print(f"⚠️ Automated metrics backfill skipped: {e}")

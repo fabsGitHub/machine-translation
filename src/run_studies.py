@@ -18,7 +18,6 @@ matplotlib.use('Agg')
 
 from config import load_config
 from utils import set_seed, check_artifact_cache, is_cache_valid
-from models import Encoder, Decoder, Seq2Seq
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -91,38 +90,37 @@ def get_vocab_sizes(token_type="word"):
 def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, bidirectional, 
                                      attention_type, emb_dim, hidden_dim, batch_size):
     """
-    Dynamically computes and outputs Model Size (Parameters & FP32 MB) 
-    and Batch Size parameters for a given study configuration.
+    Analytically computes and outputs Model Size (Parameters & FP32 MB) 
+    and Batch Size parameters without instantiating dummy PyTorch models on CPU.
     """
     src_vocab_len, trg_vocab_len = get_vocab_sizes(token_type)
     bidi_bool = str(bidirectional).lower() == "true"
     num_directions = 2 if bidi_bool else 1
-    
-    encoder = Encoder(
-        input_dim=src_vocab_len, 
-        emb_dim=int(emb_dim), 
-        hidden_dim=int(hidden_dim), 
-        n_layers=2, 
-        dropout=0.3, 
-        rnn_type=rnn_type, 
-        bidirectional=bidi_bool
-    )
-    decoder = Decoder(
-        output_dim=trg_vocab_len, 
-        emb_dim=int(emb_dim), 
-        encoder_hidden_dim=int(hidden_dim) * num_directions, 
-        decoder_hidden_dim=int(hidden_dim), 
-        n_layers=2, 
-        dropout=0.3, 
-        rnn_type=rnn_type, 
-        attention_type=attention_type
-    )
-    model = Seq2Seq(encoder, decoder, torch.device("cpu"))
-    
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    emb_d, hid_d = int(emb_dim), int(hidden_dim)
+    gates = 4 if rnn_type == "LSTM" else (3 if rnn_type == "GRU" else 1)
+
+    enc_emb = src_vocab_len * emb_d
+    enc_l1 = gates * ((emb_d * hid_d + hid_d * hid_d + 2 * hid_d) * num_directions)
+    enc_l2 = gates * ((hid_d * num_directions * hid_d + hid_d * hid_d + 2 * hid_d) * num_directions)
+    enc_params = enc_emb + enc_l1 + enc_l2
+
+    dec_emb = trg_vocab_len * emb_d
+    enc_out_dim = hid_d * num_directions
+    dec_rnn_in = emb_d + (enc_out_dim if attention_type != "none" else 0)
+    dec_l1 = gates * (dec_rnn_in * hid_d + hid_d * hid_d + 2 * hid_d)
+    dec_l2 = gates * (hid_d * hid_d + hid_d * hid_d + 2 * hid_d)
+    dec_fc = hid_d * trg_vocab_len + trg_vocab_len
+
+    attn_params = 0
+    if attention_type == "luong":
+        attn_params = (enc_out_dim * hid_d) + hid_d
+    elif attention_type == "bahdanau":
+        attn_params = (hid_d * hid_d + hid_d) + (enc_out_dim * hid_d + hid_d) + hid_d
+
+    total_params = enc_params + dec_emb + dec_l1 + dec_l2 + dec_fc + attn_params
     model_size_mb = (total_params * 4) / (1024 ** 2)
 
-    seq_len = 256 if token_type == "char" else 64   # Standardized sequence lengths to powers of 2
+    seq_len = 256 if token_type == "char" else 64
     batch_num = int(batch_size)
     batch_memory_mb = (batch_num * seq_len * 8) / (1024 ** 2)
 
@@ -133,8 +131,8 @@ def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, b
     print(f" ├─ Dimensions:               Emb={emb_dim} | Hidden={hidden_dim}")
     print(f" ├─ Batch Size (N samples):   {batch_num} sequences / batch")
     print(f" ├─ Batch Shape Estimate:     [{batch_num}, {seq_len}] ({batch_memory_mb:.4f} MB per batch tensor)")
-    print(f" ├─ Total Model Parameters:   {total_params:,} parameters")
-    print(f" └─ Model Memory Footprint:   {model_size_mb:.2f} MB")
+    print(f" ├─ Total Model Parameters:   ~{total_params:,} parameters")
+    print(f" └─ Model Memory Footprint:   ~{model_size_mb:.2f} MB")
     print("─" * 75 + "\n")
 
 
@@ -651,7 +649,6 @@ def execute_hyperparameter_tuning(stage, token_type, strategy, samples, epochs, 
         
     stage_csv = os.path.join(REPO_ROOT, f"tuning_results_{token_type}_{stage}.csv")
     
-    # Power-of-2 dimension configurations
     if token_type == "word":
         lrs = [0.003, 0.001, 0.0005]
         dropouts = [0.2, 0.3, 0.4]
