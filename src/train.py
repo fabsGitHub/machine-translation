@@ -57,6 +57,17 @@ class DistributedBatchSamplerWrapper(Sampler):
         return math.ceil(len(self.batch_sampler) / self.num_replicas)
 
 
+def get_clean_state_dict(model):
+    """
+    Extracts state_dict from a potentially wrapped (DDP) and compiled model,
+    stripping distributed module wrappers and TorchInductor '_orig_mod.' prefixes.
+    """
+    raw_model = model.module if hasattr(model, "module") else model
+    state_dict = raw_model.state_dict()
+    clean_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    return clean_dict
+
+
 def str2bool(v):
     if isinstance(v, bool): 
         return v
@@ -271,7 +282,6 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    # In train.py (replace full model compilation):
     if hasattr(torch, "compile"):
         try:
             # Compile only the encoder (safe and fast!)
@@ -340,10 +350,9 @@ def main():
                         "loss_history": loss_history
                     })
                     
-                    raw_model = model.module if hasattr(model, "module") else model
                     torch.save({
                         'config': config_dict, 
-                        'model_state_dict': raw_model.state_dict(), 
+                        'model_state_dict': get_clean_state_dict(model), 
                         'src_vocab': src_vocab, 
                         'trg_vocab': trg_vocab,
                         'loss_history': loss_history
