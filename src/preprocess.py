@@ -16,19 +16,43 @@ MOCK_DATA_DE_EN = {
         "wie geht es dir heute", 
         "maschinelles lernen macht unglaublichen spass", 
         "der schnelle braune fuchs springt ueber den faulen hund",
-        "tiefe neuronale netze erfordern strukturelle optimierung"
+        "tiefe neuronale netze erfordern strukturelle optimierung",
+        "hallo welt und maschinelles lernen",
+        "wie geht es den tiefen neuronalen netzen",
+        "der schnelle fuchs macht unglaublichen spass"
     ],
     "en": [
-        "hello world", "how are you today", "machine learning is incredibly fun", "the quick brown fox jumps over the lazy dog", "deep neural networks require structural optimization"
+        "hello world", 
+        "how are you today", 
+        "machine learning is incredibly fun", 
+        "the quick brown fox jumps over the lazy dog", 
+        "deep neural networks require structural optimization",
+        "hello world and machine learning",
+        "how are deep neural networks doing today",
+        "the quick fox is incredibly fun"
     ]
 }
 
 MOCK_DATA_SV_EN = {
     "en": [
-        "hello world", "how are you today", "machine learning is incredibly fun", "the quick brown fox jumps over the lazy dog", "deep neural networks require structural optimization"
+        "hello world", 
+        "how are you today", 
+        "machine learning is incredibly fun", 
+        "the quick brown fox jumps over the lazy dog", 
+        "deep neural networks require structural optimization",
+        "hello world and machine learning",
+        "how are deep neural networks doing today",
+        "the quick fox is incredibly fun"
     ],
     "sv": [
-        "hej världen", "hur mår du idag", "maskininlärning är otroligt roligt", "den snabba bruna räven hoppar över den lata hunden", "djupa neurala nätverk kräver strukturell optimering"
+        "hej världen", 
+        "hur mår du idag", 
+        "maskininlärning är otroligt roligt", 
+        "den snabba bruna räven hoppar över den lata hunden", 
+        "djupa neurala nätverk kräver strukturell optimering",
+        "hej världen och maskininlärning",
+        "hur mår de djupa neurala nätverken idag",
+        "den snabba räven är otroligt rolig"
     ]
 }
 
