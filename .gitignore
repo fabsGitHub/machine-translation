@@ -1,0 +1,25 @@
+# Data and heavy model binaries
+data/processed
+data/raw
+*.pt
+*.pkl
+*.pth
+!data/results/
+
+# Python environment & cache
+venv/
+__pycache__/
+*.pyc
+
+# Mac system files
+.DS_Store
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+data/glove.6B.300d.txt
+data/results/
+
+data/glove.6B.300d.txt
+data/results/
+
+kaggle_dataset_staging
