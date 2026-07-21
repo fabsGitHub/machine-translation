@@ -7,7 +7,7 @@ DEFAULT_CONFIG = {
     },
     "data": {
         "sample_rate": 1.0,
-        "test_split": 0.1,
+        "test_split": 0.001,
         "seed": 42,
         "max_word_len": 50,
         "max_char_len": 300,
