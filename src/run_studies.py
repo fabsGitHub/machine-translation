@@ -11,6 +11,7 @@ import itertools
 import random
 import threading
 import matplotlib
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import re
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -38,7 +39,7 @@ def get_batch_size(study, token_type):
     if config_batch is not None:
         return str(config_batch)
 
-    return "1024" if token_type == "char" else "512"
+    return "512" if token_type == "char" else "256"
 
 
 class AsyncEvaluationQueue:
