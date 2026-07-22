@@ -143,6 +143,14 @@ def preprocess_data(
     max_char_len=256,
 ):
     df = df.copy()
+    
+    # Use PyArrow string backend when available for accelerated vectorized string processing
+    try:
+        df[src_col] = df[src_col].astype("string[pyarrow]")
+        df[trg_col] = df[trg_col].astype("string[pyarrow]")
+    except Exception:
+        pass
+
     df[src_col] = df[src_col].astype(str).str.strip()
     df[trg_col] = df[trg_col].astype(str).str.strip()
     df = df[(df[src_col] != "") & (df[trg_col] != "")]
@@ -157,14 +165,18 @@ def preprocess_data(
     df[trg_col] = df[trg_col].str.replace(r"\s+", " ", regex=True).str.strip()
     df = df.drop_duplicates()
 
+    # OPTIMIZATION 6: Optimized vectorized word count without creating intermediate Python lists
+    def get_word_len(series):
+        return series.str.count(" ") + 1
+
     if token_type == "char":
         df["src_len"] = df[src_col].str.len()
         df["trg_len"] = df[trg_col].str.len()
         df = df[(df["src_len"] <= max_char_len) & (df["trg_len"] <= max_char_len)]
         df = df.drop(columns=["src_len", "trg_len"])
     elif token_type == "both":
-        src_w_len = df[src_col].str.split().str.len()
-        trg_w_len = df[trg_col].str.split().str.len()
+        src_w_len = get_word_len(df[src_col])
+        trg_w_len = get_word_len(df[trg_col])
         src_c_len = df[src_col].str.len()
         trg_c_len = df[trg_col].str.len()
         df = df[
@@ -174,10 +186,9 @@ def preprocess_data(
             & (trg_c_len <= max_char_len)
         ]
     else:  # "word"
-        df["src_len"] = df[src_col].str.split().str.len()
-        df["trg_len"] = df[trg_col].str.split().str.len()
-        df = df[(df["src_len"] <= max_word_len) & (df["trg_len"] <= max_word_len)]
-        df = df.drop(columns=["src_len", "trg_len"])
+        src_w_len = get_word_len(df[src_col])
+        trg_w_len = get_word_len(df[trg_col])
+        df = df[(src_w_len <= max_word_len) & (trg_w_len <= max_word_len)]
 
     return df.reset_index(drop=True)
 
@@ -287,7 +298,6 @@ def main():
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
 
-    # Map GloVe if available in Kaggle input
     if os.path.exists("/kaggle/input"):
         for root, _, files in os.walk("/kaggle/input"):
             for f in files:

@@ -32,9 +32,7 @@ eval_lock = threading.Lock()
 
 
 def get_batch_size(study, token_type):
-    """
-    Centralized handler for batch size configuration across studies and token levels.
-    """
+    """Centralized handler for batch size configuration across studies and token levels."""
     config_batch = config.get('training', {}).get('batch_size')
     if config_batch is not None:
         return str(config_batch)
@@ -92,10 +90,7 @@ def get_vocab_sizes(token_type="word"):
 
 def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, bidirectional, 
                                      attention_type, emb_dim, hidden_dim, batch_size):
-    """
-    Analytically computes and outputs Model Size (Parameters & FP32 MB) 
-    and Batch Size parameters.
-    """
+    """Analytically computes and outputs Model Size (Parameters & FP32 MB) and Batch Size parameters."""
     src_vocab_len, trg_vocab_len = get_vocab_sizes(token_type)
     bidi_bool = str(bidirectional).lower() == "true"
     num_directions = 2 if bidi_bool else 1
@@ -192,7 +187,7 @@ def run_auto_evaluation(experiment_id, rnn_type):
     if os.path.exists(target_model):
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "evaluate", "--checkpoint", target_model]
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ""  # Force evaluation processes to run strictly on CPU
+        env["CUDA_VISIBLE_DEVICES"] = ""
         try: 
             subprocess.run(cmd, check=True, env=env)
         except subprocess.CalledProcessError:
@@ -239,9 +234,7 @@ def sync_ledger_to_token_type(token_type):
 
 
 def get_best_hyperparameters(stage, token_type, rnn_type=None):
-    """
-    Parses validation loss metrics from hyperparameter tuning sweeps (TUNE_*) to select optimal settings.
-    """
+    """Parses validation loss metrics from hyperparameter tuning sweeps (TUNE_*) to select optimal settings."""
     csv_path = os.path.join(REPO_ROOT, f"tuning_results_{token_type}_{stage}.csv")
     profile = config.get('profiles', {}).get(token_type, {})
     default_args = ["--lr", str(profile.get("lr", 0.001)), "--dropout", str(profile.get("dropout", 0.3)), "--emb_dim", str(profile.get("emb_dim", 256)), "--hidden_dim", str(profile.get("hidden_dim", 512))]
@@ -541,7 +534,6 @@ def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
         if not is_cache_valid(os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{cell}.pt"), os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{cell}.json"), epochs):
             run_cmd(hparams + ["--experiment", exp_id, "--rnn_type", cell, "--bidirectional", bidi, "--token_type", token_type, "--batch_size", batch_size, "--epochs", str(epochs)])
         
-        # Enqueue BLEU & METEOR evaluation for Study A
         eval_queue.submit_evaluation(exp_id, cell, token_type)
 
     eval_queue.sync_study()
@@ -566,7 +558,6 @@ def execute_study_b(epochs, rnn_type, bidirectional, token_type, eval_queue: Asy
         if not is_cache_valid(os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{rnn_type}.pt"), os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{rnn_type}.json"), epochs):
             run_cmd(hparams + ["--experiment", exp_id, "--rnn_type", rnn_type, "--bidirectional", bidirectional, "--token_type", token_type, "--embedding_source", "scratch" if src == "onehot" else src, "--freeze_emb", freeze, "--emb_dim", emb_dim, "--batch_size", batch_size, "--epochs", str(epochs)])
         
-        # Enqueue BLEU & METEOR evaluation for Study B
         eval_queue.submit_evaluation(exp_id, rnn_type, token_type)
 
     eval_queue.sync_study()
@@ -603,7 +594,6 @@ def execute_study_c(epochs, token_type, rnn_type, bidirectional, embedding_sourc
                 "--epochs", str(epochs)
             ])
         
-        # Enqueue BLEU & METEOR evaluation for Study C
         eval_queue.submit_evaluation(exp_id, cell, token_type)
 
     eval_queue.sync_study()
@@ -627,7 +617,6 @@ def execute_study_d(epochs, token_type, rnn_type, bidirectional, embedding_sourc
         if not is_cache_valid(os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{rnn_type}.pt"), os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{rnn_type}.json"), epochs):
             run_cmd(hparams + ["--experiment", exp_id, "--rnn_type", rnn_type, "--bidirectional", bidirectional, "--attention_type", attention_type, "--embedding_source", embedding_source, "--freeze_emb", freeze_emb, "--emb_dim", emb_dim, "--batch_size", batch_size, "--src_lang", src, "--trg_lang", trg, "--token_type", tok, "--epochs", str(epochs)])
         
-        # Enqueue BLEU & METEOR evaluation for Study D
         eval_queue.submit_evaluation(exp_id, rnn_type, token_type)
 
     eval_queue.sync_study()
@@ -648,7 +637,6 @@ def execute_study_e(epochs, token_type, rnn_type, bidirectional, embedding_sourc
     if not is_cache_valid(os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{rnn_type}.pt"), os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{rnn_type}.json"), epochs):
         run_cmd(hparams + ["--experiment", exp_id, "--rnn_type", rnn_type, "--bidirectional", bidirectional, "--attention_type", attention_type, "--embedding_source", embedding_source, "--freeze_emb", freeze_emb, "--emb_dim", emb_dim, "--batch_size", batch_size, "--src_lang", "en", "--trg_lang", "sv", "--token_type", token_type, "--epochs", str(epochs)])
     
-    # Enqueue BLEU & METEOR evaluation for Study E
     eval_queue.submit_evaluation(exp_id, rnn_type, token_type)
     eval_queue.sync_study()
 

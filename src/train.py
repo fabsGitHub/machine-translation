@@ -21,10 +21,6 @@ OUTPUT_DIR = os.path.join(ROOT_DIR, "data", "results")
 
 
 class DistributedBatchSamplerWrapper(Sampler):
-    """
-    Wraps a BatchSampler for DistributedDataParallel (DDP) execution 
-    while preserving custom batch ordering and shuffling across epochs.
-    """
     def __init__(self, batch_sampler, num_replicas, rank, shuffle=True):
         self.batch_sampler = batch_sampler
         self.num_replicas = num_replicas
@@ -58,10 +54,6 @@ class DistributedBatchSamplerWrapper(Sampler):
 
 
 def get_clean_state_dict(model):
-    """
-    Extracts state_dict from a potentially wrapped (DDP) and compiled model,
-    stripping distributed module wrappers and TorchInductor '_orig_mod.' prefixes.
-    """
     raw_model = model.module if hasattr(model, "module") else model
     state_dict = raw_model.state_dict()
     clean_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
@@ -104,11 +96,11 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         
+        # OPTIMIZATION 5: Pass transposed logits [B, V, T-1] directly to CrossEntropyLoss without output tensor flattening
         if scaler is not None and device.type == "cuda":
             with torch.amp.autocast(device_type=device.type):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-                output_dim = output.shape[-1]
-                loss = criterion(output[:, 1:].reshape(-1, output_dim), trg[:, 1:].reshape(-1))
+                loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -116,8 +108,7 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
             scaler.update()
         else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-            output_dim = output.shape[-1]
-            loss = criterion(output[:, 1:].reshape(-1, output_dim), trg[:, 1:].reshape(-1))
+            loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             optimizer.step()
@@ -143,12 +134,10 @@ def evaluate_validation(model, dataloader, criterion, device):
             if device.type == "cuda":
                 with torch.amp.autocast(device_type=device.type):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
-                    output_dim = output.shape[-1]
-                    loss = criterion(output[:, 1:].reshape(-1, output_dim), trg[:, 1:].reshape(-1))
+                    loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
             else:
                 output = model(src, trg, teacher_forcing_ratio=0.0)
-                output_dim = output.shape[-1]
-                loss = criterion(output[:, 1:].reshape(-1, output_dim), trg[:, 1:].reshape(-1))
+                loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
             epoch_loss += loss.item()
             
     total_loss = epoch_loss / len(dataloader)
@@ -291,14 +280,25 @@ def main():
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
     if hasattr(torch, "compile"):
-        try:
-            raw_model = model.module if hasattr(model, "module") else model
-            raw_model.encoder = torch.compile(raw_model.encoder)
-            if rank == 0:
-                print("⚡ Compiled Encoder with TorchInductor.")
-        except Exception as e:
-            if rank == 0:
-                print(f"⚠️ torch.compile skipped: {e}")
+        can_compile = True
+
+        if torch.cuda.is_available():
+            major_cap = torch.cuda.get_device_capability()[0]
+            if major_cap < 7:
+                can_compile = False
+                if rank == 0:
+                    print(f"⚠️ torch.compile skipped: GPU Compute Capability ({major_cap}.x < 7.0) is not supported by Triton.")
+
+        if can_compile:
+            try:
+                raw_model = model.module if hasattr(model, "module") else model
+                raw_model.encoder = torch.compile(raw_model.encoder)
+                if rank == 0:
+                    print("⚡ Compiled Encoder with TorchInductor.")
+            except Exception as e:
+                if rank == 0:
+                    print(f"⚠️ torch.compile skipped: {e}")
+    
         
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
@@ -381,7 +381,6 @@ def main():
                         pass
                 break
 
-    # Automated Backfill Evaluation strictly for Main Study Experiments (Skipped for TUNE_ runs)
     if rank == 0:
         if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
             try:

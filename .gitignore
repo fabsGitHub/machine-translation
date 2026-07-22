@@ -5,6 +5,7 @@ data/raw
 *.pkl
 *.pth
 !data/results/
+.venv
 
 # Python environment & cache
 venv/

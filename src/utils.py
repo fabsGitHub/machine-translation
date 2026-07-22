@@ -25,7 +25,6 @@ def set_seed(seed=42, deterministic=False):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     else:
-        # Unlocks optimal cuDNN GEMM kernel selection on RTX 3090 (20%-40% speedup)
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 

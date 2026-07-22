@@ -1,5 +1,6 @@
 import os
 import random
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -87,38 +88,53 @@ class PretokenizedNMTDataset(Dataset):
         else:
             self.trg_vocab = trg_vocab
 
+        # OPTIMIZATION 1: Store sequences as 1D NumPy arrays to prevent millions of standalone torch.Tensor allocations
         self.data = []
         for src, trg in zip(src_texts, trg_texts):
-            src_num = [SOS_IDX] + self.src_vocab.numericalize(src) + [EOS_IDX]
-            trg_num = [SOS_IDX] + self.trg_vocab.numericalize(trg) + [EOS_IDX]
-            self.data.append((
-                torch.tensor(src_num, dtype=torch.long),
-                torch.tensor(trg_num, dtype=torch.long)
-            ))
+            src_num = np.array([SOS_IDX] + self.src_vocab.numericalize(src) + [EOS_IDX], dtype=np.int64)
+            trg_num = np.array([SOS_IDX] + self.trg_vocab.numericalize(trg) + [EOS_IDX], dtype=np.int64)
+            self.data.append((src_num, trg_num))
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        src_arr, trg_arr = self.data[idx]
+        return torch.from_numpy(src_arr), torch.from_numpy(trg_arr)
 
 
 class BucketBatchSampler(Sampler):
     """
-    Groups sequences of similar lengths together to minimize PAD computation.
+    Groups sequences of similar lengths together to minimize PAD computation
+    using megabatch bucketing to preserve batch variance and optimize sorting.
     """
-    def __init__(self, dataset, batch_size, shuffle=True):
+    def __init__(self, dataset, batch_size, shuffle=True, mega_batch_mult=100):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
-        
-        # Sort indices by source sequence length
-        self.indices = sorted(range(len(dataset)), key=lambda i: len(dataset[i][0]))
+        self.mega_batch_size = batch_size * mega_batch_mult
+
+    def _get_src_len(self, idx):
+        if hasattr(self.dataset, 'data'):
+            return len(self.dataset.data[idx][0])
+        return len(self.dataset[idx][0])
 
     def __iter__(self):
-        batches = [self.indices[i:i + self.batch_size] for i in range(0, len(self.indices), self.batch_size)]
+        # OPTIMIZATION 3: Megabatch window bucketing instead of global O(N log N) sorting
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            random.shuffle(indices)
+
+        batches = []
+        for i in range(0, len(indices), self.mega_batch_size):
+            mega_batch = indices[i:i + self.mega_batch_size]
+            mega_batch.sort(key=self._get_src_len)
+            for j in range(0, len(mega_batch), self.batch_size):
+                batches.append(mega_batch[j:j + self.batch_size])
+
         if self.shuffle:
             random.shuffle(batches)
+
         for batch in batches:
             yield batch
 
@@ -142,7 +158,6 @@ def get_dataloader(csv_path, batch_size=512, shuffle=True, src_vocab=None, trg_v
     
     sampler = BucketBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
     
-    # Enable worker optimizations safely depending on worker count
     use_workers = num_workers > 0
     
     loader = DataLoader(

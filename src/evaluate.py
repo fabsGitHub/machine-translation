@@ -157,8 +157,10 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     model = Seq2Seq(enc, dec, device).to(device)
     model.load_state_dict(state_dict)
     
-    if hasattr(torch, "compile"):
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
         model = torch.compile(model)
+    else:
+        print("Skipping torch.compile: GPU Compute Capability < 7.0")
     
     references, hypotheses = [], []
     meta_info = []
@@ -303,8 +305,10 @@ def visualize_sample_attention(model_path, test_csv, sample_index=0):
         model = Seq2Seq(enc, dec, device).to(device)
         model.load_state_dict(state_dict)
 
-        if hasattr(torch, "compile"):
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
             model = torch.compile(model)
+        else:
+            print("Skipping torch.compile: GPU Compute Capability < 7.0")
 
         for idx, (src, _) in enumerate(test_loader):
             if idx == sample_index:

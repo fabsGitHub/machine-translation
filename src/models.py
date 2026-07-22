@@ -65,10 +65,14 @@ class BahdanauAttention(AttentionStrategy):
         keys = projected_encoder if projected_encoder is not None else self.U_a(encoder_outputs)
         if decoder_hidden.dim() == 2:
             query = self.W_a(decoder_hidden).unsqueeze(1)
-            energy = torch.tanh(query.unsqueeze(2) + keys.unsqueeze(1))
-            scores = self.v_a(energy).squeeze(-1)
         else:
             query = self.W_a(decoder_hidden)
+
+        # OPTIMIZATION 2: Avoid intermediate 4D tensor allocation [B, T_tgt, T_src, H] during step-by-step decoding
+        if query.size(1) == 1:
+            energy = torch.tanh(query + keys)
+            scores = self.v_a(energy).squeeze(-1).unsqueeze(1)
+        else:
             energy = torch.tanh(query.unsqueeze(2) + keys.unsqueeze(1))
             scores = self.v_a(energy).squeeze(-1)
             
@@ -90,12 +94,10 @@ class Encoder(nn.Module):
         self.rnn_type = rnn_type
         self.bidirectional = bidirectional
         
-        # Vocab padded to multiple of 16 for Tensor Core alignment
         padded_input_dim = pad_vocab_size(input_dim, multiple=16)
         actual_emb_dim = emb_dim
 
         if pretrained_embeddings is not None:
-            # Zero-pad pretrained embedding rows to match padded_input_dim
             if pretrained_embeddings.shape[0] < padded_input_dim:
                 pad_rows = padded_input_dim - pretrained_embeddings.shape[0]
                 padding_tensor = torch.zeros(
@@ -151,7 +153,6 @@ class Decoder(nn.Module):
         self.decoder_hidden_dim = decoder_hidden_dim
         
         if pretrained_embeddings is not None:
-            # Zero-pad pretrained embedding rows to match padded_output_dim
             if pretrained_embeddings.shape[0] < self.padded_output_dim:
                 pad_rows = self.padded_output_dim - pretrained_embeddings.shape[0]
                 padding_tensor = torch.zeros(
@@ -192,37 +193,29 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward_step(self, input_step, hidden, encoder_outputs):
-        """
-        Executes a single autoregressive decoding step.
-        """
         if input_step.dim() == 1:
-            input_step = input_step.unsqueeze(1)  # [batch_size, 1]
+            input_step = input_step.unsqueeze(1)
 
-        embedded = self.dropout(self.project(self.embedding(input_step)))  # [batch_size, 1, emb_dim]
+        embedded = self.dropout(self.project(self.embedding(input_step)))
 
-        # Extract top-layer hidden state query across LSTM (h, c) or GRU/RNN h
         decoder_query = hidden[0][-1] if isinstance(hidden, tuple) else hidden[-1]
 
         if self.attention_type != "none":
-            attn_weights = self.attention(decoder_query, encoder_outputs)  # [batch_size, 1, src_len]
-            context = torch.bmm(attn_weights, encoder_outputs)              # [batch_size, 1, encoder_hidden_dim]
-            rnn_input = torch.cat((embedded, context), dim=2)               # [batch_size, 1, emb_dim + encoder_hidden_dim]
+            attn_weights = self.attention(decoder_query, encoder_outputs)
+            context = torch.bmm(attn_weights, encoder_outputs)
+            rnn_input = torch.cat((embedded, context), dim=2)
         else:
             rnn_input = embedded
 
-        rnn_output, hidden = self.rnn(rnn_input, hidden)  # rnn_output: [batch_size, 1, decoder_hidden_dim]
-        output = self.fc_out(rnn_output.squeeze(1))       # output: [batch_size, padded_output_dim]
+        rnn_output, hidden = self.rnn(rnn_input, hidden)
+        output = self.fc_out(rnn_output.squeeze(1))
         
         return output, hidden
 
     def forward_vectorized(self, trg_input, hidden, encoder_outputs):
-        """
-        Executes parallelized full-sequence forward pass when teacher_forcing_ratio == 1.0.
-        """
         embedded = self.dropout(self.project(self.embedding(trg_input)))
 
         if self.attention_type != "none":
-            # For attention models, process step-by-step across the sequence length
             outputs = []
             current_hidden = hidden
             for t in range(trg_input.size(1)):
@@ -231,7 +224,6 @@ class Decoder(nn.Module):
                 outputs.append(out.unsqueeze(1))
             return torch.cat(outputs, dim=1), current_hidden
         else:
-            # Non-attention models can process the entire sequence in a single parallel RNN pass
             rnn_output, hidden = self.rnn(embedded, hidden)
             predictions = self.fc_out(rnn_output)
             return predictions, hidden
@@ -265,22 +257,20 @@ class Seq2Seq(nn.Module):
         encoder_outputs, hidden = self.encoder(src)
         hidden = self._bridge_hidden(hidden)
 
-        # ⚡ OPTIMIZATION: Zero-overhead padding for Fully Vectorized Matrix Pass during Teacher Forcing
         if teacher_forcing_ratio == 1.0:
             trg_input = trg[:, :-1]
             predictions, _ = self.decoder.forward_vectorized(trg_input, hidden, encoder_outputs)
-            # Efficiently pad time dimension on the left without creating & slicing extra tensors
             return F.pad(predictions, (0, 0, 1, 0))
 
-        # Sequential decoding fallback for partial teacher forcing / inference
-        outputs = torch.zeros(batch_size, trg_len, self.decoder.padded_output_dim, device=self.device)
+        # OPTIMIZATION 4: Collect step outputs in a list and stack once to eliminate CUDA slice updates overhead
+        outputs_list = [torch.zeros(batch_size, self.decoder.padded_output_dim, device=self.device)]
         input_step = trg[:, 0]
 
         for t in range(1, trg_len):
             output, hidden = self.decoder.forward_step(input_step, hidden, encoder_outputs)
-            outputs[:, t] = output
+            outputs_list.append(output)
             teacher_force = random.random() < teacher_forcing_ratio
             top1 = output.argmax(1)
             input_step = trg[:, t] if teacher_force else top1
 
-        return outputs
+        return torch.stack(outputs_list, dim=1)
