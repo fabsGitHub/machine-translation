@@ -68,7 +68,7 @@ class BahdanauAttention(AttentionStrategy):
         else:
             query = self.W_a(decoder_hidden)
 
-        # OPTIMIZATION 2: Avoid intermediate 4D tensor allocation [B, T_tgt, T_src, H] during step-by-step decoding
+        # OPTIMIZATION: Avoid intermediate 4D tensor allocation [B, T_tgt, T_src, H] during step-by-step decoding
         if query.size(1) == 1:
             energy = torch.tanh(query + keys)
             scores = self.v_a(energy).squeeze(-1).unsqueeze(1)
@@ -135,7 +135,6 @@ class Encoder(nn.Module):
         outputs, hidden = self.rnn(embedded)
         return outputs, hidden
 
-
 # ============================================================================
 # DECODER MODULE
 # ============================================================================
@@ -151,6 +150,7 @@ class Decoder(nn.Module):
         self.attention_type = attention_type
         self.encoder_hidden_dim = encoder_hidden_dim
         self.decoder_hidden_dim = decoder_hidden_dim
+        self.n_layers = n_layers
         
         if pretrained_embeddings is not None:
             if pretrained_embeddings.shape[0] < self.padded_output_dim:
@@ -192,42 +192,58 @@ class Decoder(nn.Module):
         self.fc_out = nn.Linear(decoder_hidden_dim, self.padded_output_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward_step(self, input_step, hidden, encoder_outputs):
+    def forward_step(self, input_step, hidden, encoder_outputs, projected_encoder=None):
         if input_step.dim() == 1:
             input_step = input_step.unsqueeze(1)
 
         embedded = self.dropout(self.project(self.embedding(input_step)))
-
         decoder_query = hidden[0][-1] if isinstance(hidden, tuple) else hidden[-1]
 
         if self.attention_type != "none":
-            attn_weights = self.attention(decoder_query, encoder_outputs)
+            attn_weights = self.attention(decoder_query, encoder_outputs, projected_encoder=projected_encoder)
             context = torch.bmm(attn_weights, encoder_outputs)
             rnn_input = torch.cat((embedded, context), dim=2)
         else:
             rnn_input = embedded
 
-        rnn_output, hidden = self.rnn(rnn_input, hidden)
+        # OPTIMIZATION: Integrate fused JIT CUDA step kernel for 1-layer LSTM step without attention
+        if (self.rnn_type == "LSTM" and self.attention_type == "none" 
+            and self.n_layers == 1 and isinstance(hidden, tuple) and rnn_input.size(1) == 1):
+            h_prev, c_prev = hidden[0].squeeze(0), hidden[1].squeeze(0)
+            x = rnn_input.squeeze(1)
+            w_ih, w_hh = self.rnn.weight_ih_l0, self.rnn.weight_hh_l0
+            b_ih, b_hh = self.rnn.bias_ih_l0, self.rnn.bias_hh_l0
+            h_next, c_next = lstm_decoder_step(x, h_prev, c_prev, w_ih, w_hh, b_ih, b_hh)
+            hidden = (h_next.unsqueeze(0), c_next.unsqueeze(0))
+            rnn_output = h_next.unsqueeze(1)
+        else:
+            rnn_output, hidden = self.rnn(rnn_input, hidden)
+            
         output = self.fc_out(rnn_output.squeeze(1))
-        
         return output, hidden
 
     def forward_vectorized(self, trg_input, hidden, encoder_outputs):
         embedded = self.dropout(self.project(self.embedding(trg_input)))
 
         if self.attention_type != "none":
+            projected_encoder = None
+            if self.attention_type == "luong":
+                projected_encoder = self.attention.attn(encoder_outputs)
+            elif self.attention_type == "bahdanau":
+                projected_encoder = self.attention.U_a(encoder_outputs)
+
             outputs = []
             current_hidden = hidden
             for t in range(trg_input.size(1)):
                 step_in = trg_input[:, t]
-                out, current_hidden = self.forward_step(step_in, current_hidden, encoder_outputs)
+                out, current_hidden = self.forward_step(step_in, current_hidden, encoder_outputs, projected_encoder=projected_encoder)
                 outputs.append(out.unsqueeze(1))
             return torch.cat(outputs, dim=1), current_hidden
         else:
             rnn_output, hidden = self.rnn(embedded, hidden)
             predictions = self.fc_out(rnn_output)
             return predictions, hidden
-             
+
 # ============================================================================
 # SEQ2SEQ WRAPPER
 # ============================================================================
@@ -262,12 +278,18 @@ class Seq2Seq(nn.Module):
             predictions, _ = self.decoder.forward_vectorized(trg_input, hidden, encoder_outputs)
             return F.pad(predictions, (0, 0, 1, 0))
 
-        # OPTIMIZATION 4: Collect step outputs in a list and stack once to eliminate CUDA slice updates overhead
+        # Pre-compute projected encoder outputs once to eliminate repeated projections in step loop
+        projected_encoder = None
+        if self.decoder.attention_type == "luong":
+            projected_encoder = self.decoder.attention.attn(encoder_outputs)
+        elif self.decoder.attention_type == "bahdanau":
+            projected_encoder = self.decoder.attention.U_a(encoder_outputs)
+
         outputs_list = [torch.zeros(batch_size, self.decoder.padded_output_dim, device=self.device)]
         input_step = trg[:, 0]
 
         for t in range(1, trg_len):
-            output, hidden = self.decoder.forward_step(input_step, hidden, encoder_outputs)
+            output, hidden = self.decoder.forward_step(input_step, hidden, encoder_outputs, projected_encoder=projected_encoder)
             outputs_list.append(output)
             teacher_force = random.random() < teacher_forcing_ratio
             top1 = output.argmax(1)

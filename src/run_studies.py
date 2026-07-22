@@ -50,13 +50,13 @@ class AsyncEvaluationQueue:
         self.futures = []
 
     def submit_evaluation(self, experiment_id, rnn_type, token_type):
-        """Queues evaluation in the background strictly on CPU without blocking GPU execution."""
+        """Queues evaluation in the background without holding a global lock during computation."""
         def _task():
+            print(f"\n⚡ [Async Eval Started] -> {experiment_id} ({rnn_type}) [Forced CPU Mode]")
+            run_auto_evaluation(experiment_id, rnn_type)
             with eval_lock:
-                print(f"\n⚡ [Async Eval Started] -> {experiment_id} ({rnn_type}) [Forced CPU Mode]")
-                run_auto_evaluation(experiment_id, rnn_type)
                 sync_ledger_to_token_type(token_type)
-                print(f"✅ [Async Eval Finished] -> {experiment_id} ({rnn_type})")
+            print(f"✅ [Async Eval Finished] -> {experiment_id} ({rnn_type})")
 
         future = self.executor.submit(_task)
         self.futures.append(future)

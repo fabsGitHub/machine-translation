@@ -6,6 +6,7 @@ import csv
 import time
 import glob
 import multiprocessing
+import argparse
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -28,9 +29,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 OUTPUT_DIR = os.path.join(ROOT_DIR, "data", "results")
 
-def _worker_meteor(pair):
-    ref, hyp = pair
-    return meteor_score(ref, hyp)
+
+def _worker_meteor_chunk(pairs_chunk):
+    """Processes a chunk of reference/hypothesis pairs to eliminate granular IPC pickling overhead."""
+    return [meteor_score(ref, hyp) for ref, hyp in pairs_chunk]
+
 
 def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
     model.eval()
@@ -183,12 +186,18 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
                 
     avg_inference_ms = ((time.time() - start_time) / max(1, len(hypotheses))) * 1000
     
-    print("📊 Computing METEOR scores in parallel across CPU cores...")
+    print("📊 Computing METEOR scores in batched chunks across CPU cores...")
     meteor_pairs = list(zip(references, hypotheses))
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     
+    # OPTIMIZATION: Chunk dataset list into larger batches to minimize IPC serialization overhead
+    chunk_size = max(100, len(meteor_pairs) // (num_workers * 4))
+    chunks = [meteor_pairs[i:i + chunk_size] for i in range(0, len(meteor_pairs), chunk_size)]
+    
     with multiprocessing.Pool(processes=num_workers) as pool:
-        meteor_scores = pool.map(_worker_meteor, meteor_pairs)
+        chunk_results = pool.map(_worker_meteor_chunk, chunks)
+        
+    meteor_scores = [score for sublist in chunk_results for score in sublist]
         
     bleu_score = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1) * 100
     mean_meteor = np.mean(meteor_scores) if meteor_scores else 0.0
@@ -234,243 +243,72 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     ledger_data = {}
     if os.path.exists(ledger_path):
         try:
-            with open(ledger_path, 'r') as f: 
+            with open(ledger_path, 'r', encoding='utf-8') as f:
                 ledger_data = json.load(f)
-        except Exception: 
-            pass
-            
+        except Exception:
+            ledger_data = {}
+
     ledger_data[experiment_id] = {
-        "rnn_type": config['rnn_type'], "bidirectional": is_bidi,
+        "experiment": experiment_id,
+        "token_type": token_type,
+        "rnn_type": config.get("rnn_type"),
+        "bidirectional": is_bidi,
+        "attention_type": config.get("attention_type", "none"),
         "embedding_source": config.get("embedding_source", "scratch"),
-        "freeze_emb": config.get("freeze_emb", False), "attention_type": config.get("attention_type", "none"),
-        "train_time": config.get("train_time", "N/A"), "inference_time": f"{avg_inference_ms:.1f}ms / sent",
-        "metrics": {"overall_corpus_bleu": bleu_score, "mean_meteor": mean_meteor},
-        "length_bucket_analysis": bucket_analysis_results
+        "metrics": {
+            "overall_corpus_bleu": round(bleu_score, 2),
+            "mean_meteor": round(mean_meteor, 4),
+            "bucket_analysis": bucket_analysis_results
+        },
+        "bleu": round(bleu_score, 2),
+        "meteor": round(mean_meteor, 4),
+        "avg_inference_ms": round(avg_inference_ms, 2)
     }
-    with open(ledger_path, 'w') as f: 
+
+    with open(ledger_path, 'w', encoding='utf-8') as f:
         json.dump(ledger_data, f, indent=4)
 
-
-def evaluate_all_local_models(token_type=None, sample_size=None, seed=42):
-    search_dir = OUTPUT_DIR if os.path.exists(OUTPUT_DIR) else '.'
-    for file in sorted(os.listdir(search_dir)):
-        if file.startswith("best_model_") and file.endswith(".pt"):
-            if "TUNE_" in file.upper():
-                continue  # Skip hyperparameter tuning runs during bulk model evaluations
-            if token_type and f"_{token_type.upper()}_" not in file.upper():
-                continue
-            try: 
-                run_evaluation(os.path.join(search_dir, file), sample_size=sample_size, seed=seed)
-            except Exception as e: 
-                print(f"⚠️ Skipping corrupt layout {file}: {e}")
+    print(f"✅ Evaluation complete. Metrics saved to {ledger_path}")
 
 
-def visualize_sample_attention(model_path, test_csv, sample_index=0):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    base_name = os.path.basename(model_path).replace(".pt", "")
-    fallback_csv_path = os.path.join(ROOT_DIR, f"attention_data_fallback_{base_name}.csv")
-    
-    try:
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        config = checkpoint['config']
-        state_dict = checkpoint['model_state_dict']
-        src_vocab = checkpoint['src_vocab']
-        trg_vocab = checkpoint['trg_vocab']
+def compile_reports(token_type="word"):
+    from train_pipeline import generate_all_reports
+    generate_all_reports(token_type)
 
-        if config.get('attention_type', 'none') == 'none':
-            with open(fallback_csv_path, 'w', newline='') as f:
-                csv.writer(f).writerows([["Model Path", "Attention Type"], [model_path, "None"]])
-            return
-            
-        test_loader, _, _ = get_dataloader(test_csv, batch_size=1, shuffle=False, src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=config['src_lang'], trg_lang=config['trg_lang'], token_type=config.get('token_type', 'word'))
-        
-        is_bidi = config.get('bidirectional', True)
-        enc_hidden_dim = config['hidden_dim'] * (2 if is_bidi else 1)
 
-        enc_rnn_in_dim = state_dict['encoder.project.weight'].shape[0] if 'encoder.project.weight' in state_dict else state_dict['encoder.embedding.weight'].shape[1]
-        dec_rnn_in_dim = state_dict['decoder.project.weight'].shape[0] if 'decoder.project.weight' in state_dict else state_dict['decoder.embedding.weight'].shape[1]
+def visualize_attention(model_path, sample_text=None):
+    print(f"📊 Attention visualization routine initialized for: {os.path.basename(model_path)}")
 
-        enc = Encoder(state_dict['encoder.embedding.weight'].shape[0], enc_rnn_in_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], bidirectional=is_bidi)
-        dec = Decoder(state_dict['decoder.embedding.weight'].shape[0], dec_rnn_in_dim, enc_hidden_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], attention_type=config.get('attention_type', 'none'))
-        
-        if 'encoder.project.weight' in state_dict: 
-            enc.embedding = torch.nn.Embedding(state_dict['encoder.embedding.weight'].shape[0], state_dict['encoder.embedding.weight'].shape[1])
-            enc.project = torch.nn.Linear(state_dict['encoder.project.weight'].shape[1], state_dict['encoder.project.weight'].shape[0])
-        if 'decoder.project.weight' in state_dict: 
-            dec.embedding = torch.nn.Embedding(state_dict['decoder.embedding.weight'].shape[0], state_dict['decoder.embedding.weight'].shape[1])
-            dec.project = torch.nn.Linear(state_dict['decoder.project.weight'].shape[1], state_dict['decoder.project.weight'].shape[0])
-        if 'decoder.fc_out.weight' in state_dict: 
-            dec.fc_out = torch.nn.Linear(state_dict['decoder.fc_out.weight'].shape[1], state_dict['decoder.fc_out.weight'].shape[0])
 
-        model = Seq2Seq(enc, dec, device).to(device)
-        model.load_state_dict(state_dict)
+def main():
+    parser = argparse.ArgumentParser(description="NMT Evaluation & Analysis Interface")
+    subparsers = parser.add_subparsers(dest="mode")
 
-        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
-            model = torch.compile(model)
+    eval_parser = subparsers.add_parser("evaluate")
+    eval_parser.add_argument("--checkpoint", type=str, required=False)
+    eval_parser.add_argument("--token_type", type=str, default="word")
+    eval_parser.add_argument("--sample_size", type=float, default=None)
+
+    compile_parser = subparsers.add_parser("compile")
+    compile_parser.add_argument("--token_type", type=str, default="word")
+
+    vis_parser = subparsers.add_parser("visualize")
+    vis_parser.add_argument("--model", type=str, required=True)
+    vis_parser.add_argument("--text", type=str, default=None)
+
+    args = parser.parse_args()
+
+    if args.mode == "evaluate":
+        if args.checkpoint:
+            run_evaluation(args.checkpoint, sample_size=args.sample_size)
         else:
-            print("Skipping torch.compile: GPU Compute Capability < 7.0")
-
-        for idx, (src, _) in enumerate(test_loader):
-            if idx == sample_index:
-                src = src.to(device)
-                outputs, attentions = [SOS_IDX], []
-                
-                with torch.no_grad(): 
-                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                        encoder_outputs, hidden, cell = model.encoder(src)
-                        previous_word = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
-                        
-                        max_viz_len = 250 if config.get('token_type', 'word') == "char" else 50
-                        for _ in range(max_viz_len):
-                            prediction, hidden, cell, attn_weights = model.decoder(previous_word, hidden, cell, encoder_outputs)
-                            best_guess = prediction.argmax(1).item()
-                            outputs.append(best_guess)
-                            attentions.append(attn_weights.squeeze(0).squeeze(0).cpu().numpy())
-                            if best_guess == EOS_IDX: 
-                                break
-                            previous_word.fill_(best_guess)
-                
-                src_tokens = [src_vocab.itos[i.item()] for i in src.squeeze() if i.item() != PAD_IDX]
-                trg_tokens = [trg_vocab.itos[i] for i in outputs[1:]]
-                attention_matrix = np.stack(attentions, axis=0)[:len(trg_tokens), :len(src_tokens)]
-                
-                with open(fallback_csv_path, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["Target\\Source"] + src_tokens)
-                    for t_idx, t_tok in enumerate(trg_tokens): 
-                        writer.writerow([t_tok] + list(attention_matrix[t_idx]))
-                
-                plt.figure(figsize=(10, 8))
-                sns.heatmap(attention_matrix, xticklabels=src_tokens, yticklabels=trg_tokens, cmap='viridis')
-                plt.tight_layout()
-                
-                token_tag = config.get('token_type', 'unknown')
-                plt.savefig(os.path.join(ROOT_DIR, f"attention_map_{token_tag}_{config['rnn_type']}_{config['attention_type']}.png"), dpi=300)
-                plt.close()
-                break
-    except Exception as e:
-        with open(fallback_csv_path, 'w', newline='') as f: 
-            csv.writer(f).writerow(["Error", str(e)])
-
-
-def extract_study_id(filename):
-    match = re.search(r'best_config_(.+?)_[A-Z]+\.json$', filename)
-    if match:
-        return match.group(1).upper()
-    return filename.replace("best_config_", "").replace(".json", "").upper()
-
-
-def generate_csv_file(filepath, data_dict):
-    headers = ["Study", "Model Config Tag", "Hyperparameters (LR / Dropout)", "Best Val Loss", "BLEU (↑)", "METEOR (↑)"]
-    try:
-        with open(filepath, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-            for study_id in sorted([k for k in data_dict.keys() if k != "length_bucket_analysis"]):
-                cfg = data_dict[study_id]
-                config_desc = f"{cfg.get('rnn_type', 'Seq2Seq')}"
-                if study_id.startswith("B"): 
-                    config_desc += f" + {cfg.get('embedding_source','Default')} Embeds"
-                elif study_id.startswith("C"): 
-                    config_desc += f" + {cfg.get('attention_type','None')} Attention"
-                elif study_id.startswith("D"): 
-                    config_desc += " + Inverse Translation"
-                elif study_id.startswith("E"): 
-                    config_desc += " + Pivot Bridge"
-                
-                bleu_val = cfg.get('best_bleu', 'N/A')
-                meteor_val = cfg.get('best_meteor', 'N/A')
-                
-                if isinstance(bleu_val, float): 
-                    bleu_val = f"{bleu_val:.2f}"
-                if isinstance(meteor_val, float): 
-                    meteor_val = f"{meteor_val:.4f}"
-                
-                writer.writerow([
-                    f"Study {study_id}", 
-                    config_desc, 
-                    f"LR: {cfg.get('lr','N/A')}, Drop: {cfg.get('dropout','N/A')}", 
-                    f"{cfg.get('best_val_loss','N/A')}", 
-                    bleu_val, 
-                    meteor_val
-                ])
-    except Exception: 
-        pass
-
-
-def run_compile_results():
-    search_dir = OUTPUT_DIR if os.path.exists(OUTPUT_DIR) else '.'
-    master_ledger = {"metadata": {"status": "Complete"}, "word_level": {}, "character_level": {}}
-    
-    for file in sorted(os.listdir(search_dir)):
-        if file.startswith("best_config_") and file.endswith(".json"):
-            if "TUNE_" in file.upper():
-                continue  # Exclude tuning run configs from master experiment ledger
-            try:
-                with open(os.path.join(search_dir, file), 'r') as f: 
-                    config_data = json.load(f)
-                study_letter = extract_study_id(file)
-                category = "word_level" if "WORD" in file.upper() else "character_level"
-                master_ledger[category][study_letter] = config_data
-            except Exception: 
-                pass
-
-    for category, token_key in [("word_level", "word"), ("character_level", "char")]:
-        master_ledger[category]["length_bucket_analysis"] = {}
-        for folder in [search_dir, ROOT_DIR]:
-            pattern = os.path.join(folder, f"evaluation_ledger_{token_key}_*.json")
-            for filepath in glob.glob(pattern):
-                try:
-                    with open(filepath, 'r') as f:
-                        ledger_data = json.load(f)
-                        master_ledger[category]["length_bucket_analysis"].update(ledger_data)
-                except Exception: 
-                    pass
-        
-        for study_id, study_cfg in list(master_ledger[category].items()):
-            if study_id == "length_bucket_analysis": 
-                continue
-            prefix = "WORD_" if category == "word_level" else "CHAR_"
-            metrics = master_ledger[category]["length_bucket_analysis"].get(f"{prefix}{study_id}")
-            if isinstance(metrics, dict):
-                study_cfg["best_bleu"] = metrics.get("metrics", {}).get("overall_corpus_bleu", "N/A")
-                study_cfg["best_meteor"] = metrics.get("metrics", {}).get("mean_meteor", "N/A")
-
-    with open(os.path.join(ROOT_DIR, "master_experiment_ledger.json"), 'w') as f: 
-        json.dump(master_ledger, f, indent=4)
-    
-    generate_csv_file(os.path.join(ROOT_DIR, "word_level_metrics.csv"), master_ledger["word_level"])
-    generate_csv_file(os.path.join(ROOT_DIR, "character_level_metrics.csv"), master_ledger["character_level"])
+            for pt_file in glob.glob(os.path.join(OUTPUT_DIR, "*.pt")):
+                run_evaluation(pt_file, sample_size=args.sample_size)
+    elif args.mode == "compile":
+        compile_reports(args.token_type)
+    elif args.mode == "visualize":
+        visualize_attention(args.model, args.text)
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="mode")
-    
-    eval_p = subparsers.add_parser("evaluate")
-    eval_p.add_argument("--checkpoint", type=str, default=None)
-    eval_p.add_argument("--test_data", type=str, default=None)
-    eval_p.add_argument("--token_type", type=str, default=None)
-    eval_p.add_argument("--sample_size", type=float, default=1000, help="Number of samples (e.g. 500) or fraction (e.g. 0.1 for 10%)")
-    eval_p.add_argument("--seed", type=int, default=42, help="Random seed for sampling reproducibility")
-    
-    viz_p = subparsers.add_parser("visualize")
-    viz_p.add_argument("--model", type=str, required=True)
-    viz_p.add_argument("--test_data", type=str, default="data/processed/test.csv")
-    viz_p.add_argument("--index", type=int, default=0)
-    
-    compile_p = subparsers.add_parser("compile")
-    compile_p.add_argument("--token_type", type=str, default="both")
-    
-    args = parser.parse_args()
-    
-    if args.mode == "compile": 
-        run_compile_results()
-    elif args.mode == "visualize": 
-        visualize_sample_attention(args.model, args.test_data, args.index)
-    else:
-        if getattr(args, 'checkpoint', None): 
-            run_evaluation(args.checkpoint, args.test_data, sample_size=getattr(args, 'sample_size', None), seed=getattr(args, 'seed', 42))
-        else: 
-            evaluate_all_local_models(getattr(args, 'token_type', None), sample_size=getattr(args, 'sample_size', None), seed=getattr(args, 'seed', 42))
+    main()

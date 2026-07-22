@@ -91,16 +91,17 @@ def parse_args():
 
 def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None):
     model.train()
-    epoch_loss = 0
+    epoch_loss_tensor = torch.zeros((), device=device)
+    
     for src, trg in dataloader:
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         
-        # OPTIMIZATION 5: Pass transposed logits [B, V, T-1] directly to CrossEntropyLoss without output tensor flattening
+        # OPTIMIZATION: Ensure contiguous memory strides for CrossEntropyLoss CUDA kernel
         if scaler is not None and device.type == "cuda":
             with torch.amp.autocast(device_type=device.type):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-                loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
+                loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -108,14 +109,15 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
             scaler.update()
         else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-            loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
+            loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             optimizer.step()
             
-        epoch_loss += loss.item()
+        # OPTIMIZATION: Accumulate detached loss tensor on GPU to eliminate blocking GPU-CPU host syncs per batch
+        epoch_loss_tensor += loss.detach()
     
-    total_loss = epoch_loss / len(dataloader)
+    total_loss = (epoch_loss_tensor / len(dataloader)).item()
     
     if dist.is_initialized() and dist.get_world_size() > 1:
         loss_tensor = torch.tensor(total_loss, device=device)
@@ -127,20 +129,20 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
 
 def evaluate_validation(model, dataloader, criterion, device):
     model.eval()
-    epoch_loss = 0
+    epoch_loss_tensor = torch.zeros((), device=device)
     with torch.no_grad():
         for src, trg in dataloader:
             src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
             if device.type == "cuda":
                 with torch.amp.autocast(device_type=device.type):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
-                    loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
+                    loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
             else:
                 output = model(src, trg, teacher_forcing_ratio=0.0)
-                loss = criterion(output[:, 1:].transpose(1, 2), trg[:, 1:])
-            epoch_loss += loss.item()
+                loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+            epoch_loss_tensor += loss.detach()
             
-    total_loss = epoch_loss / len(dataloader)
+    total_loss = (epoch_loss_tensor / len(dataloader)).item()
     
     if dist.is_initialized() and dist.get_world_size() > 1:
         loss_tensor = torch.tensor(total_loss, device=device)
@@ -293,13 +295,13 @@ def main():
             try:
                 raw_model = model.module if hasattr(model, "module") else model
                 raw_model.encoder = torch.compile(raw_model.encoder)
+                raw_model.decoder = torch.compile(raw_model.decoder)
                 if rank == 0:
-                    print("⚡ Compiled Encoder with TorchInductor.")
+                    print("⚡ Compiled Encoder & Decoder with TorchInductor.")
             except Exception as e:
                 if rank == 0:
                     print(f"⚠️ torch.compile skipped: {e}")
     
-        
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None

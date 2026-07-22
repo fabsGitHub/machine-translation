@@ -159,13 +159,11 @@ def preprocess_data(
     df[trg_col] = df[trg_col].str.lower()
 
     punct_regex = r"([.,!?\"':;)(])"
-    df[src_col] = df[src_col].str.replace(punct_regex, r" \1 ", regex=True)
-    df[trg_col] = df[trg_col].str.replace(punct_regex, r" \1 ", regex=True)
-    df[src_col] = df[src_col].str.replace(r"\s+", " ", regex=True).str.strip()
-    df[trg_col] = df[trg_col].str.replace(r"\s+", " ", regex=True).str.strip()
+    df[src_col] = df[src_col].str.replace(punct_regex, r" \1 ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+    df[trg_col] = df[trg_col].str.replace(punct_regex, r" \1 ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
     df = df.drop_duplicates()
 
-    # OPTIMIZATION 6: Optimized vectorized word count without creating intermediate Python lists
+    # Optimized vectorized word count without creating intermediate Python lists
     def get_word_len(series):
         return series.str.count(" ") + 1
 
@@ -220,6 +218,7 @@ def process_and_save_pair(
     train_df.to_csv(train_path, index=False)
     val_df.to_csv(val_path, index=False)
     test_df.to_csv(test_path, index=False)
+
 
 def execute_offline_caching(processed_dir, token_type="word"):
     print("\n" + "─" * 75)
