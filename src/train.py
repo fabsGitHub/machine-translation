@@ -66,6 +66,66 @@ def str2bool(v):
     return v.lower() in ('yes', 'true', 't', 'y', '1')
 
 
+def get_vram_breakdown(model, optimizer, device):
+    """
+    Calculates exact PyTorch CUDA tensor allocations (in MB & GB) for:
+      - Model Weights
+      - Gradients
+      - Optimizer State (Adam moments)
+      - Activations & Output Logits (Dynamic Tensors)
+      - Active Allocations & Peak VRAM Footprint
+    """
+    if not torch.cuda.is_available() or device.type != "cuda":
+        return {
+            "gpu_name": "CPU",
+            "vram_model_mb": 0.0,
+            "vram_gradients_mb": 0.0,
+            "vram_optimizer_mb": 0.0,
+            "vram_activations_mb": 0.0,
+            "vram_allocated_mb": 0.0,
+            "vram_peak_mb": 0.0,
+            "vram_peak_gb": 0.0
+        }
+    
+    raw_model = model.module if hasattr(model, "module") else model
+    
+    # 1. Model Weights Memory
+    model_bytes = sum(p.numel() * p.element_size() for p in raw_model.parameters())
+    
+    # 2. Gradients Memory
+    grad_bytes = sum(p.grad.numel() * p.grad.element_size() for p in raw_model.parameters() if p.grad is not None)
+    
+    # 3. Optimizer State Memory (Adam moments)
+    opt_bytes = 0
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                opt_bytes += v.numel() * v.element_size()
+                
+    allocated_bytes = torch.cuda.memory_allocated(device)
+    peak_bytes = torch.cuda.max_memory_allocated(device)
+    
+    model_mb = model_bytes / (1024 ** 2)
+    grad_mb = grad_bytes / (1024 ** 2)
+    opt_mb = opt_bytes / (1024 ** 2)
+    allocated_mb = allocated_bytes / (1024 ** 2)
+    
+    # Dynamic activations, attention matrices, and vocabulary logits
+    activations_mb = max(0.0, allocated_mb - (model_mb + grad_mb + opt_mb))
+    gpu_name = torch.cuda.get_device_name(device)
+    
+    return {
+        "gpu_name": gpu_name,
+        "vram_model_mb": round(model_mb, 2),
+        "vram_gradients_mb": round(grad_mb, 2),
+        "vram_optimizer_mb": round(opt_mb, 2),
+        "vram_activations_mb": round(activations_mb, 2),
+        "vram_allocated_mb": round(allocated_mb, 2),
+        "vram_peak_mb": round(peak_bytes / (1024 ** 2), 2),
+        "vram_peak_gb": round(peak_bytes / (1024 ** 3), 3)
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Unified Seq2Seq NMT Training Interface")
     parser.add_argument("--experiment", type=str, required=True)
@@ -89,11 +149,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None):
+def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None, vram_stats_out=None):
     model.train()
     epoch_loss_tensor = torch.zeros((), device=device)
     
-    for src, trg in dataloader:
+    for batch_idx, (src, trg) in enumerate(dataloader):
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         
@@ -113,6 +173,10 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
             optimizer.step()
+            
+        # Capture precise VRAM footprint after optimizer step on the first batch
+        if batch_idx == 0 and vram_stats_out is not None and device.type == "cuda":
+            vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
             
         # OPTIMIZATION: Accumulate detached loss tensor on GPU to eliminate blocking GPU-CPU host syncs per batch
         epoch_loss_tensor += loss.detach()
@@ -168,6 +232,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.reset_peak_memory_stats(device)
     else:
         device = torch.device("cpu")
         
@@ -262,15 +327,20 @@ def main():
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         model_size_mb = (total_params * 4) / (1024 ** 2)
+        gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
 
         print("\n" + "─" * 75)
         print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
+        print(f" ├─ Target Device:              {gpu_name}")
         print(f" ├─ Experiment ID:              {args.experiment}")
+        print(f" ├─ Architecture:               {args.rnn_type} ({'Bidirectional' if args.bidirectional else 'Unidirectional'})")
         print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
+        print(f" ├─ Attention Type:             {args.attention_type.upper()}")
+        print(f" ├─ Embedding Source:           {args.embedding_source.upper()}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
         print(f" ├─ Global Batch Size (Total):   {args.batch_size * world_size} sequence(s) across {world_size} rank(s)")
         print(f" ├─ Total Trainable Parameters: {total_params:,}")
-        print(f" └─ Total Model Memory (FP32):  {model_size_mb:.2f} MB")
+        print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
     
     if is_distributed:
@@ -329,6 +399,8 @@ def main():
             loss_history = checkpoint['loss_history']
             start_epoch = len(loss_history.get("train", []))
     
+    vram_stats = {}
+    
     if start_epoch >= args.epochs:
         if rank == 0:
             print(f"📦 Checkpoint already fully trained ({start_epoch}/{args.epochs} epochs). Skipping epoch loop.")
@@ -338,12 +410,23 @@ def main():
                 train_sampler.set_epoch(epoch)
                 val_sampler.set_epoch(epoch)
                 
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, scaler)
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, scaler, vram_stats_out=vram_stats)
             val_loss = evaluate_validation(model, val_loader, criterion, device)
             
             loss_history["train"].append(train_loss)
             loss_history["val"].append(val_loss)
             
+            if rank == 0 and epoch == start_epoch and vram_stats:
+                print("─" * 75)
+                print(f"📊 [PROFILED VRAM TENSOR MEMORY BREAKDOWN - {vram_stats.get('gpu_name', 'CUDA')}]")
+                print(f" ├─ Model Weights VRAM:          {vram_stats.get('vram_model_mb', 0.0):>8.2f} MB")
+                print(f" ├─ Gradients VRAM (p.grad):      {vram_stats.get('vram_gradients_mb', 0.0):>8.2f} MB")
+                print(f" ├─ Optimizer State VRAM (Adam):  {vram_stats.get('vram_optimizer_mb', 0.0):>8.2f} MB (1st & 2nd Moments)")
+                print(f" ├─ Dynamic Activations & Logits: {vram_stats.get('vram_activations_mb', 0.0):>8.2f} MB (Forward/Backward Tensors)")
+                print(f" ├─ Total Active Allocations:    {vram_stats.get('vram_allocated_mb', 0.0):>8.2f} MB")
+                print(f" └─ Peak Measured VRAM Memory:    {vram_stats.get('vram_peak_mb', 0.0):>8.2f} MB ({vram_stats.get('vram_peak_gb', 0.0):.3f} GB)")
+                print("─" * 75 + "\n")
+
             if rank == 0:
                 print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
                 
@@ -352,12 +435,14 @@ def main():
                 if rank == 0:
                     config_dict = vars(args).copy()
                     config_dict.update({
-                        "train_time": f"{time.time() - start_train_time:.1f}s", 
+                        "train_time": f"{time.time() - start_train_time:.1f}", 
                         "best_val_loss": best_val_loss, 
                         "val_loss": best_val_loss,
                         "epochs_trained": len(loss_history["train"]),
                         "loss_history": loss_history
                     })
+                    # Add measured VRAM usage to output JSON ledger
+                    config_dict.update(vram_stats)
                     
                     torch.save({
                         'config': config_dict, 
@@ -377,6 +462,7 @@ def main():
                             with open(config_json_path, 'r') as f:
                                 c_data = json.load(f)
                             c_data["loss_history"] = loss_history
+                            c_data.update(vram_stats)
                             with open(config_json_path, 'w') as f:
                                 json.dump(c_data, f, indent=4)
                     except Exception:

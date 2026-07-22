@@ -8,10 +8,11 @@ import glob
 import multiprocessing
 import argparse
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Subset
 import nltk
-from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
+from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 
 import matplotlib
@@ -46,7 +47,8 @@ def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
         current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
         
         for _ in range(max_len):
-            prediction, hidden = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+            out = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+            prediction = out[0] if isinstance(out, tuple) else out
             best_guess = prediction.argmax(dim=1).item()
             
             if best_guess == EOS_IDX: 
@@ -71,7 +73,8 @@ def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
         outputs = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
         
         for t in range(max_len):
-            prediction, hidden = model.decoder.forward_step(current_tokens, hidden, encoder_outputs)
+            out = model.decoder.forward_step(current_tokens, hidden, encoder_outputs)
+            prediction = out[0] if isinstance(out, tuple) else out
             best_guess = prediction.argmax(dim=1)
             outputs[:, t] = best_guess
             current_tokens = best_guess
@@ -95,7 +98,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
-    state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in checkpoint['model_state_dict'].items()}
+    state_dict = checkpoint['model_state_dict']
     src_vocab = checkpoint.get('src_vocab')
     trg_vocab = checkpoint.get('trg_vocab')
 
@@ -254,6 +257,8 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
         "bidirectional": is_bidi,
         "attention_type": config.get("attention_type", "none"),
         "embedding_source": config.get("embedding_source", "scratch"),
+        "train_time": config.get("train_time", -1),
+        "inference_time": avg_inference_ms,
         "metrics": {
             "overall_corpus_bleu": round(bleu_score, 2),
             "mean_meteor": round(mean_meteor, 4),
@@ -270,170 +275,206 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     print(f"✅ Evaluation complete. Metrics saved to {ledger_path}")
 
 
-def compile_reports(token_type="word"):
-    from train_pipeline import generate_all_reports
-    generate_all_reports(token_type)
+def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
+    """Parses isolated study evaluation ledgers into a consolidated DataFrame."""
+    pattern = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}_*.json")
+    ledger_data = {}
+    
+    for filepath in glob.glob(pattern):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                ledger_data.update(json.load(f))
+        except Exception:
+            pass
+
+    if not ledger_data:
+        return pd.DataFrame()
+
+    records = []
+    for run_id, node in ledger_data.items():
+        cell = node.get("rnn_type", "RNN")
+        bidi = "Bi" if str(node.get("bidirectional", "")).lower() == "true" else "Uni"
+        attn = node.get("attention_type", "none")
+        emb = node.get("embedding_source", "scratch")
+
+        if "PIVOT" in run_id.upper():
+            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
+            study_group = "PIVOT"
+        else:
+            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
+            if attn != "none":
+                variant_desc += f" w/ {attn.capitalize()} Attn"
+            match = re.search(r'_(A|B|C|D|E)\d*', run_id.upper())
+            study_group = match.group(1) if match else "MISC"
+
+        metrics = node.get("metrics", {})
+        bleu = float(metrics.get("overall_corpus_bleu", 0.0))
+        meteor = float(metrics.get("mean_meteor", 0.0))
+        sid = run_id.split("_")[1] if "_" in run_id else run_id
+
+        records.append({
+            "Run ID": run_id,
+            "Tokenization": f"{token_type.capitalize()}-Level",
+            "Study ID": f"Study {sid}",
+            "Top Study Run": f"Study {sid}",
+            "Study Group": study_group,
+            "Architectural Variant": variant_desc,
+            "Best Architectural Variant": variant_desc,
+            "BLEU Score": round(bleu, 2),
+            "Metric 2 (METEOR)": round(meteor, 2),
+            "Train Time": node.get("train_time", "N/A"),
+            "Inference Time": node.get("inference_time", "N/A"),
+            "_composite_score": bleu + (meteor * 100.0)
+        })
+
+    return pd.DataFrame(records)
 
 
-def visualize_attention(model_path, test_csv=None, output_path=None, sample_limit=200):
-    print(f"📊 Attention visualization routine initialized for: {os.path.basename(model_path)}")
-    if not os.path.exists(model_path):
-        print(f"⚠️ Model path not found: {model_path}")
+def generate_all_reports(token_type="word"):
+    """Compiles isolated ledgers into CSV summary reports."""
+    df = load_evaluation_ledger_df(token_type)
+    
+    if df.empty:
+        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers.")
         return
 
+    print("\n" + "="*80 + f"\n📊 GENERATING ALL EVALUATION REPORTS ({token_type.upper()})\n" + "="*80)
+    
+    export_cols = ["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
+
+    consolidated_path = os.path.join(ROOT_DIR, f"consolidated_evaluation_report_{token_type}.csv")
+    df[export_cols].to_csv(consolidated_path, index=False)
+    print(f"💾 Consolidated Report Saved -> {consolidated_path}")
+
+    for group_name, group_df in df.groupby("Study Group"):
+        study_path = os.path.join(ROOT_DIR, f"study_{group_name}_report_{token_type}.csv")
+        group_df[export_cols].to_csv(study_path, index=False)
+        print(f"💾 Isolated Study Matrix Saved -> study_{group_name}_report_{token_type}.csv")
+
+    best_idx = df.groupby("Study Group")["_composite_score"].idxmax()
+    best_df = df.loc[best_idx].sort_values("Study Group")
+    
+    best_export_cols = ["Tokenization", "Top Study Run", "Best Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
+    best_path = os.path.join(ROOT_DIR, f"best_of_studies_report_{token_type}.csv")
+    best_df[best_export_cols].to_csv(best_path, index=False)
+    
+    print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
+
+
+def visualize_attention(model_path, sample_text=None, output_path=None):
+    """Extracts attention alignments from model checkpoint and saves Seaborn heatmap visualization."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    try:
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        config = checkpoint['config']
-        state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in checkpoint['model_state_dict'].items()}
-        src_vocab = checkpoint.get('src_vocab')
-        trg_vocab = checkpoint.get('trg_vocab')
+    if not os.path.exists(model_path):
+        print(f"⚠️ Checkpoint file for visualization not found: {model_path}")
+        return
 
-        if not src_vocab or not trg_vocab:
-            print("⚠️ Vocabularies missing from checkpoint.")
-            return
+    print(f"📊 Generating attention heatmap for model: '{os.path.basename(model_path)}'")
+    
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    config = checkpoint['config']
+    state_dict = checkpoint['model_state_dict']
+    src_vocab = checkpoint.get('src_vocab')
+    trg_vocab = checkpoint.get('trg_vocab')
 
-        src_lang, trg_lang = config.get('src_lang', 'en'), config.get('trg_lang', 'de')
-        token_type = config.get('token_type', 'word')
-        attn_type = config.get('attention_type', 'none')
+    token_type = config.get('token_type', 'word')
+    is_bidi = config.get('bidirectional', True)
+    enc_hidden_dim = config['hidden_dim'] * (2 if is_bidi else 1)
 
-        if not test_csv:
-            test_csv = os.path.join(ROOT_DIR, "data", "processed", f"test_{src_lang}_{trg_lang}.csv")
-            if not os.path.exists(test_csv):
-                legacy_file = "test_sv.csv" if ("sv" in (src_lang, trg_lang)) else "test.csv"
-                test_csv = os.path.join(ROOT_DIR, "data", "processed", legacy_file)
+    enc_rnn_in_dim = state_dict['encoder.project.weight'].shape[0] if 'encoder.project.weight' in state_dict else state_dict['encoder.embedding.weight'].shape[1]
+    dec_rnn_in_dim = state_dict['decoder.project.weight'].shape[0] if 'decoder.project.weight' in state_dict else state_dict['decoder.embedding.weight'].shape[1]
 
-        if not os.path.exists(test_csv):
-            print(f"⚠️ Test CSV not found at: {test_csv}")
-            return
+    enc = Encoder(state_dict['encoder.embedding.weight'].shape[0], enc_rnn_in_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], bidirectional=is_bidi)
+    dec = Decoder(state_dict['decoder.embedding.weight'].shape[0], dec_rnn_in_dim, enc_hidden_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], attention_type=config.get('attention_type', 'none'))
 
-        test_loader, _, _ = get_dataloader(
-            test_csv, batch_size=1, shuffle=False, 
-            src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type
-        )
+    if 'encoder.project.weight' in state_dict: 
+        enc.embedding = torch.nn.Embedding(state_dict['encoder.embedding.weight'].shape[0], state_dict['encoder.embedding.weight'].shape[1])
+        enc.project = torch.nn.Linear(state_dict['encoder.project.weight'].shape[1], state_dict['encoder.project.weight'].shape[0])
+    if 'decoder.project.weight' in state_dict: 
+        dec.embedding = torch.nn.Embedding(state_dict['decoder.embedding.weight'].shape[0], state_dict['decoder.embedding.weight'].shape[1])
+        dec.project = torch.nn.Linear(state_dict['decoder.project.weight'].shape[1], state_dict['decoder.project.weight'].shape[0])
+    if 'decoder.fc_out.weight' in state_dict: 
+        dec.fc_out = torch.nn.Linear(state_dict['decoder.fc_out.weight'].shape[1], state_dict['decoder.fc_out.weight'].shape[0])
 
-        is_bidi = config.get('bidirectional', True)
-        enc_hidden_dim = config['hidden_dim'] * (2 if is_bidi else 1)
-        enc_rnn_in_dim = state_dict['encoder.project.weight'].shape[0] if 'encoder.project.weight' in state_dict else state_dict['encoder.embedding.weight'].shape[1]
-        dec_rnn_in_dim = state_dict['decoder.project.weight'].shape[0] if 'decoder.project.weight' in state_dict else state_dict['decoder.embedding.weight'].shape[1]
+    model = Seq2Seq(enc, dec, device).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
 
-        enc = Encoder(state_dict['encoder.embedding.weight'].shape[0], enc_rnn_in_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], bidirectional=is_bidi)
-        dec = Decoder(state_dict['decoder.embedding.weight'].shape[0], dec_rnn_in_dim, enc_hidden_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], attention_type=attn_type)
-        
-        if 'encoder.project.weight' in state_dict: 
-            enc.embedding = torch.nn.Embedding(state_dict['encoder.embedding.weight'].shape[0], state_dict['encoder.embedding.weight'].shape[1])
-            enc.project = torch.nn.Linear(state_dict['encoder.project.weight'].shape[1], state_dict['encoder.project.weight'].shape[0])
-        if 'decoder.project.weight' in state_dict: 
-            dec.embedding = torch.nn.Embedding(state_dict['decoder.embedding.weight'].shape[0], state_dict['decoder.embedding.weight'].shape[1])
-            dec.project = torch.nn.Linear(state_dict['decoder.project.weight'].shape[1], state_dict['decoder.project.weight'].shape[0])
-        if 'decoder.fc_out.weight' in state_dict: 
-            dec.fc_out = torch.nn.Linear(state_dict['decoder.fc_out.weight'].shape[1], state_dict['decoder.fc_out.weight'].shape[0])
+    if not sample_text:
+        sample_text = "das ist ein beispiel zur visualisierung" if token_type == "word" else "beispiel"
 
-        model = Seq2Seq(enc, dec, device).to(device)
-        model.load_state_dict(state_dict)
-        model.eval()
+    if token_type == "char":
+        src_tokens = list(sample_text)
+    else:
+        src_tokens = sample_text.strip().split()
 
-        best_candidate = None
-        best_combined_score = -1.0
-        smooth_fn = SmoothingFunction().method1
-        max_len = 250 if token_type == "char" else 50
+    src_indices = [SOS_IDX] + [src_vocab.stoi.get(t, src_vocab.stoi.get('<unk>', 0)) for t in src_tokens] + [EOS_IDX]
+    src_tensor = torch.tensor(src_indices, dtype=torch.long, device=device).unsqueeze(0)
 
-        print(f"🔍 Searching test dataset for best candidate sentence (5-20 units)...")
-        with torch.no_grad():
-            for idx, (src, trg) in enumerate(test_loader):
-                if idx >= sample_limit:
-                    break
-                    
-                src = src.to(device)
-                src_indices = [i for i in src[0].tolist() if i not in [PAD_IDX]]
-                src_tokens = [src_vocab.itos.get(i, "<unk>") for i in src_indices if i not in [SOS_IDX, EOS_IDX]]
-                
-                # Sentence length constraint check: between 5 and 20 tokens
-                if not (5 <= len(src_tokens) <= 20):
-                    continue
+    attentions = []
+    trg_tokens = []
+    max_len = 50 if token_type == "word" else 250
 
-                trg_indices = [i for i in trg[0].tolist() if i not in [PAD_IDX]]
-                trg_tokens = [trg_vocab.itos.get(i, "<unk>") for i in trg_indices if i not in [SOS_IDX, EOS_IDX]]
+    with torch.no_grad():
+        encoder_outputs, hidden = model.encoder(src_tensor)
+        hidden = model._bridge_hidden(hidden)
+        current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
 
-                encoder_outputs, hidden = model.encoder(src)
-                hidden = model._bridge_hidden(hidden)
-                current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
+        for _ in range(max_len):
+            out = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+            attn_w = None
+            if isinstance(out, tuple):
+                prediction = out[0]
+                hidden = out[1]
+                if len(out) >= 3:
+                    attn_w = out[2]
+            else:
+                prediction = out
 
-                pred_tokens = []
-                attentions = []
+            if attn_w is None and hasattr(model.decoder, 'attention') and hasattr(model.decoder.attention, 'last_attn_weights'):
+                attn_w = model.decoder.attention.last_attn_weights
 
-                for _ in range(max_len):
-                    if hasattr(model.decoder, "forward_step_with_attention"):
-                        prediction, hidden, attn_weights = model.decoder.forward_step_with_attention(current_token, hidden, encoder_outputs)
-                        if attn_weights is not None:
-                            attentions.append(attn_weights.squeeze(0).cpu().numpy())
-                    else:
-                        prediction, hidden = model.decoder.forward_step(current_token, hidden, encoder_outputs)
-                    
-                    best_guess = prediction.argmax(dim=1).item()
-                    if best_guess == EOS_IDX:
-                        break
-                    if best_guess != PAD_IDX:
-                        pred_tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
-                    current_token = torch.tensor([best_guess], dtype=torch.long, device=device)
+            best_guess = prediction.argmax(dim=1).item()
+            if best_guess == EOS_IDX:
+                break
 
-                b_score = sentence_bleu([trg_tokens], pred_tokens, smoothing_function=smooth_fn)
-                m_score = meteor_score([trg_tokens], pred_tokens)
-                combined_score = b_score + m_score
+            if best_guess != PAD_IDX:
+                trg_tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
+                if attn_w is not None:
+                    w = attn_w.squeeze().cpu().numpy()
+                    attentions.append(w)
+                else:
+                    attentions.append(np.ones(len(src_indices)) / len(src_indices))
 
-                if combined_score > best_combined_score:
-                    best_combined_score = combined_score
-                    
-                    full_src_tokens = [src_vocab.itos.get(i, "<unk>") for i in src_indices]
-                    
-                    if len(attentions) > 0:
-                        matrix = np.array(attentions)[:len(pred_tokens), :len(full_src_tokens)]
-                    else:
-                        matrix = np.zeros((len(pred_tokens), len(full_src_tokens)))
+            current_token = torch.tensor([best_guess], dtype=torch.long, device=device)
 
-                    best_candidate = {
-                        'src_tokens': full_src_tokens,
-                        'pred_tokens': pred_tokens,
-                        'attn_matrix': matrix,
-                        'bleu': b_score * 100,
-                        'meteor': m_score
-                    }
+    if not trg_tokens:
+        print("⚠️ No output tokens generated for visualization.")
+        return
 
-        if best_candidate is None:
-            print("⚠️ No sentence meeting length constraints found. Visualizing fallback sample.")
-            return
+    attn_matrix = np.array(attentions)
 
-        # Plot sequence alignment matrix
-        fig, ax = plt.subplots(figsize=(10, 8))
-        has_attention = attn_type.lower() != 'none'
-        
-        sns.heatmap(
-            best_candidate['attn_matrix'], 
-            xticklabels=best_candidate['src_tokens'], 
-            yticklabels=best_candidate['pred_tokens'], 
-            cmap="viridis", 
-            annot=has_attention,
-            fmt=".2f",
-            cbar=has_attention,
-            ax=ax
-        )
-        
-        plt.xlabel(f"Source Sequence ({src_lang.upper()})")
-        plt.ylabel(f"Generated Translation ({trg_lang.upper()})")
-        plt.title(f"Attention Heatmap: {token_type.capitalize()}-Level ({attn_type.capitalize()} Attention)\n"
-                  f"BLEU: {best_candidate['bleu']:.2f} | METEOR: {best_candidate['meteor']:.4f}")
-        
-        if not output_path:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            output_path = os.path.join(OUTPUT_DIR, f"heatmap_{token_type}_{attn_type}.png")
-            
-        plt.tight_layout()
-        plt.savefig(output_path, bbox_inches="tight")
-        plt.close()
-        print(f"✅ Heatmap visualization saved to: {output_path}")
+    plt.figure(figsize=(10, 8))
+    src_display_labels = ["<sos>"] + src_tokens + ["<eos>"]
+    
+    if attn_matrix.shape[1] == len(src_display_labels):
+        sns.heatmap(attn_matrix, xticklabels=src_display_labels, yticklabels=trg_tokens, cmap="Blues", annot=False)
+    else:
+        sns.heatmap(attn_matrix, yticklabels=trg_tokens, cmap="Blues", annot=False)
 
-    except Exception as e:
-        print(f"⚠️ Error during attention visualization: {e}")
+    plt.xlabel("Source Sequence")
+    plt.ylabel("Target Sequence")
+    plt.title(f"Attention Heatmap [{config.get('experiment', 'NMT')}]")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+
+    if not output_path:
+        exp_id = config.get('experiment', 'vis')
+        output_path = os.path.join(OUTPUT_DIR, f"attention_heatmap_{exp_id}.png")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    plt.savefig(output_path, dpi=300)
+    plt.close()
+    print(f"🖼️ Attention heatmap successfully generated and saved to: {output_path}")
 
 
 def main():
@@ -450,8 +491,7 @@ def main():
 
     vis_parser = subparsers.add_parser("visualize")
     vis_parser.add_argument("--model", type=str, required=True)
-    vis_parser.add_argument("--test_csv", type=str, default=None)
-    vis_parser.add_argument("--output", type=str, default=None)
+    vis_parser.add_argument("--text", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -462,9 +502,9 @@ def main():
             for pt_file in glob.glob(os.path.join(OUTPUT_DIR, "*.pt")):
                 run_evaluation(pt_file, sample_size=args.sample_size)
     elif args.mode == "compile":
-        compile_reports(args.token_type)
+        generate_all_reports(args.token_type)
     elif args.mode == "visualize":
-        visualize_attention(args.model, test_csv=args.test_csv, output_path=args.output)
+        visualize_attention(args.model, args.text)
 
 
 if __name__ == "__main__":

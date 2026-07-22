@@ -19,6 +19,7 @@ matplotlib.use('Agg')
 
 from config import load_config
 from utils import set_seed, check_artifact_cache, is_cache_valid
+from evaluate import generate_all_reports, visualize_attention
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -37,7 +38,7 @@ def get_batch_size(study, token_type):
     if config_batch is not None:
         return str(config_batch)
 
-    return "2048" if token_type == "char" else "1024"
+    return "1024" if token_type == "char" else "512"
 
 
 class AsyncEvaluationQueue:
@@ -301,82 +302,6 @@ def get_best_hyperparameters(stage, token_type, rnn_type=None):
         return default_args
 
 
-def run_evaluation_and_heatmaps():
-    token_types = ['word', 'char']
-    attention_types = ['none', 'luong', 'bahdanau']
-    
-    # Base directory containing saved model checkpoints
-    checkpoint_dir = "data/results/checkpoints"
-    output_dir = "data/results/heatmaps"
-    os.makedirs(output_dir, exist_ok=True)
-
-    heatmap_counter = 0
-
-    for token in token_types:
-        for attn in attention_types:
-            model_filename = f"best_model_{token}_{attn}.pt"
-            model_path = os.path.join(checkpoint_dir, model_filename)
-
-            if not os.path.exists(model_path):
-                print(f"Skipping: Checkpoint {model_path} not found.")
-                continue
-
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            checkpoint = torch.load(model_path, map_location=device)
-            config = checkpoint['config']
-            src_vocab = checkpoint['src_vocab']
-            trg_vocab = checkpoint['trg_vocab']
-
-            # 1. Load test data loader
-            test_loader, _, _ = get_dataloader(
-                "data/processed/test.csv",
-                batch_size=1,
-                shuffle=False,
-                src_vocab=src_vocab,
-                trg_vocab=trg_vocab,
-                src_lang=config['src_lang'],
-                trg_lang=config['trg_lang'],
-                token_type=config['token_type']
-            )
-
-            # 2. Reconstruct Model Architecture
-            pretrained_dim = 300 if config.get('embedding_source') == 'glove' else None
-            num_directions = 2 if config.get('bidirectional', True) else 1
-            enc_hidden_dim = config['hidden_dim'] * num_directions
-
-            enc = Encoder(
-                len(src_vocab),
-                config['emb_dim'],
-                config['hidden_dim'],
-                config['n_layers'],
-                config['dropout'],
-                rnn_type=config['rnn_type'],
-                bidirectional=config.get('bidirectional', True),
-                pretrained_dim=pretrained_dim
-            )
-
-            dec = Decoder(
-                len(trg_vocab),
-                config['emb_dim'],
-                enc_hidden_dim,
-                config['hidden_dim'],
-                config['n_layers'],
-                config['dropout'],
-                rnn_type=config['rnn_type'],
-                attention_type=config.get('attention_type', 'none'),
-                pretrained_dim=pretrained_dim
-            )
-
-            model = Seq2Seq(enc, dec, device).to(device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-
-            # 3. Generate heatmap plot for the best representative sentence
-            save_path = os.path.join(output_dir, f"heatmap_{token}_{attn}.png")
-            generate_attention_heatmap(model, test_loader, src_vocab, trg_vocab, config, save_path)
-            heatmap_counter += 1
-
-    print(f"\nSuccessfully generated {heatmap_counter}/6 total heatmaps in '{output_dir}'.")
-    
 def get_best_empirical_settings(token_type):
     profile = config.get('profiles', {}).get(token_type, {})
     defaults = {
@@ -458,90 +383,6 @@ def get_best_empirical_settings(token_type):
     return defaults
 
 
-def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
-    pattern = os.path.join(REPO_ROOT, f"evaluation_ledger_{token_type}_*.json")
-    ledger_data = {}
-    
-    for filepath in glob.glob(pattern):
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                ledger_data.update(json.load(f))
-        except Exception:
-            pass
-
-    if not ledger_data:
-        return pd.DataFrame()
-
-    records = []
-    for run_id, node in ledger_data.items():
-        cell = node.get("rnn_type", "RNN")
-        bidi = "Bi" if str(node.get("bidirectional", "")).lower() == "true" else "Uni"
-        attn = node.get("attention_type", "none")
-        emb = node.get("embedding_source", "scratch")
-
-        if "PIVOT" in run_id.upper():
-            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
-            study_group = "PIVOT"
-        else:
-            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
-            if attn != "none":
-                variant_desc += f" w/ {attn.capitalize()} Attn"
-            match = re.search(r'_(A|B|C|D|E)\d*', run_id.upper())
-            study_group = match.group(1) if match else "MISC"
-
-        metrics = node.get("metrics", {})
-        bleu = float(metrics.get("overall_corpus_bleu", 0.0))
-        meteor = float(metrics.get("mean_meteor", 0.0))
-        sid = run_id.split("_")[1] if "_" in run_id else run_id
-
-        records.append({
-            "Run ID": run_id,
-            "Tokenization": f"{token_type.capitalize()}-Level",
-            "Study ID": f"Study {sid}",
-            "Top Study Run": f"Study {sid}",
-            "Study Group": study_group,
-            "Architectural Variant": variant_desc,
-            "Best Architectural Variant": variant_desc,
-            "BLEU Score": round(bleu, 2),
-            "Metric 2 (METEOR)": round(meteor, 2),
-            "Train Time": node.get("train_time", "N/A"),
-            "Inference Time": node.get("inference_time", "N/A"),
-            "_composite_score": bleu + (meteor * 100.0)
-        })
-
-    return pd.DataFrame(records)
-
-
-def generate_all_reports(token_type: str):
-    df = load_evaluation_ledger_df(token_type)
-    
-    if df.empty:
-        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers.")
-        return
-
-    print("\n" + "="*80 + f"\n📊 GENERATING ALL EVALUATION REPORTS ({token_type.upper()})\n" + "="*80)
-    
-    export_cols = ["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
-
-    consolidated_path = os.path.join(REPO_ROOT, f"consolidated_evaluation_report_{token_type}.csv")
-    df[export_cols].to_csv(consolidated_path, index=False)
-    print(f"💾 Consolidated Report Saved -> {consolidated_path}")
-
-    for group_name, group_df in df.groupby("Study Group"):
-        study_path = os.path.join(REPO_ROOT, f"study_{group_name}_report_{token_type}.csv")
-        group_df[export_cols].to_csv(study_path, index=False)
-        print(f"💾 Isolated Study Matrix Saved -> study_{group_name}_report_{token_type}.csv")
-
-    best_idx = df.groupby("Study Group")["_composite_score"].idxmax()
-    best_df = df.loc[best_idx].sort_values("Study Group")
-    
-    best_export_cols = ["Tokenization", "Top Study Run", "Best Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
-    best_path = os.path.join(REPO_ROOT, f"best_of_studies_report_{token_type}.csv")
-    best_df[best_export_cols].to_csv(best_path, index=False)
-    
-    print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
-
-
 def execute_preprocessing(token_type="word", mock_mode=False):
     cmd = [sys.executable, os.path.join(SCRIPT_DIR, "preprocess.py"), "--token_type", token_type]
     if mock_mode:
@@ -581,14 +422,19 @@ def run_automated_post_processing(token_type, rnn_type):
             print(f"⚠️ Quantitative pivot dataset evaluation interrupted or unsupported: {e}")
 
     try: 
-        subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "compile", "--token_type", token_type], check=True, env=env)
-    except Exception: pass
+        generate_all_reports(token_type)
+    except Exception as e:
+        print(f"⚠️ Error compiling reports: {e}")
 
     attn_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_C4_{rnn_type}.pt")
-    if not os.path.exists(attn_model): attn_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_C3_{rnn_type}.pt")
+    if not os.path.exists(attn_model): 
+        attn_model = os.path.join(OUTPUT_DIR, f"best_model_{token_type.upper()}_C3_{rnn_type}.pt")
+        
     if os.path.exists(attn_model):
-        try: subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "visualize", "--model", attn_model], check=True, env=env)
-        except Exception: pass
+        try: 
+            visualize_attention(attn_model)
+        except Exception as e:
+            print(f"⚠️ Error rendering attention heatmap: {e}")
 
 
 def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
@@ -919,7 +765,6 @@ if __name__ == "__main__":
                 
                 run_automated_post_processing(token_type=pathway, rnn_type=best["rnn_type"])
                 generate_all_reports(token_type=pathway)
-                run_evaluation_and_heatmaps()
         else:
             for pathway in target_pathways:
                 best = get_best_empirical_settings(token_type=pathway)
@@ -949,6 +794,5 @@ if __name__ == "__main__":
                 
                 run_automated_post_processing(token_type=pathway, rnn_type=best["rnn_type"])
                 generate_all_reports(token_type=pathway)
-                run_evaluation_and_heatmaps()
     finally:
         eval_queue.shutdown()
