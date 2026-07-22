@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 import nltk
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
 
 import matplotlib
@@ -95,7 +95,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
-    state_dict = checkpoint['model_state_dict']
+    state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in checkpoint['model_state_dict'].items()}
     src_vocab = checkpoint.get('src_vocab')
     trg_vocab = checkpoint.get('trg_vocab')
 
@@ -190,7 +190,6 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     meteor_pairs = list(zip(references, hypotheses))
     num_workers = max(1, multiprocessing.cpu_count() - 1)
     
-    # OPTIMIZATION: Chunk dataset list into larger batches to minimize IPC serialization overhead
     chunk_size = max(100, len(meteor_pairs) // (num_workers * 4))
     chunks = [meteor_pairs[i:i + chunk_size] for i in range(0, len(meteor_pairs), chunk_size)]
     
@@ -276,8 +275,165 @@ def compile_reports(token_type="word"):
     generate_all_reports(token_type)
 
 
-def visualize_attention(model_path, sample_text=None):
+def visualize_attention(model_path, test_csv=None, output_path=None, sample_limit=200):
     print(f"📊 Attention visualization routine initialized for: {os.path.basename(model_path)}")
+    if not os.path.exists(model_path):
+        print(f"⚠️ Model path not found: {model_path}")
+        return
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        config = checkpoint['config']
+        state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in checkpoint['model_state_dict'].items()}
+        src_vocab = checkpoint.get('src_vocab')
+        trg_vocab = checkpoint.get('trg_vocab')
+
+        if not src_vocab or not trg_vocab:
+            print("⚠️ Vocabularies missing from checkpoint.")
+            return
+
+        src_lang, trg_lang = config.get('src_lang', 'en'), config.get('trg_lang', 'de')
+        token_type = config.get('token_type', 'word')
+        attn_type = config.get('attention_type', 'none')
+
+        if not test_csv:
+            test_csv = os.path.join(ROOT_DIR, "data", "processed", f"test_{src_lang}_{trg_lang}.csv")
+            if not os.path.exists(test_csv):
+                legacy_file = "test_sv.csv" if ("sv" in (src_lang, trg_lang)) else "test.csv"
+                test_csv = os.path.join(ROOT_DIR, "data", "processed", legacy_file)
+
+        if not os.path.exists(test_csv):
+            print(f"⚠️ Test CSV not found at: {test_csv}")
+            return
+
+        test_loader, _, _ = get_dataloader(
+            test_csv, batch_size=1, shuffle=False, 
+            src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type
+        )
+
+        is_bidi = config.get('bidirectional', True)
+        enc_hidden_dim = config['hidden_dim'] * (2 if is_bidi else 1)
+        enc_rnn_in_dim = state_dict['encoder.project.weight'].shape[0] if 'encoder.project.weight' in state_dict else state_dict['encoder.embedding.weight'].shape[1]
+        dec_rnn_in_dim = state_dict['decoder.project.weight'].shape[0] if 'decoder.project.weight' in state_dict else state_dict['decoder.embedding.weight'].shape[1]
+
+        enc = Encoder(state_dict['encoder.embedding.weight'].shape[0], enc_rnn_in_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], bidirectional=is_bidi)
+        dec = Decoder(state_dict['decoder.embedding.weight'].shape[0], dec_rnn_in_dim, enc_hidden_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], attention_type=attn_type)
+        
+        if 'encoder.project.weight' in state_dict: 
+            enc.embedding = torch.nn.Embedding(state_dict['encoder.embedding.weight'].shape[0], state_dict['encoder.embedding.weight'].shape[1])
+            enc.project = torch.nn.Linear(state_dict['encoder.project.weight'].shape[1], state_dict['encoder.project.weight'].shape[0])
+        if 'decoder.project.weight' in state_dict: 
+            dec.embedding = torch.nn.Embedding(state_dict['decoder.embedding.weight'].shape[0], state_dict['decoder.embedding.weight'].shape[1])
+            dec.project = torch.nn.Linear(state_dict['decoder.project.weight'].shape[1], state_dict['decoder.project.weight'].shape[0])
+        if 'decoder.fc_out.weight' in state_dict: 
+            dec.fc_out = torch.nn.Linear(state_dict['decoder.fc_out.weight'].shape[1], state_dict['decoder.fc_out.weight'].shape[0])
+
+        model = Seq2Seq(enc, dec, device).to(device)
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        best_candidate = None
+        best_combined_score = -1.0
+        smooth_fn = SmoothingFunction().method1
+        max_len = 250 if token_type == "char" else 50
+
+        print(f"🔍 Searching test dataset for best candidate sentence (5-20 units)...")
+        with torch.no_grad():
+            for idx, (src, trg) in enumerate(test_loader):
+                if idx >= sample_limit:
+                    break
+                    
+                src = src.to(device)
+                src_indices = [i for i in src[0].tolist() if i not in [PAD_IDX]]
+                src_tokens = [src_vocab.itos.get(i, "<unk>") for i in src_indices if i not in [SOS_IDX, EOS_IDX]]
+                
+                # Sentence length constraint check: between 5 and 20 tokens
+                if not (5 <= len(src_tokens) <= 20):
+                    continue
+
+                trg_indices = [i for i in trg[0].tolist() if i not in [PAD_IDX]]
+                trg_tokens = [trg_vocab.itos.get(i, "<unk>") for i in trg_indices if i not in [SOS_IDX, EOS_IDX]]
+
+                encoder_outputs, hidden = model.encoder(src)
+                hidden = model._bridge_hidden(hidden)
+                current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
+
+                pred_tokens = []
+                attentions = []
+
+                for _ in range(max_len):
+                    if hasattr(model.decoder, "forward_step_with_attention"):
+                        prediction, hidden, attn_weights = model.decoder.forward_step_with_attention(current_token, hidden, encoder_outputs)
+                        if attn_weights is not None:
+                            attentions.append(attn_weights.squeeze(0).cpu().numpy())
+                    else:
+                        prediction, hidden = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+                    
+                    best_guess = prediction.argmax(dim=1).item()
+                    if best_guess == EOS_IDX:
+                        break
+                    if best_guess != PAD_IDX:
+                        pred_tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
+                    current_token = torch.tensor([best_guess], dtype=torch.long, device=device)
+
+                b_score = sentence_bleu([trg_tokens], pred_tokens, smoothing_function=smooth_fn)
+                m_score = meteor_score([trg_tokens], pred_tokens)
+                combined_score = b_score + m_score
+
+                if combined_score > best_combined_score:
+                    best_combined_score = combined_score
+                    
+                    full_src_tokens = [src_vocab.itos.get(i, "<unk>") for i in src_indices]
+                    
+                    if len(attentions) > 0:
+                        matrix = np.array(attentions)[:len(pred_tokens), :len(full_src_tokens)]
+                    else:
+                        matrix = np.zeros((len(pred_tokens), len(full_src_tokens)))
+
+                    best_candidate = {
+                        'src_tokens': full_src_tokens,
+                        'pred_tokens': pred_tokens,
+                        'attn_matrix': matrix,
+                        'bleu': b_score * 100,
+                        'meteor': m_score
+                    }
+
+        if best_candidate is None:
+            print("⚠️ No sentence meeting length constraints found. Visualizing fallback sample.")
+            return
+
+        # Plot sequence alignment matrix
+        fig, ax = plt.subplots(figsize=(10, 8))
+        has_attention = attn_type.lower() != 'none'
+        
+        sns.heatmap(
+            best_candidate['attn_matrix'], 
+            xticklabels=best_candidate['src_tokens'], 
+            yticklabels=best_candidate['pred_tokens'], 
+            cmap="viridis", 
+            annot=has_attention,
+            fmt=".2f",
+            cbar=has_attention,
+            ax=ax
+        )
+        
+        plt.xlabel(f"Source Sequence ({src_lang.upper()})")
+        plt.ylabel(f"Generated Translation ({trg_lang.upper()})")
+        plt.title(f"Attention Heatmap: {token_type.capitalize()}-Level ({attn_type.capitalize()} Attention)\n"
+                  f"BLEU: {best_candidate['bleu']:.2f} | METEOR: {best_candidate['meteor']:.4f}")
+        
+        if not output_path:
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            output_path = os.path.join(OUTPUT_DIR, f"heatmap_{token_type}_{attn_type}.png")
+            
+        plt.tight_layout()
+        plt.savefig(output_path, bbox_inches="tight")
+        plt.close()
+        print(f"✅ Heatmap visualization saved to: {output_path}")
+
+    except Exception as e:
+        print(f"⚠️ Error during attention visualization: {e}")
 
 
 def main():
@@ -294,7 +450,8 @@ def main():
 
     vis_parser = subparsers.add_parser("visualize")
     vis_parser.add_argument("--model", type=str, required=True)
-    vis_parser.add_argument("--text", type=str, default=None)
+    vis_parser.add_argument("--test_csv", type=str, default=None)
+    vis_parser.add_argument("--output", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -307,7 +464,7 @@ def main():
     elif args.mode == "compile":
         compile_reports(args.token_type)
     elif args.mode == "visualize":
-        visualize_attention(args.model, args.text)
+        visualize_attention(args.model, test_csv=args.test_csv, output_path=args.output)
 
 
 if __name__ == "__main__":

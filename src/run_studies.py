@@ -301,6 +301,82 @@ def get_best_hyperparameters(stage, token_type, rnn_type=None):
         return default_args
 
 
+def run_evaluation_and_heatmaps():
+    token_types = ['word', 'char']
+    attention_types = ['none', 'luong', 'bahdanau']
+    
+    # Base directory containing saved model checkpoints
+    checkpoint_dir = "data/results/checkpoints"
+    output_dir = "data/results/heatmaps"
+    os.makedirs(output_dir, exist_ok=True)
+
+    heatmap_counter = 0
+
+    for token in token_types:
+        for attn in attention_types:
+            model_filename = f"best_model_{token}_{attn}.pt"
+            model_path = os.path.join(checkpoint_dir, model_filename)
+
+            if not os.path.exists(model_path):
+                print(f"Skipping: Checkpoint {model_path} not found.")
+                continue
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            checkpoint = torch.load(model_path, map_location=device)
+            config = checkpoint['config']
+            src_vocab = checkpoint['src_vocab']
+            trg_vocab = checkpoint['trg_vocab']
+
+            # 1. Load test data loader
+            test_loader, _, _ = get_dataloader(
+                "data/processed/test.csv",
+                batch_size=1,
+                shuffle=False,
+                src_vocab=src_vocab,
+                trg_vocab=trg_vocab,
+                src_lang=config['src_lang'],
+                trg_lang=config['trg_lang'],
+                token_type=config['token_type']
+            )
+
+            # 2. Reconstruct Model Architecture
+            pretrained_dim = 300 if config.get('embedding_source') == 'glove' else None
+            num_directions = 2 if config.get('bidirectional', True) else 1
+            enc_hidden_dim = config['hidden_dim'] * num_directions
+
+            enc = Encoder(
+                len(src_vocab),
+                config['emb_dim'],
+                config['hidden_dim'],
+                config['n_layers'],
+                config['dropout'],
+                rnn_type=config['rnn_type'],
+                bidirectional=config.get('bidirectional', True),
+                pretrained_dim=pretrained_dim
+            )
+
+            dec = Decoder(
+                len(trg_vocab),
+                config['emb_dim'],
+                enc_hidden_dim,
+                config['hidden_dim'],
+                config['n_layers'],
+                config['dropout'],
+                rnn_type=config['rnn_type'],
+                attention_type=config.get('attention_type', 'none'),
+                pretrained_dim=pretrained_dim
+            )
+
+            model = Seq2Seq(enc, dec, device).to(device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+
+            # 3. Generate heatmap plot for the best representative sentence
+            save_path = os.path.join(output_dir, f"heatmap_{token}_{attn}.png")
+            generate_attention_heatmap(model, test_loader, src_vocab, trg_vocab, config, save_path)
+            heatmap_counter += 1
+
+    print(f"\nSuccessfully generated {heatmap_counter}/6 total heatmaps in '{output_dir}'.")
+    
 def get_best_empirical_settings(token_type):
     profile = config.get('profiles', {}).get(token_type, {})
     defaults = {
@@ -843,6 +919,7 @@ if __name__ == "__main__":
                 
                 run_automated_post_processing(token_type=pathway, rnn_type=best["rnn_type"])
                 generate_all_reports(token_type=pathway)
+                run_evaluation_and_heatmaps()
         else:
             for pathway in target_pathways:
                 best = get_best_empirical_settings(token_type=pathway)
@@ -872,5 +949,6 @@ if __name__ == "__main__":
                 
                 run_automated_post_processing(token_type=pathway, rnn_type=best["rnn_type"])
                 generate_all_reports(token_type=pathway)
+                run_evaluation_and_heatmaps()
     finally:
         eval_queue.shutdown()
