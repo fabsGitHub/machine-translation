@@ -3,6 +3,7 @@ import json
 import argparse
 import time
 import random
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -140,6 +141,7 @@ def parse_args():
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_ratio", type=float, default=0.5)
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
@@ -152,13 +154,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None, vram_stats_out=None):
+def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None, vram_stats_out=None, grad_accum_steps=1):
     model.train()
     epoch_loss_tensor = torch.zeros((), device=device)
+    optimizer.zero_grad(set_to_none=True)
     
     for batch_idx, (src, trg) in enumerate(dataloader):
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
         
         # Profile on batch_idx == 1 so Adam states are already initialized on GPU
         if batch_idx == 1 and device.type == "cuda":
@@ -168,29 +170,36 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
             with torch.amp.autocast(device_type=device.type):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
                 loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+                loss = loss / grad_accum_steps
+                
             scaler.scale(loss).backward()
             
             # Capture VRAM breakdown at peak backward pass on Batch 1
             if batch_idx == 1 and vram_stats_out is not None:
                 vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
                 
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
         else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
             loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+            loss = loss / grad_accum_steps
             loss.backward()
             
             # Capture VRAM breakdown at peak backward pass on Batch 1
             if batch_idx == 1 and vram_stats_out is not None and device.type == "cuda":
                 vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
                 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            optimizer.step()
+            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             
-        epoch_loss_tensor += loss.detach()
+        epoch_loss_tensor += (loss.detach() * grad_accum_steps)
     
     total_loss = (epoch_loss_tensor / len(dataloader)).item()
     
@@ -201,7 +210,6 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
     
     return total_loss
 
-
 def evaluate_validation(model, dataloader, criterion, device):
     model.eval()
     epoch_loss_tensor = torch.zeros((), device=device)
@@ -211,10 +219,16 @@ def evaluate_validation(model, dataloader, criterion, device):
             if device.type == "cuda":
                 with torch.amp.autocast(device_type=device.type):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
-                    loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+                    output_dim = output.shape[-1]
+                    output_flat = output[:, 1:].reshape(-1, output_dim)
+                    trg_flat = trg[:, 1:].reshape(-1)
+                    loss = criterion(output_flat, trg_flat)
             else:
                 output = model(src, trg, teacher_forcing_ratio=0.0)
-                loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+                output_dim = output.shape[-1]
+                output_flat = output[:, 1:].reshape(-1, output_dim)
+                trg_flat = trg[:, 1:].reshape(-1)
+                loss = criterion(output_flat, trg_flat)
             epoch_loss_tensor += loss.detach()
             
     total_loss = (epoch_loss_tensor / len(dataloader)).item()
@@ -243,6 +257,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     else:
         device = torch.device("cpu")
@@ -339,6 +354,8 @@ def main():
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         model_size_mb = (total_params * 4) / (1024 ** 2)
         gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+        effective_batch_per_gpu = args.batch_size * args.grad_accum_steps
+        global_effective_batch = effective_batch_per_gpu * world_size
 
         print("\n" + "─" * 75)
         print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
@@ -349,7 +366,9 @@ def main():
         print(f" ├─ Attention Type:             {args.attention_type.upper()}")
         print(f" ├─ Embedding Source:           {args.embedding_source.upper()}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
-        print(f" ├─ Global Batch Size (Total):   {args.batch_size * world_size} sequence(s) across {world_size} rank(s)")
+        print(f" ├─ Grad Accumulation Steps:    {args.grad_accum_steps}")
+        print(f" ├─ Effective Batch Size (p/GPU):{effective_batch_per_gpu}")
+        print(f" ├─ Global Effective Batch:     {global_effective_batch} sequence(s) across {world_size} rank(s)")
         print(f" ├─ Total Trainable Parameters: {total_params:,}")
         print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
@@ -423,8 +442,23 @@ def main():
                 train_sampler.set_epoch(epoch)
                 val_sampler.set_epoch(epoch)
                 
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, scaler, vram_stats_out=vram_stats)
+            train_loss = train_epoch(
+                model, 
+                train_loader, 
+                optimizer, 
+                criterion, 
+                args.clip, 
+                device, 
+                args.tf_ratio, 
+                scaler, 
+                vram_stats_out=vram_stats,
+                grad_accum_steps=args.grad_accum_steps
+            )
             val_loss = evaluate_validation(model, val_loader, criterion, device)
+            
+            # Clean cache at end of epoch iteration
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             epoch_duration = time.time() - epoch_start_time
             

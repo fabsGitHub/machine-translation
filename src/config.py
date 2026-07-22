@@ -22,13 +22,13 @@ DEFAULT_CONFIG = {
             "lr": 0.001,
             "dropout": 0.3,
             "emb_dim": 256,
-            "hidden_dim": 512
+            "hidden_dim": 256
         },
         "char": {
             "lr": 0.001,
             "dropout": 0.3,
             "emb_dim": 64,
-            "hidden_dim": 256
+            "hidden_dim": 512
         }
     }
 }

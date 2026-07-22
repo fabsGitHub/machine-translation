@@ -39,7 +39,7 @@ def get_batch_size(study, token_type):
     if config_batch is not None:
         return str(config_batch)
 
-    return "512" if token_type == "char" else "256"
+    return "256" if token_type == "char" else "128"
 
 
 class AsyncEvaluationQueue:
@@ -137,6 +137,10 @@ def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, b
 
 
 def run_cmd(args_list):
+    # Dynamically inject gradient accumulation steps if not provided
+    if "--grad_accum_steps" not in args_list:
+        args_list = ["--grad_accum_steps", "8"] + args_list
+
     i = 0
     kv = {}
     positional = []
@@ -601,6 +605,7 @@ def execute_hyperparameter_tuning(stage, token_type, strategy, samples, epochs, 
     random.seed(42)
     random.shuffle(all_combos)
     selected_combos = all_combos[:min(samples, len(all_combos))]
+    batch_size = get_batch_size("E", token_type)
     
     new_results = []
     
@@ -641,6 +646,7 @@ def execute_hyperparameter_tuning(stage, token_type, strategy, samples, epochs, 
             "--token_type", token_type,
             "--epochs", str(epochs),
             "--lr", str(lr),
+            "--batch_size", batch_size, 
             "--dropout", str(dropout),
             "--emb_dim", str(emb_dim),
             "--hidden_dim", str(hidden_dim)
