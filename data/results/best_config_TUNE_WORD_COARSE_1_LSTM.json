@@ -1,0 +1,44 @@
+{
+    "experiment": "TUNE_WORD_COARSE_1",
+    "rnn_type": "LSTM",
+    "bidirectional": true,
+    "epochs": 4,
+    "lr": 0.001,
+    "dropout": 0.2,
+    "emb_dim": 256,
+    "hidden_dim": 1024,
+    "batch_size": 128,
+    "grad_accum_steps": 8,
+    "clip": 1.0,
+    "tf_ratio": 0.5,
+    "attention_type": "none",
+    "token_type": "word",
+    "embedding_source": "scratch",
+    "freeze_emb": false,
+    "src_lang": "en",
+    "trg_lang": "de",
+    "resume": true,
+    "precision": "auto",
+    "train_time": "155.0",
+    "best_val_loss": 8.023000717163086,
+    "val_loss": 8.023000717163086,
+    "epochs_trained": 1,
+    "loss_history": {
+        "train": [
+            7.65033483505249
+        ],
+        "val": [
+            8.023000717163086
+        ]
+    },
+    "hardware_precision": "bf16",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "vram_model_mb": 681.24,
+    "vram_gradients_mb": 681.24,
+    "vram_optimizer_mb": 0.0,
+    "vram_activations_mb": 4846.75,
+    "vram_allocated_mb": 2636.42,
+    "vram_reserved_mb": 7192.0,
+    "vram_peak_mb": 6209.23,
+    "vram_peak_gb": 7.023
+}
