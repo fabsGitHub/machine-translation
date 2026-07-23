@@ -199,6 +199,46 @@ def load_language_matched_glove(
 
     return weights
 
+import zipfile
+import urllib.request
+
+def download_and_extract_glove(glove_dir="data"):
+    """Downloads and extracts Stanford GloVe embeddings if not present locally."""
+    os.makedirs(glove_dir, exist_ok=True)
+    glove_url = "https://nlp.stanford.edu/data/glove.6B.zip"
+    zip_path = os.path.join(glove_dir, "glove.6B.zip")
+
+    # Check if extracted files already exist
+    existing_files = os.listdir(glove_dir) if os.path.exists(glove_dir) else []
+    if not any(f.startswith("glove") and f.endswith(".txt") for f in existing_files):
+        if not os.path.exists(zip_path):
+            print(f"📥 Downloading GloVe embeddings from {glove_url}...")
+            urllib.request.urlretrieve(glove_url, zip_path)
+        print("📦 Extracting GloVe embeddings...")
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(glove_dir)
+        print("✅ GloVe extraction complete.")
+
+
+def generate_word2vec_embeddings(
+    vocab, train_csv=None, lang="en", emb_dim=300, silent=False, pair_prefix=None
+):
+    """Wrapper mapping generate_word2vec_embeddings to load_pretrained_word_vectors."""
+    return load_pretrained_word_vectors(
+        vocab=vocab, lang=lang, emb_dim=emb_dim, silent=silent
+    )
+
+
+def precompute_word2vec_embeddings(
+    vocab=None, train_csv=None, lang="en", emb_dim=300, silent=False
+):
+    """Pre-computes or caches Word2Vec embeddings for offline processing."""
+    if vocab is not None:
+        return load_pretrained_word_vectors(
+            vocab=vocab, lang=lang, emb_dim=emb_dim, silent=silent
+        )
+    return None
+
 
 def load_glove_embeddings_pair(
     src_vocab,
