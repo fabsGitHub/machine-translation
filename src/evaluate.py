@@ -22,6 +22,9 @@ import seaborn as sns
 from dataset import get_dataloader, SOS_IDX, EOS_IDX, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
 
+# Enable TensorCore TF32 execution globally for Ampere GPUs
+torch.set_float32_matmul_precision('high')
+
 nltk.download('wordnet', quiet=True)
 nltk.download('omw-1.4', quiet=True)
 
@@ -37,56 +40,88 @@ def _worker_meteor_chunk(pairs_chunk):
 
 def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
     model.eval()
-    tokens = []
+    is_cuda = device.type == "cuda"
+    batch_size = src_tensor.size(0)
     
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=is_cuda):
         encoder_outputs, hidden = model.encoder(src_tensor)
         hidden = model._bridge_hidden(hidden)
         
-        current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
+        current_token = torch.full((1,), SOS_IDX, dtype=torch.long, device=device)
+        generated_indices = []
         
+        # Pre-compute Bahdanau projection once for the sequence
+        proj_enc = (
+            model.decoder.attention.U_a(encoder_outputs)
+            if getattr(model.decoder, "attention_type", None) == "bahdanau"
+            else None
+        )
+        
+        # Optimized Code: Accumulate tokens on GPU and transfer in bulk post-loop
         for _ in range(max_len):
-            out = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+            out = model.decoder.forward_step(current_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
             prediction = out[0] if isinstance(out, tuple) else out
-            best_guess = prediction.argmax(dim=1).item()
+            best_guess_tensor = prediction.argmax(dim=1)
+            generated_indices.append(best_guess_tensor)
+            current_token = best_guess_tensor  # Avoid in-place copy_() synchronization overhead
+
+        if generated_indices:
+            indices_cpu = torch.stack(generated_indices, dim=1).cpu().numpy()
+        else:
+            indices_cpu = np.empty((batch_size, 0), dtype=np.int64)
             
-            if best_guess == EOS_IDX: 
+        itos = trg_vocab.itos
+        tokens = []
+        for idx in indices_cpu:
+            if idx == EOS_IDX:
                 break
-            if best_guess != PAD_IDX:
-                tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
-                
-            current_token = torch.tensor([best_guess], dtype=torch.long, device=device)
-            
+            if idx != PAD_IDX:
+                tokens.append(itos.get(idx, "<unk>"))
     return tokens
 
 
 def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
     model.eval()
     batch_size = src_tensor.size(0)
+    is_cuda = device.type == "cuda"
     
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=is_cuda):
         encoder_outputs, hidden = model.encoder(src_tensor)
         hidden = model._bridge_hidden(hidden)
         
         current_tokens = torch.full((batch_size,), SOS_IDX, dtype=torch.long, device=device)
-        outputs = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        output_list = []
         
+        # Pre-compute Bahdanau projection once for the entire batch
+        proj_enc = (
+            model.decoder.attention.U_a(encoder_outputs)
+            if getattr(model.decoder, "attention_type", None) == "bahdanau"
+            else None
+        )
+        
+        # Decode max_len tokens without in-place tensor slice assignments
         for t in range(max_len):
-            out = model.decoder.forward_step(current_tokens, hidden, encoder_outputs)
+            out = model.decoder.forward_step(current_tokens, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
             prediction = out[0] if isinstance(out, tuple) else out
             best_guess = prediction.argmax(dim=1)
-            outputs[:, t] = best_guess
+            output_list.append(best_guess)
             current_tokens = best_guess
         
-    outputs_cpu = outputs.cpu().tolist()
+        outputs = torch.stack(output_list, dim=1) if output_list else torch.empty((batch_size, 0), dtype=torch.long, device=device)
+        
+    # Defer GPU-to-CPU host transfer until full batch sequence decoding finishes
+    outputs_cpu = outputs.cpu().numpy()
+    itos = trg_vocab.itos
     translated_sentences = []
+    
     for i in range(batch_size):
         tokens = []
         for idx in outputs_cpu[i]:
-            if idx == EOS_IDX: 
+            idx_int = int(idx)
+            if idx_int == EOS_IDX: 
                 break
-            if idx != PAD_IDX:
-                tokens.append(trg_vocab.itos.get(idx, "<unk>"))
+            if idx_int != PAD_IDX:
+                tokens.append(itos.get(idx_int, "<unk>"))
         translated_sentences.append(tokens)
     return translated_sentences
 
@@ -115,9 +150,11 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     if not os.path.exists(test_csv): 
         return
         
+    eval_batch_size = config.get('batch_size_char', 4096) if token_type == "char" else config.get('batch_size_word', 1024)
     test_loader, _, _ = get_dataloader(
-        test_csv, batch_size=config.get('batch_size', 2048), shuffle=False, 
-        src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type
+        test_csv, batch_size=eval_batch_size, shuffle=False, 
+        src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type,
+        num_workers=8
     )
     
     if sample_size is not None:
@@ -138,7 +175,10 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
                 batch_size=test_loader.batch_size,
                 shuffle=False,
                 collate_fn=getattr(test_loader, 'collate_fn', None),
-                num_workers=getattr(test_loader, 'num_workers', 0)
+                num_workers=8,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2
             )
 
     is_bidi = config.get('bidirectional', True)
@@ -165,34 +205,36 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     # Safe Hardware Capabilities & Torch Compile Handling
     if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7 and hasattr(torch, "compile"):
         try:
-            model = torch.compile(model)
+            model = torch.compile(model, mode="reduce-overhead")
         except Exception as e:
             print(f"Skipping torch.compile during evaluation: {e}")
     
     references, hypotheses = [], []
     meta_info = []
+    trg_itos = trg_vocab.itos
+    src_itos = src_vocab.itos
     
     start_time = time.time()
     for src, trg in test_loader:
-        src = src.to(device, non_blocking=True)
-        batch_hyps = translate_batch(model, src, trg_vocab, device, max_len=max_len)
+        src_dev = src.to(device, non_blocking=True)
+        batch_hyps = translate_batch(model, src_dev, trg_vocab, device, max_len=max_len)
         hypotheses.extend(batch_hyps)
         
-        trg_list = trg.tolist()
-        src_list = src.tolist()
+        trg_np = trg.numpy()
+        src_np = src.numpy()
         
-        for i in range(len(trg_list)):
-            ref_tokens = [trg_vocab.itos[idx] for idx in trg_list[i] if idx not in [PAD_IDX, SOS_IDX, EOS_IDX]]
+        for i in range(len(trg_np)):
+            ref_tokens = [trg_itos[idx] for idx in trg_np[i] if idx not in (PAD_IDX, SOS_IDX, EOS_IDX)]
             references.append([ref_tokens])
             
-            src_tokens = [src_vocab.itos[idx] for idx in src_list[i] if idx not in [PAD_IDX, SOS_IDX, EOS_IDX]]
+            src_tokens = [src_itos[idx] for idx in src_np[i] if idx not in (PAD_IDX, SOS_IDX, EOS_IDX)]
             meta_info.append(len(src_tokens))
                 
     avg_inference_ms = ((time.time() - start_time) / max(1, len(hypotheses))) * 1000
     
     print("📊 Computing METEOR scores in batched chunks across CPU cores...")
     meteor_pairs = list(zip(references, hypotheses))
-    num_workers = max(1, multiprocessing.cpu_count() - 1)
+    num_workers = min(32, os.cpu_count() or 16)
     
     chunk_size = max(100, len(meteor_pairs) // (num_workers * 4))
     chunks = [meteor_pairs[i:i + chunk_size] for i in range(0, len(meteor_pairs), chunk_size)]
@@ -414,14 +456,23 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
     attentions = []
     trg_tokens = []
     max_len = 50 if token_type == "word" else 250
+    is_cuda = device.type == "cuda"
 
-    with torch.no_grad():
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=is_cuda):
         encoder_outputs, hidden = model.encoder(src_tensor)
         hidden = model._bridge_hidden(hidden)
-        current_token = torch.tensor([SOS_IDX], dtype=torch.long, device=device)
+        
+        current_token = torch.full((1,), SOS_IDX, dtype=torch.long, device=device)
 
+        proj_enc = (
+            model.decoder.attention.U_a(encoder_outputs)
+            if getattr(model.decoder, "attention_type", None) == "bahdanau"
+            else None
+        )
+
+        pred_tensors = []
         for _ in range(max_len):
-            out = model.decoder.forward_step(current_token, hidden, encoder_outputs)
+            out = model.decoder.forward_step(current_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
             attn_w = None
             if isinstance(out, tuple):
                 prediction = out[0]
@@ -434,11 +485,20 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
             if attn_w is not None:
                 attentions.append(attn_w.squeeze(0).cpu())
 
-            prediction = prediction.argmax(dim=1)
-            if prediction.item() == EOS_IDX:
+            pred_tensor = prediction.argmax(dim=1)
+            pred_tensors.append(pred_tensor)
+            current_token.copy_(pred_tensor)
+
+        # Bulk GPU-to-CPU transfer outside the step loop to avoid stream stalls
+        if pred_tensors:
+            pred_indices = torch.cat(pred_tensors).cpu().tolist()
+        else:
+            pred_indices = []
+
+        for pred_val in pred_indices:
+            if pred_val == EOS_IDX:
                 break
-            trg_tokens.append(trg_vocab.itos.get(prediction.item(), "<unk>"))
-            current_token = prediction
+            trg_tokens.append(trg_vocab.itos.get(pred_val, "<unk>"))
 
     if not attentions:
         print("⚠️ Model does not output attention weights (attention_type='none').")

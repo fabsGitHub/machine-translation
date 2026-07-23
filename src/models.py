@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Enable TensorCore TF32 execution globally for Ampere GPUs
+torch.set_float32_matmul_precision('high')
+
 
 class Encoder(nn.Module):
     def __init__(
@@ -24,9 +27,12 @@ class Encoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, emb_dim_in)
 
         if pretrained_emb is not None:
-            self.embedding.weight.data.copy_(
-                torch.tensor(pretrained_emb, dtype=torch.float32)
-            )
+            if isinstance(pretrained_emb, torch.Tensor):
+                self.embedding.weight.data.copy_(pretrained_emb)
+            else:
+                self.embedding.weight.data.copy_(
+                    torch.as_tensor(pretrained_emb, dtype=torch.float32)
+                )
             if freeze_emb:
                 self.embedding.weight.requires_grad = False
 
@@ -78,10 +84,13 @@ class BahdanauAttention(nn.Module):
         self.U_a = nn.Linear(enc_hidden_dim, hidden_dim)
         self.v_a = nn.Linear(hidden_dim, 1, bias=False)
 
-    def forward(self, hidden, encoder_outputs):
-        src_len = encoder_outputs.size(1)
-        h_expanded = hidden.unsqueeze(1).repeat(1, src_len, 1)
-        energy = torch.tanh(self.W_a(h_expanded) + self.U_a(encoder_outputs))
+    def forward(self, hidden, encoder_outputs, proj_enc_outputs=None):
+        # Calculate U_a projection only if not pre-computed and passed in
+        if proj_enc_outputs is None:
+            proj_enc_outputs = self.U_a(encoder_outputs)
+
+        # Implicit PyTorch 3D broadcasting replaces explicit memory allocations
+        energy = torch.tanh(self.W_a(hidden).unsqueeze(1) + proj_enc_outputs)
         score = self.v_a(energy).squeeze(2)
         return F.softmax(score, dim=1)
 
@@ -112,9 +121,12 @@ class Decoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, emb_dim_in)
 
         if pretrained_emb is not None:
-            self.embedding.weight.data.copy_(
-                torch.tensor(pretrained_emb, dtype=torch.float32)
-            )
+            if isinstance(pretrained_emb, torch.Tensor):
+                self.embedding.weight.data.copy_(pretrained_emb)
+            else:
+                self.embedding.weight.data.copy_(
+                    torch.as_tensor(pretrained_emb, dtype=torch.float32)
+                )
             if freeze_emb:
                 self.embedding.weight.requires_grad = False
 
@@ -149,7 +161,7 @@ class Decoder(nn.Module):
         )
         self.fc_out = nn.Linear(fc_in_dim, vocab_size)
 
-    def forward_step(self, input_token, hidden, encoder_outputs):
+    def forward_step(self, input_token, hidden, encoder_outputs, proj_enc_outputs=None):
         # input_token: [batch_size]
         embedded = self.dropout(self.embedding(input_token.unsqueeze(1)))
         if self.project is not None:
@@ -159,7 +171,11 @@ class Decoder(nn.Module):
             h_top = (
                 hidden[0][-1] if isinstance(hidden, tuple) else hidden[-1]
             )
-            attn_weights = self.attention(h_top, encoder_outputs)
+            if self.attention_type == "bahdanau":
+                attn_weights = self.attention(h_top, encoder_outputs, proj_enc_outputs=proj_enc_outputs)
+            else:
+                attn_weights = self.attention(h_top, encoder_outputs)
+
             context = torch.bmm(
                 attn_weights.unsqueeze(1), encoder_outputs
             )  # [batch_size, 1, enc_hidden_dim]
@@ -184,7 +200,7 @@ class Decoder(nn.Module):
     ):
         batch_size, trg_len = trg.shape
 
-        # FAST PATH: Fused cuDNN pass when teacher forcing triggers (tf_ratio ~ 0.4) on non-attention models
+        # FAST PATH: Fused cuDNN pass when teacher forcing triggers on non-attention models
         use_teacher_forcing = self.training and (
             random.random() < teacher_forcing_ratio
         )
@@ -200,30 +216,41 @@ class Decoder(nn.Module):
                 rnn_out
             )  # [batch_size, trg_len-1, vocab_size]
 
-            outputs = torch.zeros(
-                batch_size, trg_len, self.vocab_size, device=trg.device
+            # Pre-allocate zero tensor with contiguous layout avoiding runtime synchronization
+            zero_step = torch.zeros(
+                batch_size, 1, self.vocab_size, device=trg.device, dtype=predictions.dtype, memory_format=torch.contiguous_format
             )
-            outputs[:, 1:] = predictions
-            return outputs
+            return torch.cat([zero_step, predictions], dim=1)
 
-        # STEP-BY-STEP PATH: For attention or when teacher forcing is skipped during training/inference
-        outputs = torch.zeros(
-            batch_size, trg_len, self.vocab_size, device=trg.device
-        )
+        # STEP-BY-STEP PATH: For attention or when teacher forcing is skipped
+        output_list = [
+            torch.zeros(
+                batch_size, self.vocab_size, device=trg.device, dtype=encoder_outputs.dtype
+            )
+        ]
         input_token = trg[:, 0]  # <SOS> token
+
+        # Pre-compute teacher forcing decision vector across sequence steps
+        use_tf_steps = [
+            (self.training and random.random() < teacher_forcing_ratio)
+            for _ in range(1, trg_len)
+        ]
+
+        # Pre-project encoder outputs once if using Bahdanau attention
+        proj_enc = (
+            self.attention.U_a(encoder_outputs)
+            if self.attention_type == "bahdanau"
+            else None
+        )
 
         for t in range(1, trg_len):
             pred, hidden, _ = self.forward_step(
-                input_token, hidden, encoder_outputs
+                input_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc
             )
-            outputs[:, t] = pred
-            teacher_force = self.training and (
-                random.random() < teacher_forcing_ratio
-            )
-            top1 = pred.argmax(1)
-            input_token = trg[:, t] if teacher_force else top1
+            output_list.append(pred)
+            input_token = trg[:, t] if use_tf_steps[t - 1] else pred.argmax(dim=1)
 
-        return outputs
+        return torch.stack(output_list, dim=1)
 
 
 class Seq2Seq(nn.Module):

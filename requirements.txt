@@ -11,3 +11,4 @@ jupyterlab
 scikit-learn
 gensim
 pandas
+bitsandbytes

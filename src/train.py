@@ -4,6 +4,10 @@ import argparse
 import time
 import random
 import torch
+
+# 1. Enable TensorFloat-32 (TF32) for Ampere Tensor Cores immediately at startup
+torch.set_float32_matmul_precision('high')
+
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
@@ -90,7 +94,7 @@ def setup_hardware_precision(device, precision_arg="auto"):
         elif major_cap >= 7:
             chosen_precision = "fp16"
         else:
-            chosen_precision = "fp32"  # Pure FP32 for Pascal (CC 6.x) and older
+            chosen_precision = "fp32"
     else:
         chosen_precision = precision_arg.lower()
 
@@ -172,7 +176,7 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_ratio", type=float, default=0.5)
@@ -203,7 +207,7 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
             torch.cuda.reset_peak_memory_stats(device)
         
         if use_amp:
-            with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype):
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
                 loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
                 loss = loss / grad_accum_steps
@@ -247,7 +251,7 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
     if dist.is_initialized() and dist.get_world_size() > 1:
         loss_tensor = torch.tensor(total_loss, device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        return loss_tensor.item() / dist.get_world_size()
+        return (loss_tensor / dist.get_world_size()).item()
     
     return total_loss
 
@@ -261,7 +265,7 @@ def evaluate_validation(model, dataloader, criterion, device, autocast_dtype=tor
         for src, trg in dataloader:
             src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
             if use_amp:
-                with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype):
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
                     output_dim = output.shape[-1]
                     output_flat = output[:, 1:].reshape(-1, output_dim)
@@ -280,7 +284,7 @@ def evaluate_validation(model, dataloader, criterion, device, autocast_dtype=tor
     if dist.is_initialized() and dist.get_world_size() > 1:
         loss_tensor = torch.tensor(total_loss, device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        return loss_tensor.item() / dist.get_world_size()
+        return (loss_tensor / dist.get_world_size()).item()
         
     return total_loss
 
@@ -336,6 +340,8 @@ def main():
         src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
     )
     
+    # 3. Optimized DataLoader Parameters to prevent CPU worker starvation
+    num_workers = 8  # Optimized for multi-core host CPUs
     if is_distributed:
         train_sampler = DistributedBatchSamplerWrapper(
             raw_train_loader.batch_sampler, num_replicas=world_size, rank=rank, shuffle=True
@@ -348,23 +354,41 @@ def main():
             raw_train_loader.dataset,
             batch_sampler=train_sampler,
             collate_fn=raw_train_loader.collate_fn,
-            num_workers=raw_train_loader.num_workers,
-            pin_memory=raw_train_loader.pin_memory,
-            persistent_workers=(raw_train_loader.num_workers > 0)
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
         )
         val_loader = DataLoader(
             raw_val_loader.dataset,
             batch_sampler=val_sampler,
             collate_fn=raw_val_loader.collate_fn,
-            num_workers=raw_val_loader.num_workers,
-            pin_memory=raw_val_loader.pin_memory,
-            persistent_workers=(raw_val_loader.num_workers > 0)
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
         )
     else:
-        train_loader = raw_train_loader
-        val_loader = raw_val_loader
         train_sampler = None
         val_sampler = None
+        train_loader = DataLoader(
+            raw_train_loader.dataset,
+            batch_sampler=raw_train_loader.batch_sampler,
+            collate_fn=raw_train_loader.collate_fn,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
+        val_loader = DataLoader(
+            raw_val_loader.dataset,
+            batch_sampler=raw_val_loader.batch_sampler,
+            collate_fn=raw_val_loader.collate_fn,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True
+        )
     
     pretrained_src_emb, pretrained_trg_emb = None, None
     silent_logging = rank > 0
@@ -429,19 +453,32 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    # Flexible Compile Handling
+    # 1. Compile Model Graph to fuse kernels and remove Python loop overheads
     if can_compile:
         try:
-            raw_model = model.module if hasattr(model, "module") else model
-            raw_model.encoder = torch.compile(raw_model.encoder)
-            raw_model.decoder = torch.compile(raw_model.decoder)
+            model = torch.compile(model, mode="reduce-overhead")
             if rank == 0:
-                print("⚡ Compiled Encoder & Decoder with TorchInductor.")
+                print("⚡ Compiled Model Graph with TorchInductor (mode='reduce-overhead').")
         except Exception as e:
             if rank == 0:
                 print(f"⚠️ torch.compile skipped due to execution environment: {e}")
     
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # 2. Fast Optimizer Setup: 8-bit AdamW via bitsandbytes or native Fused AdamW
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        if rank == 0:
+            print("⚡ Using BitsAndBytes 8-bit AdamW Optimizer (optim.AdamW8bit).")
+    except ImportError:
+        try:
+            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
+            if rank == 0:
+                print("⚡ Using Native PyTorch Fused AdamW Optimizer (torch.optim.AdamW).")
+        except Exception:
+            optimizer = optim.Adam(model.parameters(), lr=args.lr)
+            if rank == 0:
+                print("⚡ Using Standard Adam Optimizer.")
+
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     
     best_val_loss = float("inf")

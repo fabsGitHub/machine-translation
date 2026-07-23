@@ -3,7 +3,8 @@ import yaml
 
 DEFAULT_CONFIG = {
     "system": {
-        "seed": 42
+        "seed": 42,
+        "float32_matmul_precision": "high",
     },
     "data": {
         "sample_rate": 0.1,
@@ -12,26 +13,38 @@ DEFAULT_CONFIG = {
         "max_word_len": 50,
         "max_char_len": 300,
         "raw_dir": "data/raw",
-        "processed_dir": "data/processed"
+        "processed_dir": "data/processed",
+        "num_workers": 16,
+        "pin_memory": True,
+        "prefetch_factor": 4,
+        "persistent_workers": True,
     },
     "training": {
-        "epochs": 1
+        "epochs": 1,
+        "batch_size_word": 2048,
+        "batch_size_char": 4096,
+        "grad_accum_steps": 1,
+        "precision": "bfloat16",
+        "use_8bit_adam": True,
     },
     "profiles": {
         "word": {
             "lr": 0.001,
             "dropout": 0.3,
             "emb_dim": 256,
-            "hidden_dim": 256
+            "hidden_dim": 256,
+            "batch_size": 2048,
         },
         "char": {
             "lr": 0.001,
             "dropout": 0.3,
             "emb_dim": 64,
-            "hidden_dim": 512
-        }
-    }
+            "hidden_dim": 512,
+            "batch_size": 4096,
+        },
+    },
 }
+
 
 def load_config(config_path="config/config.yaml"):
     """Loads operational thresholds and parameter profiles safely from disk with fallback defaults."""
@@ -40,7 +53,14 @@ def load_config(config_path="config/config.yaml"):
             with open(config_path, "r", encoding="utf-8") as f:
                 loaded = yaml.safe_load(f)
                 if loaded and isinstance(loaded, dict):
-                    return loaded
+                    # Perform deep dictionary merge so explicit configs retain hardware defaults
+                    merged = DEFAULT_CONFIG.copy()
+                    for k, v in loaded.items():
+                        if isinstance(v, dict) and k in merged and isinstance(merged[k], dict):
+                            merged[k] = {**merged[k], **v}
+                        else:
+                            merged[k] = v
+                    return merged
         except Exception:
             pass
     return DEFAULT_CONFIG

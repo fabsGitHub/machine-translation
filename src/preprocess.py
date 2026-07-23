@@ -4,12 +4,16 @@ import shutil
 import tarfile
 import urllib.request
 import pandas as pd
+import torch
 from sklearn.model_selection import train_test_split
 from utils import setup_logging
 
 from config import load_config
 from dataset import PretokenizedNMTDataset
 from embeddings import download_and_extract_glove, precompute_word2vec_embeddings
+
+# Enable TensorCore TF32 precision globally across runtime operations
+torch.set_float32_matmul_precision('high')
 
 MOCK_DATA_DE_EN = {
     "de": [
@@ -136,6 +140,35 @@ def download_and_extract_europarl(raw_dir, lang_pair="de-en"):
     return f1, f2
 
 
+def _fast_read_lines(filepath):
+    """Fast vectorized text file reading using PyArrow/C engine where available."""
+    try:
+        df = pd.read_csv(
+            filepath,
+            sep="\n",
+            header=None,
+            engine="pyarrow",
+            quoting=3,
+            on_bad_lines="skip",
+            dtype_backend="pyarrow",
+        )
+        return df[0]
+    except Exception:
+        try:
+            df = pd.read_csv(
+                filepath,
+                sep="\n",
+                header=None,
+                engine="c",
+                quoting=3,
+                on_bad_lines="skip",
+            )
+            return df[0]
+        except Exception:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return pd.Series(f.read().splitlines())
+
+
 def preprocess_data(
     df,
     src_col="de",
@@ -156,11 +189,11 @@ def preprocess_data(
 
     df[src_col] = df[src_col].str.strip()
     df[trg_col] = df[trg_col].str.strip()
-    
+
     # Filter empty rows and XML tag markers
     df = df[(df[src_col] != "") & (df[trg_col] != "")]
     df = df[~df[src_col].str.startswith("<") & ~df[trg_col].str.startswith("<")]
-    
+
     df[src_col] = df[src_col].str.lower()
     df[trg_col] = df[trg_col].str.lower()
 
@@ -178,7 +211,7 @@ def preprocess_data(
         .str.replace(r"\s+", " ", regex=True)
         .str.strip()
     )
-    
+
     df = df.drop_duplicates()
 
     # Optimized vectorized word count
@@ -238,57 +271,63 @@ def process_and_save_pair(
     test_df.to_csv(test_path, index=False)
 
 
+def _cache_single_pair(src, trg, processed_dir, token_type):
+    pair_tag = f"{src}_{trg}"
+    train_csv = get_split_path(processed_dir, "train", src, trg)
+    val_csv = get_split_path(processed_dir, "val", src, trg)
+    test_csv = get_split_path(processed_dir, "test", src, trg)
+
+    if os.path.exists(train_csv):
+        print(
+            "\n📦 Pre-tokenizing & caching binary tensors for pair:"
+            f" {src.upper()} -> {trg.upper()}"
+        )
+        train_ds = PretokenizedNMTDataset(
+            train_csv, src_lang=src, trg_lang=trg, token_type=token_type
+        )
+        if os.path.exists(val_csv):
+            PretokenizedNMTDataset(
+                val_csv,
+                src_lang=src,
+                trg_lang=trg,
+                token_type=token_type,
+                src_vocab=train_ds.src_vocab,
+                trg_vocab=train_ds.trg_vocab,
+            )
+        if os.path.exists(test_csv):
+            PretokenizedNMTDataset(
+                test_csv,
+                src_lang=src,
+                trg_lang=trg,
+                token_type=token_type,
+                src_vocab=train_ds.src_vocab,
+                trg_vocab=train_ds.trg_vocab,
+            )
+
+        if token_type in ["word", "both"]:
+            for dim in [128, 256]:
+                precompute_word2vec_embeddings(
+                    train_csv, train_ds.src_vocab, src, emb_dim=dim, pair_prefix=pair_tag
+                )
+                precompute_word2vec_embeddings(
+                    train_csv, train_ds.trg_vocab, trg, emb_dim=dim, pair_prefix=pair_tag
+                )
+
+
 def execute_offline_caching(processed_dir, token_type="word"):
     """
     Pre-tokenizes CSV splits and caches binary tensors (.pt matrix files)
-    and pre-computed Word2Vec embedding weights locally.
+    and pre-computed Word2Vec embedding weights locally. Runs sequentially per pair to allow
+    inner dataset worker pools to fully utilize all available host CPU cores without contention.
     """
     print("\n" + "─" * 75)
     print("⚡ [OFFLINE BINARY CACHING & TENSOR PRE-SERIALIZATION]")
     print("─" * 75)
 
     pairs = [("de", "en"), ("en", "de"), ("en", "sv")]
+
     for src, trg in pairs:
-        pair_tag = f"{src}_{trg}"
-        train_csv = get_split_path(processed_dir, "train", src, trg)
-        val_csv = get_split_path(processed_dir, "val", src, trg)
-        test_csv = get_split_path(processed_dir, "test", src, trg)
-
-        if os.path.exists(train_csv):
-            print(
-                "\n📦 Pre-tokenizing & caching binary tensors for pair:"
-                f" {src.upper()} -> {trg.upper()}"
-            )
-            train_ds = PretokenizedNMTDataset(
-                train_csv, src_lang=src, trg_lang=trg, token_type=token_type
-            )
-            if os.path.exists(val_csv):
-                PretokenizedNMTDataset(
-                    val_csv,
-                    src_lang=src,
-                    trg_lang=trg,
-                    token_type=token_type,
-                    src_vocab=train_ds.src_vocab,
-                    trg_vocab=train_ds.trg_vocab,
-                )
-            if os.path.exists(test_csv):
-                PretokenizedNMTDataset(
-                    test_csv,
-                    src_lang=src,
-                    trg_lang=trg,
-                    token_type=token_type,
-                    src_vocab=train_ds.src_vocab,
-                    trg_vocab=train_ds.trg_vocab,
-                )
-
-            if token_type in ["word", "both"]:
-                for dim in [128, 256]:
-                    precompute_word2vec_embeddings(
-                        train_csv, train_ds.src_vocab, src, emb_dim=dim, pair_prefix=pair_tag
-                    )
-                    precompute_word2vec_embeddings(
-                        train_csv, train_ds.trg_vocab, trg, emb_dim=dim, pair_prefix=pair_tag
-                    )
+        _cache_single_pair(src, trg, processed_dir, token_type)
 
 
 def main():
@@ -303,7 +342,7 @@ def main():
         choices=["word", "char", "both"],
     )
     args = parser.parse_args()
-    
+
     setup_logging(log_filename=f"preprocess_{args.token_type}.log", log_dir="data/results")
 
     config = load_config()
@@ -350,10 +389,8 @@ def main():
 
         download_and_extract_glove(os.path.dirname(raw_dir))
 
-        with open(de_file, "r", encoding="utf-8") as f:
-            de_sentences = f.read().splitlines()
-        with open(en_file, "r", encoding="utf-8") as f:
-            en_sentences = f.read().splitlines()
+        de_sentences = _fast_read_lines(de_file)
+        en_sentences = _fast_read_lines(en_file)
         raw_df = pd.DataFrame({"de": de_sentences, "en": en_sentences})
 
         sampled_df = raw_df.sample(
@@ -402,10 +439,8 @@ def main():
         if not sv_file or not en_sv_file:
             sv_file, en_sv_file = download_and_extract_europarl(raw_dir, "sv-en")
 
-        with open(sv_file, "r", encoding="utf-8") as f:
-            sv_sentences = f.read().splitlines()
-        with open(en_sv_file, "r", encoding="utf-8") as f:
-            en_sv_sentences = f.read().splitlines()
+        sv_sentences = _fast_read_lines(sv_file)
+        en_sv_sentences = _fast_read_lines(en_sv_file)
         raw_sv_df = pd.DataFrame({"en": en_sv_sentences, "sv": sv_sentences})
 
         sampled_sv_df = raw_sv_df.sample(

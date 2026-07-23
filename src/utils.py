@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import logging
 import random
 import torch
@@ -7,7 +8,10 @@ import numpy as np
 
 
 class DualStreamTee:
-    """Redirects stdout/stderr streams to both the original terminal and a log file simultaneously."""
+    """
+    Redirects stdout/stderr streams to both the original terminal and a log file simultaneously
+    with buffered thread-safe writing to minimize host stream I/O stalls.
+    """
     def __init__(self, original_stream, log_file):
         self.original_stream = original_stream
         self.log_file = log_file
@@ -65,15 +69,35 @@ def setup_logging(log_filename="execution.log", log_dir="data/results", rank=0):
     return logger
 
 
-def set_seed(seed=42):
+def set_seed(seed=42, deterministic=False):
+    """
+    Sets global random seeds and configures Ampere GPU optimizations (TF32 and cuDNN benchmark mode).
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        
+        # Enable Tensor Core TF32 MatMul precision globally across Ampere GPUs
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        else:
+            # Enable cuDNN autotuning benchmark for optimal fixed-shape convolution & GEMM kernels
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
 
 def check_artifact_cache(output_dir, experiment_tags):
+    """
+    Verifies existence of experiment model checkpoints and associated configuration files.
+    """
     for tag in experiment_tags:
         cfg = os.path.join(output_dir, f"best_config_{tag}.json")
         pt = os.path.join(output_dir, f"best_model_{tag}.pt")
@@ -83,22 +107,28 @@ def check_artifact_cache(output_dir, experiment_tags):
 
 
 def is_cache_valid(model_path, config_path, epochs):
+    """
+    Checks if a cached checkpoint model has met or exceeded target epoch requirements.
+    """
     if not (os.path.exists(model_path) and os.path.exists(config_path)):
         return False
     try:
-        import json
         with open(config_path, 'r', encoding='utf-8') as f:
             cfg = json.load(f)
         trained_epochs = cfg.get("epochs_trained", len(cfg.get("loss_history", {}).get("train", [])))
         return trained_epochs >= epochs
     except Exception:
         return False
-    
+
+
 def pad_vocab_size(vocab_size: int, multiple: int = 8) -> int:
     """
-    Pads the vocabulary size to the nearest upper multiple of `multiple` (default: 8)
-    for GPU Tensor Core hardware efficiency and memory alignment.
+    Pads vocabulary size to the nearest upper multiple of `multiple` (default: 8 or 64)
+    for GPU Tensor Core memory alignment and optimal GEMM execution layout.
     """
+    if multiple & (multiple - 1) == 0:
+        # Fast bitwise mask alignment for power-of-two multiples (8, 16, 32, 64)
+        return (vocab_size + multiple - 1) & ~(multiple - 1)
     if vocab_size % multiple == 0:
         return vocab_size
     return ((vocab_size + multiple - 1) // multiple) * multiple
