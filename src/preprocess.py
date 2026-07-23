@@ -313,23 +313,30 @@ def _cache_single_pair(src, trg, processed_dir, token_type):
                 trg_vocab=train_ds.trg_vocab,
             )
 
-        # preprocess.py
+        # Precompute and disk-cache resulting embedding matrices
         if token_type in ["word", "both"]:
+            matrix_cache_dir = os.path.join(processed_dir, ".matrix_cache")
+            os.makedirs(matrix_cache_dir, exist_ok=True)
+
             for dim in [128, 256]:
-                precompute_word2vec_embeddings(
-                    vocab=train_ds.src_vocab,
-                    train_csv=train_csv,
-                    lang=src,
-                    emb_dim=dim,
-                    pair_prefix=pair_tag
-                )
-                precompute_word2vec_embeddings(
-                    vocab=train_ds.trg_vocab,
-                    train_csv=train_csv,
-                    lang=trg,
-                    emb_dim=dim,
-                    pair_prefix=pair_tag
-                )
+                for lang, vocab in [(src, train_ds.src_vocab), (trg, train_ds.trg_vocab)]:
+                    cache_filename = f"emb_matrix_{pair_tag}_{lang}_{dim}d_{token_type}.pt"
+                    cache_path = os.path.join(matrix_cache_dir, cache_filename)
+
+                    if os.path.exists(cache_path):
+                        print(f"⚡ Embedding matrix cache loaded -> {cache_path}")
+                    else:
+                        weights = precompute_word2vec_embeddings(
+                            vocab=vocab,
+                            train_csv=train_csv,
+                            lang=lang,
+                            emb_dim=dim,
+                            pair_prefix=pair_tag,
+                            token_type=token_type,
+                        )
+                        if weights is not None:
+                            torch.save(weights, cache_path)
+                            print(f"⚡ Saved embedding matrix cache -> {cache_path}")
 
 
 def execute_offline_caching(processed_dir, token_type="word"):
