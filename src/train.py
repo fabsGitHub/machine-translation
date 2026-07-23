@@ -176,7 +176,7 @@ def parse_args():
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_ratio", type=float, default=0.5)

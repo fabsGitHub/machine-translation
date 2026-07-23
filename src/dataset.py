@@ -284,9 +284,9 @@ def collate_fn(batch):
     trg_padded = pad_sequence(trg_list, batch_first=True, padding_value=PAD_IDX)
     
     # Explicitly pin memory in the collate function for asynchronous CUDA transfers
-    if torch.cuda.is_available():
-        src_padded = src_padded.pin_memory()
-        trg_padded = trg_padded.pin_memory()
+    # if torch.cuda.is_available():
+    #     src_padded = src_padded.pin_memory()
+    #     trg_padded = trg_padded.pin_memory()
         
     return src_padded, trg_padded
 

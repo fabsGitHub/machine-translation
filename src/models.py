@@ -218,7 +218,7 @@ class Decoder(nn.Module):
 
             # Pre-allocate zero tensor with contiguous layout avoiding runtime synchronization
             zero_step = torch.zeros(
-                batch_size, 1, self.vocab_size, device=trg.device, dtype=predictions.dtype, memory_format=torch.contiguous_format
+                (batch_size, 1, self.vocab_size), device=trg.device, dtype=predictions.dtype
             )
             return torch.cat([zero_step, predictions], dim=1)
 
