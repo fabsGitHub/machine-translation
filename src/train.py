@@ -66,15 +66,52 @@ def str2bool(v):
     return v.lower() in ('yes', 'true', 't', 'y', '1')
 
 
+def setup_hardware_precision(device, precision_arg="auto"):
+    """
+    Dynamically configures hardware precision (FP32, FP16 AMP, BF16 AMP) 
+    and hardware features (TF32, torch.compile) based on detected CUDA Compute Capability.
+    """
+    if device.type != "cuda":
+        return "fp32", torch.float32, None, False, False
+
+    major_cap, minor_cap = torch.cuda.get_device_capability(device)
+    supports_tf32 = False
+    
+    # Enable TF32 for Ampere / Ada / Hopper (Compute Capability >= 8.0)
+    if major_cap >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        supports_tf32 = True
+
+    # Resolve Precision Mode
+    if precision_arg == "auto":
+        if major_cap >= 8 and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            chosen_precision = "bf16"
+        elif major_cap >= 7:
+            chosen_precision = "fp16"
+        else:
+            chosen_precision = "fp32"  # Pure FP32 for Pascal (CC 6.x) and older
+    else:
+        chosen_precision = precision_arg.lower()
+
+    # Configure Autocast Dtype and GradScaler
+    if chosen_precision == "fp16":
+        autocast_dtype = torch.float16
+        scaler = torch.amp.GradScaler("cuda")
+    elif chosen_precision == "bf16":
+        autocast_dtype = torch.bfloat16
+        scaler = None  # BF16 offers dynamic range matching FP32 and does not require loss scaling
+    else:
+        chosen_precision = "fp32"
+        autocast_dtype = torch.float32
+        scaler = None
+
+    supports_compile = (major_cap >= 7) and hasattr(torch, "compile")
+    return chosen_precision, autocast_dtype, scaler, supports_compile, supports_tf32
+
+
 def get_vram_breakdown(model, optimizer, device):
-    """
-    Calculates exact PyTorch CUDA tensor allocations (in MB & GB) for:
-      - Model Weights
-      - Gradients
-      - Optimizer State (Adam moments)
-      - Dynamic Activations & Logits
-      - Active Allocations & Reserved Peak VRAM Footprint
-    """
+    """Calculates PyTorch CUDA tensor memory allocation breakdown."""
     if not torch.cuda.is_available() or device.type != "cuda":
         return {
             "gpu_name": "CPU",
@@ -90,13 +127,9 @@ def get_vram_breakdown(model, optimizer, device):
     
     raw_model = model.module if hasattr(model, "module") else model
     
-    # 1. Model Weights Memory
     model_bytes = sum(p.numel() * p.element_size() for p in raw_model.parameters())
-    
-    # 2. Gradients Memory
     grad_bytes = sum(p.grad.numel() * p.grad.element_size() for p in raw_model.parameters() if p.grad is not None)
     
-    # 3. Optimizer State Memory (Adam moments)
     opt_bytes = 0
     for state in optimizer.state.values():
         for k, v in state.items():
@@ -140,7 +173,7 @@ def parse_args():
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps (Optimized 1-2 for GTX 1070)")
+    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_ratio", type=float, default=0.5)
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
@@ -150,13 +183,18 @@ def parse_args():
     parser.add_argument("--src_lang", type=str, default="de")
     parser.add_argument("--trg_lang", type=str, default="en")
     parser.add_argument("--resume", type=str2bool, default=True, help="Resume from existing checkpoint if present")
+    parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"],
+                        help="Precision mode: 'auto' chooses optimal setting based on GPU capabilities.")
     return parser.parse_args()
 
 
-def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None, vram_stats_out=None, grad_accum_steps=1):
+def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, 
+                scaler=None, autocast_dtype=torch.float32, vram_stats_out=None, grad_accum_steps=1):
     model.train()
     epoch_loss_tensor = torch.zeros((), device=device)
     optimizer.zero_grad(set_to_none=True)
+    
+    use_amp = (device.type == "cuda") and (autocast_dtype in (torch.float16, torch.bfloat16))
     
     for batch_idx, (src, trg) in enumerate(dataloader):
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
@@ -164,25 +202,31 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
         if batch_idx == 1 and device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         
-        # Standard FP32 path (Active when scaler is None, e.g., on GTX 1070 or CPU)
-        if scaler is not None and device.type == "cuda":
-            with torch.amp.autocast(device_type=device.type):
+        if use_amp:
+            with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
                 loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
                 loss = loss / grad_accum_steps
                 
-            scaler.scale(loss).backward()
-            
+            if scaler is not None:  # FP16 AMP Path
+                scaler.scale(loss).backward()
+            else:  # BF16 AMP Path
+                loss.backward()
+                
             if batch_idx == 1 and vram_stats_out is not None:
                 vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
                 
             if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-        else:
+        else:  # Standard Pure FP32 Path
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
             loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
             loss = loss / grad_accum_steps
@@ -208,14 +252,16 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
     return total_loss
 
 
-def evaluate_validation(model, dataloader, criterion, device, is_gtx1070=False):
+def evaluate_validation(model, dataloader, criterion, device, autocast_dtype=torch.float32):
     model.eval()
     epoch_loss_tensor = torch.zeros((), device=device)
+    use_amp = (device.type == "cuda") and (autocast_dtype in (torch.float16, torch.bfloat16))
+
     with torch.no_grad():
         for src, trg in dataloader:
             src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
-            if device.type == "cuda" and not is_gtx1070:
-                with torch.amp.autocast(device_type=device.type):
+            if use_amp:
+                with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
                     output_dim = output.shape[-1]
                     output_flat = output[:, 1:].reshape(-1, output_dim)
@@ -252,21 +298,16 @@ def main():
         if not dist.is_initialized():
             dist.init_process_group(backend=backend, init_method="env://")
     
-    is_gtx1070 = False
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
-        gpu_name = torch.cuda.get_device_name(device)
-        major_cap = torch.cuda.get_device_capability(device)[0]
-        
-        # Hardware Check: GTX 1070 / Pascal GPUs (Compute Capability 6.1) suffer a 64x speed hit in FP16.
-        if "1070" in gpu_name or major_cap < 7:
-            is_gtx1070 = True
-            
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     else:
         device = torch.device("cpu")
+
+    # Dynamic Precision and Hardware Feature Detection
+    chosen_precision, autocast_dtype, scaler, can_compile, supports_tf32 = setup_hardware_precision(device, args.precision)
         
     set_seed(42 + rank)
     
@@ -284,8 +325,6 @@ def main():
         setup_logging(log_filename=f"train_{exp_tag}.log", log_dir=OUTPUT_DIR, rank=rank)
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
-        if is_gtx1070:
-            print("🚀 GTX 1070 / Pascal GPU Detected: Enforcing Pure FP32 Precision (3x–4x Faster Execution Target).")
 
     raw_train_loader, src_vocab, trg_vocab = get_dataloader(
         train_csv, batch_size=args.batch_size, shuffle=True, 
@@ -368,14 +407,12 @@ def main():
         global_effective_batch = effective_batch_per_gpu * world_size
 
         print("\n" + "─" * 75)
-        print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
+        print(f"📐 [DYNAMIC MODEL & HARDWARE ANALYSIS]")
         print(f" ├─ Target Device:              {gpu_name}")
-        print(f" ├─ Precision Strategy:         {'Standard FP32 (GTX 1070 Optimized)' if is_gtx1070 else 'AMP FP16 Autocast'}")
+        print(f" ├─ Precision Strategy:         {chosen_precision.upper()} (TF32 Support: {supports_tf32})")
+        print(f" ├─ Dynamic Compilation:        {'Supported' if can_compile else 'Disabled / Incompatible CC < 7.0'}")
         print(f" ├─ Experiment ID:              {args.experiment}")
         print(f" ├─ Architecture:               {args.rnn_type} ({'Bidirectional' if args.bidirectional else 'Unidirectional'})")
-        print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
-        print(f" ├─ Attention Type:             {args.attention_type.upper()}")
-        print(f" ├─ Embedding Source:           {args.embedding_source.upper()}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
         print(f" ├─ Grad Accumulation Steps:    {args.grad_accum_steps}")
         print(f" ├─ Effective Batch Size (p/GPU):{effective_batch_per_gpu}")
@@ -392,32 +429,20 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    if hasattr(torch, "compile"):
-        can_compile = True
-
-        if torch.cuda.is_available():
-            major_cap = torch.cuda.get_device_capability()[0]
-            if major_cap < 7:
-                can_compile = False
-                if rank == 0:
-                    print(f"⚠️ torch.compile skipped: GPU Compute Capability ({major_cap}.x < 7.0) is not supported by Triton.")
-
-        if can_compile:
-            try:
-                raw_model = model.module if hasattr(model, "module") else model
-                raw_model.encoder = torch.compile(raw_model.encoder)
-                raw_model.decoder = torch.compile(raw_model.decoder)
-                if rank == 0:
-                    print("⚡ Compiled Encoder & Decoder with TorchInductor.")
-            except Exception as e:
-                if rank == 0:
-                    print(f"⚠️ torch.compile skipped: {e}")
+    # Flexible Compile Handling
+    if can_compile:
+        try:
+            raw_model = model.module if hasattr(model, "module") else model
+            raw_model.encoder = torch.compile(raw_model.encoder)
+            raw_model.decoder = torch.compile(raw_model.decoder)
+            if rank == 0:
+                print("⚡ Compiled Encoder & Decoder with TorchInductor.")
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ torch.compile skipped due to execution environment: {e}")
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    
-    # Force pure FP32 on GTX 1070 (scaler=None) to prevent FP16 performance degradation
-    scaler = torch.amp.GradScaler("cuda") if (device.type == "cuda" and not is_gtx1070) else None
     
     best_val_loss = float("inf")
     start_train_time = time.time()
@@ -463,13 +488,19 @@ def main():
                 args.clip, 
                 device, 
                 args.tf_ratio, 
-                scaler, 
+                scaler=scaler,
+                autocast_dtype=autocast_dtype,
                 vram_stats_out=vram_stats,
                 grad_accum_steps=args.grad_accum_steps
             )
-            val_loss = evaluate_validation(model, val_loader, criterion, device, is_gtx1070=is_gtx1070)
+            val_loss = evaluate_validation(
+                model, 
+                val_loader, 
+                criterion, 
+                device, 
+                autocast_dtype=autocast_dtype
+            )
             
-            # REMOVED: empty_cache() calls per epoch eliminated to avoid GPU synchronization stalls
             epoch_duration = time.time() - epoch_start_time
             
             loss_history["train"].append(train_loss)
@@ -480,10 +511,10 @@ def main():
                 print(f"📊 [PROFILED VRAM TENSOR MEMORY BREAKDOWN - {vram_stats.get('gpu_name', 'CUDA')}]")
                 print(f" ├─ Model Weights VRAM:          {vram_stats.get('vram_model_mb', 0.0):>8.2f} MB")
                 print(f" ├─ Gradients VRAM (p.grad):      {vram_stats.get('vram_gradients_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Optimizer State VRAM (Adam):  {vram_stats.get('vram_optimizer_mb', 0.0):>8.2f} MB (1st & 2nd Moments)")
-                print(f" ├─ Dynamic Activations & Logits: {vram_stats.get('vram_activations_mb', 0.0):>8.2f} MB (Peak Graph Tensors)")
+                print(f" ├─ Optimizer State VRAM (Adam):  {vram_stats.get('vram_optimizer_mb', 0.0):>8.2f} MB")
+                print(f" ├─ Dynamic Activations & Logits: {vram_stats.get('vram_activations_mb', 0.0):>8.2f} MB")
                 print(f" ├─ Total Active Allocations:    {vram_stats.get('vram_allocated_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Reserved Memory Pool:         {vram_stats.get('vram_reserved_mb', 0.0):>8.2f} MB (Matches nvidia-smi)")
+                print(f" ├─ Reserved Memory Pool:         {vram_stats.get('vram_reserved_mb', 0.0):>8.2f} MB")
                 print(f" └─ Peak Measured VRAM Footprint: {vram_stats.get('vram_peak_mb', 0.0):>8.2f} MB ({vram_stats.get('vram_peak_gb', 0.0):.3f} GB)")
                 print("─" * 75 + "\n")
 
@@ -501,7 +532,8 @@ def main():
                         "best_val_loss": best_val_loss, 
                         "val_loss": best_val_loss,
                         "epochs_trained": len(loss_history["train"]),
-                        "loss_history": loss_history
+                        "loss_history": loss_history,
+                        "hardware_precision": chosen_precision
                     })
                     config_dict.update(vram_stats)
                     

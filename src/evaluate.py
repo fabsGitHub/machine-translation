@@ -162,10 +162,12 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     model = Seq2Seq(enc, dec, device).to(device)
     model.load_state_dict(state_dict)
     
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7:
-        model = torch.compile(model)
-    else:
-        print("Skipping torch.compile: GPU Compute Capability < 7.0")
+    # Safe Hardware Capabilities & Torch Compile Handling
+    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7 and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"Skipping torch.compile during evaluation: {e}")
     
     references, hypotheses = [], []
     meta_info = []
@@ -429,51 +431,40 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
             else:
                 prediction = out
 
-            if attn_w is None and hasattr(model.decoder, 'attention') and hasattr(model.decoder.attention, 'last_attn_weights'):
-                attn_w = model.decoder.attention.last_attn_weights
+            if attn_w is not None:
+                attentions.append(attn_w.squeeze(0).cpu())
 
-            best_guess = prediction.argmax(dim=1).item()
-            if best_guess == EOS_IDX:
+            prediction = prediction.argmax(dim=1)
+            if prediction.item() == EOS_IDX:
                 break
+            trg_tokens.append(trg_vocab.itos.get(prediction.item(), "<unk>"))
+            current_token = prediction
 
-            if best_guess != PAD_IDX:
-                trg_tokens.append(trg_vocab.itos.get(best_guess, "<unk>"))
-                if attn_w is not None:
-                    w = attn_w.squeeze().cpu().numpy()
-                    attentions.append(w)
-                else:
-                    attentions.append(np.ones(len(src_indices)) / len(src_indices))
-
-            current_token = torch.tensor([best_guess], dtype=torch.long, device=device)
-
-    if not trg_tokens:
-        print("⚠️ No output tokens generated for visualization.")
+    if not attentions:
+        print("⚠️ Model does not output attention weights (attention_type='none').")
         return
 
-    attn_matrix = np.array(attentions)
+    attn_matrix = torch.stack(attentions).numpy()
 
     plt.figure(figsize=(10, 8))
-    src_display_labels = ["<sos>"] + src_tokens + ["<eos>"]
-    
-    if attn_matrix.shape[1] == len(src_display_labels):
-        sns.heatmap(attn_matrix, xticklabels=src_display_labels, yticklabels=trg_tokens, cmap="Blues", annot=False)
-    else:
-        sns.heatmap(attn_matrix, yticklabels=trg_tokens, cmap="Blues", annot=False)
-
-    plt.xlabel("Source Sequence")
-    plt.ylabel("Target Sequence")
-    plt.title(f"Attention Heatmap [{config.get('experiment', 'NMT')}]")
-    plt.xticks(rotation=45, ha="right")
+    sns.heatmap(
+        attn_matrix,
+        xticklabels=src_tokens,
+        yticklabels=trg_tokens,
+        cmap="viridis",
+        annot=False,
+    )
+    plt.xlabel("Source Tokens")
+    plt.ylabel("Target Tokens")
+    plt.title(f"Attention Heatmap ({config.get('experiment', 'NMT')})")
     plt.tight_layout()
 
     if not output_path:
-        exp_id = config.get('experiment', 'vis')
-        output_path = os.path.join(OUTPUT_DIR, f"attention_heatmap_{exp_id}.png")
+        output_path = os.path.join(OUTPUT_DIR, f"attention_{config.get('experiment', 'viz')}.png")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=300)
     plt.close()
-    print(f"🖼️ Attention heatmap successfully generated and saved to: {output_path}")
+    print(f"✅ Attention visualization saved -> {output_path}")
 
 
 def main():
@@ -482,16 +473,14 @@ def main():
     subparsers = parser.add_subparsers(dest="mode")
 
     eval_parser = subparsers.add_parser("evaluate")
-    eval_parser.add_argument("--checkpoint", type=str, required=False)
+    eval_parser.add_argument("--checkpoint", type=str, default=None)
     eval_parser.add_argument("--token_type", type=str, default="word")
     eval_parser.add_argument("--sample_size", type=float, default=None)
 
-    compile_parser = subparsers.add_parser("compile")
-    compile_parser.add_argument("--token_type", type=str, default="word")
-
-    vis_parser = subparsers.add_parser("visualize")
-    vis_parser.add_argument("--model", type=str, required=True)
-    vis_parser.add_argument("--text", type=str, default=None)
+    viz_parser = subparsers.add_parser("visualize")
+    viz_parser.add_argument("--checkpoint", type=str, required=True)
+    viz_parser.add_argument("--text", type=str, default=None)
+    viz_parser.add_argument("--output", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -499,12 +488,13 @@ def main():
         if args.checkpoint:
             run_evaluation(args.checkpoint, sample_size=args.sample_size)
         else:
-            for pt_file in glob.glob(os.path.join(OUTPUT_DIR, "*.pt")):
-                run_evaluation(pt_file, sample_size=args.sample_size)
-    elif args.mode == "compile":
-        generate_all_reports(args.token_type)
+            pattern = os.path.join(OUTPUT_DIR, f"best_model_{args.token_type.upper()}_*.pt")
+            checkpoints = glob.glob(pattern)
+            for ckpt in checkpoints:
+                run_evaluation(ckpt, sample_size=args.sample_size)
+            generate_all_reports(args.token_type)
     elif args.mode == "visualize":
-        visualize_attention(args.model, args.text)
+        visualize_attention(args.checkpoint, sample_text=args.text, output_path=args.output)
 
 
 if __name__ == "__main__":

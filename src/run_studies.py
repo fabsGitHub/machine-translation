@@ -76,7 +76,7 @@ class AsyncEvaluationQueue:
 
 
 def get_vocab_sizes(token_type="word"):
-    """Dynamically retrieves vocabulary size from binary dataset cache or defaults to realistic baseline power of 2."""
+    """Dynamically retrieves vocabulary size from binary dataset cache or defaults to baseline."""
     processed_dir = os.path.join(REPO_ROOT, "data", "processed")
     cache_dir = os.path.join(processed_dir, ".matrix_cache")
     if os.path.exists(cache_dir):
@@ -92,7 +92,7 @@ def get_vocab_sizes(token_type="word"):
 
 def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, bidirectional, 
                                      attention_type, emb_dim, hidden_dim, batch_size):
-    """Analytically computes and outputs Model Size (Parameters & FP32 MB) and Batch Size parameters."""
+    """Analytically computes and outputs Model Size and Batch Size parameters."""
     src_vocab_len, trg_vocab_len = get_vocab_sizes(token_type)
     bidi_bool = str(bidirectional).lower() == "true"
     num_directions = 2 if bidi_bool else 1
@@ -137,9 +137,8 @@ def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, b
 
 
 def run_cmd(args_list):
-    # Optimized default gradient accumulation step (1-2 steps) for GTX 1070 speedup
     if "--grad_accum_steps" not in args_list:
-        args_list = ["--grad_accum_steps", "2"] + args_list
+        args_list = ["--grad_accum_steps", "16"] + args_list
 
     i = 0
     kv = {}
@@ -187,10 +186,7 @@ def run_cmd(args_list):
 
 
 def run_auto_evaluation(experiment_id, rnn_type):
-    """
-    Executes model evaluation strictly on CPU to eliminate GPU contention and OOM crashes.
-    Computes BLEU & METEOR scores for main study experiments.
-    """
+    """Executes model evaluation strictly on CPU to eliminate GPU contention."""
     target_model = os.path.join(OUTPUT_DIR, f"best_model_{experiment_id}_{rnn_type}.pt")
     if os.path.exists(target_model):
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "evaluate.py"), "evaluate", "--checkpoint", target_model]
@@ -242,7 +238,7 @@ def sync_ledger_to_token_type(token_type):
 
 
 def get_best_hyperparameters(stage, token_type, rnn_type=None):
-    """Parses validation loss metrics from hyperparameter tuning sweeps (TUNE_*) to select optimal settings."""
+    """Parses validation loss metrics from hyperparameter tuning sweeps."""
     csv_path = os.path.join(REPO_ROOT, f"tuning_results_{token_type}_{stage}.csv")
     profile = config.get('profiles', {}).get(token_type, {})
     default_args = ["--lr", str(profile.get("lr", 0.001)), "--dropout", str(profile.get("dropout", 0.3)), "--emb_dim", str(profile.get("emb_dim", 256)), "--hidden_dim", str(profile.get("hidden_dim", 512))]
@@ -268,7 +264,7 @@ def get_best_hyperparameters(stage, token_type, rnn_type=None):
                 dropout = best_cfg.get("dropout", profile.get("dropout", 0.3))
                 emb_dim = int(best_cfg.get("emb_dim", profile.get("emb_dim", 256)))
                 hidden_dim = int(best_cfg.get("hidden_dim", profile.get("hidden_dim", 512)))
-                print(f"🎯 Optimization Checkpoint Found from JSON files! Applying Tuned Parameters: --lr {lr} --dropout {dropout} --emb_dim {emb_dim} --hidden_dim {hidden_dim}")
+                print(f"🎯 Optimization Checkpoint Found! Applying Tuned Parameters: --lr {lr} --dropout {dropout} --emb_dim {emb_dim} --hidden_dim {hidden_dim}")
                 return ["--lr", str(lr), "--dropout", str(dropout), "--emb_dim", str(emb_dim), "--hidden_dim", str(hidden_dim)]
                 
         print(f"ℹ️ Tuning ledger missing at {csv_path}. Falling back to standard profiles.")
@@ -737,9 +733,9 @@ if __name__ == "__main__":
                 base_scale = max(1, int(runtime_epochs * char_factor)) if not args.mock else 1
                 
                 epochs_coarse = max(1, int(base_scale * 0.4))
-                epochs_abc    = max(1, int(base_scale * 0.8))
+                epochs_abc    = max(1, int(base_scale * 0.6))
                 epochs_fine   = max(1, int(base_scale * 0.6))
-                epochs_de     = max(1, int(base_scale * 1.8))
+                epochs_de     = max(1, int(base_scale * 0.8))
                 
                 print(f"\n📊 [DYNAMIC EPOCH TIER PLAN] Pathway: {pathway.upper()}")
                 print(f" ├─ Coarse Sweep Epochs:  {epochs_coarse}")
