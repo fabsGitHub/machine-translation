@@ -27,12 +27,12 @@ class Encoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, emb_dim_in)
 
         if pretrained_emb is not None:
-            if isinstance(pretrained_emb, torch.Tensor):
-                self.embedding.weight.data.copy_(pretrained_emb)
-            else:
-                self.embedding.weight.data.copy_(
-                    torch.as_tensor(pretrained_emb, dtype=torch.float32)
-                )
+            pretrained_tensor = (
+                pretrained_emb
+                if isinstance(pretrained_emb, torch.Tensor)
+                else torch.as_tensor(pretrained_emb, dtype=torch.float32)
+            )
+            self.embedding.weight.data[: pretrained_tensor.size(0)].copy_(pretrained_tensor)
             if freeze_emb:
                 self.embedding.weight.requires_grad = False
 
@@ -54,7 +54,6 @@ class Encoder(nn.Module):
         )
 
     def forward(self, src):
-        # src: [batch_size, src_len]
         embedded = self.dropout(self.embedding(src))
         if self.project is not None:
             embedded = self.project(embedded)
@@ -69,8 +68,6 @@ class LuongAttention(nn.Module):
         self.attn = nn.Linear(hidden_dim, enc_hidden_dim)
 
     def forward(self, hidden, encoder_outputs):
-        # hidden: [batch_size, hidden_dim]
-        # encoder_outputs: [batch_size, src_len, enc_hidden_dim]
         score = torch.bmm(
             encoder_outputs, self.attn(hidden).unsqueeze(2)
         ).squeeze(2)
@@ -85,11 +82,9 @@ class BahdanauAttention(nn.Module):
         self.v_a = nn.Linear(hidden_dim, 1, bias=False)
 
     def forward(self, hidden, encoder_outputs, proj_enc_outputs=None):
-        # Calculate U_a projection only if not pre-computed and passed in
         if proj_enc_outputs is None:
             proj_enc_outputs = self.U_a(encoder_outputs)
 
-        # Implicit PyTorch 3D broadcasting replaces explicit memory allocations
         energy = torch.tanh(self.W_a(hidden).unsqueeze(1) + proj_enc_outputs)
         score = self.v_a(energy).squeeze(2)
         return F.softmax(score, dim=1)
@@ -121,12 +116,12 @@ class Decoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, emb_dim_in)
 
         if pretrained_emb is not None:
-            if isinstance(pretrained_emb, torch.Tensor):
-                self.embedding.weight.data.copy_(pretrained_emb)
-            else:
-                self.embedding.weight.data.copy_(
-                    torch.as_tensor(pretrained_emb, dtype=torch.float32)
-                )
+            pretrained_tensor = (
+                pretrained_emb
+                if isinstance(pretrained_emb, torch.Tensor)
+                else torch.as_tensor(pretrained_emb, dtype=torch.float32)
+            )
+            self.embedding.weight.data[: pretrained_tensor.size(0)].copy_(pretrained_tensor)
             if freeze_emb:
                 self.embedding.weight.requires_grad = False
 
@@ -162,7 +157,6 @@ class Decoder(nn.Module):
         self.fc_out = nn.Linear(fc_in_dim, vocab_size)
 
     def forward_step(self, input_token, hidden, encoder_outputs, proj_enc_outputs=None):
-        # input_token: [batch_size]
         embedded = self.dropout(self.embedding(input_token.unsqueeze(1)))
         if self.project is not None:
             embedded = self.project(embedded)
@@ -178,7 +172,7 @@ class Decoder(nn.Module):
 
             context = torch.bmm(
                 attn_weights.unsqueeze(1), encoder_outputs
-            )  # [batch_size, 1, enc_hidden_dim]
+            )
             rnn_in = torch.cat((embedded, context), dim=2)
         else:
             context = None
@@ -192,7 +186,7 @@ class Decoder(nn.Module):
         else:
             fc_in = output
 
-        prediction = self.fc_out(fc_in.squeeze(1))  # [batch_size, vocab_size]
+        prediction = self.fc_out(fc_in.squeeze(1))
         return prediction, hidden, attn_weights
 
     def forward(
@@ -200,15 +194,12 @@ class Decoder(nn.Module):
     ):
         batch_size, trg_len = trg.shape
 
-        # Pre-compute Bahdanau projection once to avoid repeated projection inside step loops
         proj_enc = (
             self.attention.U_a(encoder_outputs)
             if self.attention_type == "bahdanau"
             else None
         )
 
-        # FAST PATH: Fused cuDNN pass when teacher forcing triggers on non-attention models
-        # Host-side Python random eliminates GPU-to-CPU sync and CUDA graph breaks
         use_teacher_forcing = self.training and (
             (random.random() < teacher_forcing_ratio)
             if teacher_forcing_ratio > 0.0
@@ -216,31 +207,26 @@ class Decoder(nn.Module):
         )
 
         if use_teacher_forcing and self.attention_type == "none":
-            trg_in = trg[:, :-1]  # Slice inputs excluding last token
+            trg_in = trg[:, :-1]
             embedded = self.dropout(self.embedding(trg_in))
             if self.project is not None:
                 embedded = self.project(embedded)
 
-            rnn_out, _ = self.rnn(embedded, hidden)  # Single fused cuDNN pass
-            predictions = self.fc_out(
-                rnn_out
-            )  # [batch_size, trg_len-1, vocab_size]
+            rnn_out, _ = self.rnn(embedded, hidden)
+            predictions = self.fc_out(rnn_out)
 
-            # Pre-allocate zero tensor with contiguous layout avoiding runtime synchronization
             zero_step = torch.zeros(
                 (batch_size, 1, self.vocab_size), device=trg.device, dtype=predictions.dtype
             )
             return torch.cat([zero_step, predictions], dim=1)
 
-        # STEP-BY-STEP PATH: For attention or when teacher forcing is skipped
         output_list = [
             torch.zeros(
                 batch_size, self.vocab_size, device=trg.device, dtype=encoder_outputs.dtype
             )
         ]
-        input_token = trg[:, 0]  # <SOS> token
+        input_token = trg[:, 0]
 
-        # Pre-compute teacher forcing decision vector across sequence steps using PyTorch random ops
         if self.training and teacher_forcing_ratio > 0.0:
             tf_mask = torch.rand(trg_len - 1, device=trg.device) < teacher_forcing_ratio
         else:
@@ -251,7 +237,6 @@ class Decoder(nn.Module):
                 input_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc
             )
             output_list.append(pred)
-            # Enforce contiguous layout to prevent stride mismatch re-compiles
             next_tf = trg[:, t].contiguous()
             input_token = next_tf if tf_mask[t - 1] else pred.argmax(dim=1)
 

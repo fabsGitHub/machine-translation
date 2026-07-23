@@ -1,213 +1,246 @@
 import os
-import zipfile
-import urllib.request
-from concurrent.futures import ProcessPoolExecutor
 import numpy as np
-import pandas as pd
 import torch
 
 
-def _tokenize_sentence_chunk(chunk, token_type):
-    """Worker process function to tokenize sentence chunks in parallel."""
-    if token_type == "char":
-        return [list(str(text).strip()) for text in chunk]
-    return [str(text).strip().split() for text in chunk]
+def load_pretrained_word_vectors(
+    vocab, lang="en", emb_dim=300, glove_dir="data", silent=False
+):
+    """Loads pre-trained Word2Vec/FastText vectors for EN, DE, SV.
 
-
-def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache_dir=None, silent=False, pair_prefix=""):
+    Checks local volume directory first before attempting remote API downloads.
     """
-    Offline/Online pre-computation of Gensim Word2Vec weight matrices.
-    Utilizes parallelized host worker threads and disambiguates cache files using `pair_prefix`.
-    """
-    if cache_dir is None:
-        cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
-    os.makedirs(cache_dir, exist_ok=True)
+    local_file_candidates = {
+        "en": [
+            "GoogleNews-vectors-negative300.bin.gz",
+            "GoogleNews-vectors-negative300.bin",
+            "cc.en.300.vec",
+            "wiki.en.vec",
+        ],
+        "de": [
+            "wiki.de.vec",
+            "cc.de.300.vec",
+            "fasttext-wiki-news-subwords-300.vec",
+            "glove.de.300d.txt",
+        ],
+        "sv": [
+            "wiki.sv.vec",
+            "cc.sv.300.vec",
+            "fasttext-wiki-news-subwords-300.vec",
+            "glove.sv.300d.txt",
+        ],
+    }
 
-    # Disambiguate cache file by dataset file/pair prefix
-    prefix_str = f"{pair_prefix}_" if pair_prefix else ""
-    cache_path = os.path.join(cache_dir, f"w2v_{prefix_str}{lang_col}_{emb_dim}.pt")
+    candidates = local_file_candidates.get(lang, [])
+    filepath = None
 
-    if os.path.exists(cache_path):
+    # Check for local file existence
+    for cand in candidates:
+        full_p = os.path.join(glove_dir, cand)
+        if os.path.exists(full_p):
+            filepath = full_p
+            break
+        elif os.path.exists(cand):
+            filepath = cand
+            break
+
+    wv = None
+
+    # Option A: Load from local volume file
+    if filepath:
         if not silent:
-            print(f"✓ Word2Vec matrix cache present at: {cache_path}")
-        return cache_path
-
-    if not silent:
-        print(f"⌛ Training Gensim Word2Vec for '{lang_col}' (Emb={emb_dim})...")
-    try:
-        from gensim.models import Word2Vec
-        df = pd.read_csv(csv_path)
-        texts = df[lang_col].astype(str).tolist()
-
-        num_texts = len(texts)
-        num_workers = min(32, os.cpu_count() or 16)
-
-        # Parallelize CPU tokenization across host cores for large datasets
-        if num_texts >= 5000:
-            chunk_size = (num_texts + num_workers - 1) // num_workers
-            chunks = [texts[i:i + chunk_size] for i in range(0, num_texts, chunk_size)]
-            token_type = getattr(vocab, "token_type", "word")
-
-            sentences = []
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(_tokenize_sentence_chunk, chunk, token_type) for chunk in chunks]
-                for future in futures:
-                    sentences.extend(future.result())
-        else:
-            sentences = [vocab.tokenize(text) for text in texts]
-
-        w2v_model = Word2Vec(
-            sentences=sentences,
-            vector_size=emb_dim,
-            window=5,
-            min_count=1,
-            workers=num_workers
-        )
-
-        weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim)).astype(np.float32)
-        for word, idx in vocab.stoi.items():
-            if word in w2v_model.wv:
-                weight_matrix[idx] = w2v_model.wv[word]
-
-        weight_tensor = torch.from_numpy(weight_matrix).float()
-        torch.save(weight_tensor, cache_path)
-        if not silent:
-            print(f"⚡ Saved Word2Vec binary matrix -> {cache_path}")
-        return cache_path
-    except Exception as e:
-        if not silent:
-            print(f"⚠️ Word2Vec generation skipped: {e}")
-        return None
-
-
-def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=False, pair_prefix=""):
-    """Loads pre-computed Word2Vec embeddings matrix or triggers pre-computation with pair prefix disambiguation."""
-    cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
-    prefix_str = f"{pair_prefix}_" if pair_prefix else ""
-    cache_path = os.path.join(cache_dir, f"w2v_{prefix_str}{lang_col}_{emb_dim}.pt")
-
-    if not os.path.exists(cache_path):
-        cache_path = precompute_word2vec_embeddings(
-            csv_path, vocab, lang_col, emb_dim=emb_dim, cache_dir=cache_dir, silent=silent, pair_prefix=pair_prefix
-        )
-
-    if cache_path and os.path.exists(cache_path):
+            print(
+                f"📦 [Word2Vec/FastText] Loading local file for '{lang}' from: {filepath}"
+            )
         try:
-            if not silent:
-                print(f"⚡ Loading pre-computed Word2Vec matrix cache: {cache_path}")
-            tensor = torch.load(cache_path, weights_only=False)
-            if tensor.shape[0] == len(vocab) and tensor.shape[1] == emb_dim:
-                # Pin memory for fast DMA transfers to GPU instead of using share_memory_()
-                return tensor.pin_memory()
+            from gensim.models import KeyedVectors
+
+            is_binary = filepath.endswith(".bin") or filepath.endswith(".bin.gz")
+            wv = KeyedVectors.load_word2vec_format(filepath, binary=is_binary)
         except Exception as e:
             if not silent:
-                print(f"⚠️ Cache read failed ({e}). Defaulting to standard distributions.")
+                print(
+                    f"⚠️ Failed to parse local file with Gensim ({e}). Falling back..."
+                )
 
-    return None
-
-
-def load_glove_embeddings_pair(src_vocab, trg_vocab, glove_file_path, emb_dim=300, silent=False):
-    """
-    Single-pass C-accelerated parser extracting vectors for both source and target vocabularies.
-    Reads GloVe vectors using fast Pandas C-engine routines and vectorized NumPy boolean masking.
-    """
-    if not silent:
-        print(f"⌛ Single-pass GloVe extraction for SRC & TRG vocabularies from {glove_file_path}...")
-
-    src_matrix = np.random.normal(scale=0.6, size=(len(src_vocab), emb_dim)).astype(np.float32)
-    trg_matrix = np.random.normal(scale=0.6, size=(len(trg_vocab), emb_dim)).astype(np.float32)
-
-    if not os.path.exists(glove_file_path):
-        if not silent:
-            print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
-        return (torch.from_numpy(src_matrix).pin_memory(),
-                torch.from_numpy(trg_matrix).pin_memory())
-
-    src_stoi = src_vocab.stoi
-    trg_stoi = trg_vocab.stoi
-
-    # C-engine accelerated CSV parser replacing Python line-by-line loops
-    df_glove = pd.read_csv(
-        glove_file_path, sep=" ", quoting=3, header=None, engine="c", dtype={0: str}
-    )
-    words = df_glove[0].values
-    vectors = df_glove.iloc[:, 1:].values.astype(np.float32)
-
-    # Vectorized NumPy boolean masking replacing sequential for loops
-    src_mask = np.array([w in src_stoi for w in words])
-    if np.any(src_mask):
-        src_words = words[src_mask]
-        src_indices = np.array([src_stoi[w] for w in src_words], dtype=np.int64)
-        src_matrix[src_indices] = vectors[src_mask]
-
-    trg_mask = np.array([w in trg_stoi for w in words])
-    if np.any(trg_mask):
-        trg_words = words[trg_mask]
-        trg_indices = np.array([trg_stoi[w] for w in trg_words], dtype=np.int64)
-        trg_matrix[trg_indices] = vectors[trg_mask]
-
-    return (torch.from_numpy(src_matrix).pin_memory(),
-            torch.from_numpy(trg_matrix).pin_memory())
-
-
-def load_glove_embeddings(vocab, glove_file_path, emb_dim=300, silent=False):
-    """Single vocabulary C-accelerated GloVe loader using Pandas multi-threaded routines and vectorized NumPy boolean masking."""
-    if not silent:
-        print(f"⌛ Multi-threaded GloVe loading from {glove_file_path}...")
-    weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim)).astype(np.float32)
-
-    if not os.path.exists(glove_file_path):
-        if not silent:
-            print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
-        return torch.from_numpy(weight_matrix).pin_memory()
-
-    vocab_stoi = vocab.stoi
-
-    # C-engine accelerated CSV parser
-    df_glove = pd.read_csv(
-        glove_file_path, sep=" ", quoting=3, header=None, engine="c", dtype={0: str}
-    )
-    words = df_glove[0].values
-    vectors = df_glove.iloc[:, 1:].values.astype(np.float32)
-
-    # Vectorized NumPy boolean masking replacing sequential for loops
-    mask = np.array([w in vocab_stoi for w in words])
-    if np.any(mask):
-        matching_words = words[mask]
-        vocab_indices = np.array([vocab_stoi[w] for w in matching_words], dtype=np.int64)
-        weight_matrix[vocab_indices] = vectors[mask]
-
-    return torch.from_numpy(weight_matrix).pin_memory()
-
-
-def download_and_extract_glove(data_dir):
-    glove_target_file = os.path.join(data_dir, "glove.6B.300d.txt")
-    glove_alt_file = os.path.join(data_dir, "raw", "glove.6B.300d.txt")
-
-    if os.path.exists(glove_target_file):
-        print("✓ Pre-trained GloVe 300d vectors already present locally in data/.")
-        return
-
-    if os.path.exists(glove_alt_file):
-        print("✓ Found GloVe 300d vectors in 'raw/' directory. Creating link/copy in data/...")
+    # Option B: Download via Gensim API if local file doesn't exist
+    if wv is None:
         try:
-            os.symlink(os.path.abspath(glove_alt_file), glove_target_file)
-        except Exception:
-            import shutil
-            shutil.copy(glove_alt_file, glove_target_file)
-        return
+            import gensim.downloader as api
 
-    glove_url = "http://nlp.stanford.edu/data/glove.6B.zip"
-    zip_path = os.path.join(data_dir, "glove.6B.zip")
+            model_name_map = {
+                "en": "word2vec-google-news-300",
+                "de": "fasttext-wiki-news-subwords-300",
+                "sv": "fasttext-wiki-news-subwords-300",
+            }
+            model_name = model_name_map.get(lang, "word2vec-google-news-300")
+            if not silent:
+                print(
+                    f"📦 [Word2Vec] Local file not found. Attempting download via Gensim API ({model_name})..."
+                )
+            wv = api.load(model_name)
+        except Exception as e:
+            if not silent:
+                print(
+                    f"⚠️ Could not download Word2Vec model via Gensim API ({e}). Falling back to randomized initialization."
+                )
+            return torch.randn(len(vocab), emb_dim) * 0.01
 
-    print("\n🌐 GloVe embeddings missing...")
-    if not os.path.exists(zip_path):
-        print("Downloading GloVe 6B word vectors (approx. 822MB)...")
-        urllib.request.urlretrieve(glove_url, zip_path)
+    # Populate embedding matrix
+    actual_dim = wv.vector_size
+    weights = torch.randn(len(vocab), actual_dim) * 0.01
 
-    print("⚡ Extracting 'glove.6B.300d.txt' from zip archive...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extract("glove.6B.300d.txt", data_dir)
+    found = 0
+    stoi_dict = (
+        vocab.stoi if hasattr(vocab, "stoi") else getattr(vocab, "word2idx", {})
+    )
 
-    if os.path.exists(zip_path):
-        os.remove(zip_path)
+    for token, idx in stoi_dict.items():
+        if token in wv:
+            weights[idx] = torch.from_numpy(wv[token].copy())
+            found += 1
+        elif token.lower() in wv:
+            weights[idx] = torch.from_numpy(wv[token.lower()].copy())
+            found += 1
+
+    if not silent:
+        coverage = (found / max(1, len(vocab))) * 100
+        print(
+            f"✅ Loaded {found}/{len(vocab)} tokens ({coverage:.1f}%) from pre-trained vectors ({lang})."
+        )
+
+    return weights
+
+
+def load_language_matched_glove(
+    vocab, lang="en", emb_dim=300, glove_dir="data", silent=False
+):
+    """Loads language-matched GloVe / FastText text vector files (.txt / .vec) from disk."""
+    lang_file_map = {
+        "en": [
+            f"glove.6B.{emb_dim}d.txt",
+            "glove.6B.300d.txt",
+            "glove.en.300d.txt",
+            "cc.en.300.vec",
+        ],
+        "de": [
+            "glove.de.300d.txt",
+            "wiki.de.vec",
+            "cc.de.300.vec",
+            "german_glove.txt",
+            f"glove.de.{emb_dim}d.txt",
+        ],
+        "sv": [
+            "glove.sv.300d.txt",
+            "wiki.sv.vec",
+            "cc.sv.300.vec",
+            f"glove.sv.{emb_dim}d.txt",
+        ],
+    }
+
+    candidates = lang_file_map.get(
+        lang, [f"glove.{lang}.300d.txt", "glove.6B.300d.txt"]
+    )
+    filepath = None
+
+    for cand in candidates:
+        full_p = os.path.join(glove_dir, cand)
+        if os.path.exists(full_p):
+            filepath = full_p
+            break
+        elif os.path.exists(cand):
+            filepath = cand
+            break
+
+    embeddings_dict = {}
+    detected_dim = emb_dim
+
+    if filepath and os.path.exists(filepath):
+        if not silent:
+            print(
+                f"📖 [GloVe/Text] Loading language-matched vectors for '{lang}' from: {filepath}"
+            )
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                parts = line.rstrip().split(" ")
+                if (
+                    len(parts) < 10
+                ):  # Skip header lines (e.g. FastText "2000000 300")
+                    continue
+                word = parts[0]
+                vector = np.asarray(parts[1:], dtype="float32")
+                embeddings_dict[word] = vector
+                detected_dim = len(vector)
+    else:
+        if not silent:
+            print(
+                f"⚠️ [GloVe/Text] Language vector file for '{lang}' not found in {candidates}. Falling back to random initialization."
+            )
+
+    weights = torch.randn(len(vocab), detected_dim) * 0.01
+    found = 0
+    stoi_dict = (
+        vocab.stoi if hasattr(vocab, "stoi") else getattr(vocab, "word2idx", {})
+    )
+
+    for token, idx in stoi_dict.items():
+        if token in embeddings_dict:
+            weights[idx] = torch.from_numpy(embeddings_dict[token])
+            found += 1
+        elif token.lower() in embeddings_dict:
+            weights[idx] = torch.from_numpy(embeddings_dict[token.lower()])
+            found += 1
+
+    if not silent:
+        coverage = (found / max(1, len(vocab))) * 100
+        print(
+            f"✅ [GloVe Language Alignment] Matched {found}/{len(vocab)} tokens ({coverage:.1f}%) for language '{lang}'."
+        )
+
+    return weights
+
+
+def load_glove_embeddings_pair(
+    src_vocab,
+    trg_vocab,
+    src_lang="de",
+    trg_lang="en",
+    emb_dim=300,
+    glove_dir="data",
+    silent=False,
+):
+    if not silent:
+        print(
+            f"🌐 [Embedding Pipeline] Building Language-Matched Matrices: Src={src_lang.upper()} | Trg={trg_lang.upper()}"
+        )
+
+    src_weights = load_language_matched_glove(
+        src_vocab,
+        lang=src_lang,
+        emb_dim=emb_dim,
+        glove_dir=glove_dir,
+        silent=silent,
+    )
+    trg_weights = load_language_matched_glove(
+        trg_vocab,
+        lang=trg_lang,
+        emb_dim=emb_dim,
+        glove_dir=glove_dir,
+        silent=silent,
+    )
+
+    return src_weights, trg_weights
+
+
+def generate_word2vec_embeddings(
+    vocab,
+    train_csv=None,
+    lang="en",
+    emb_dim=300,
+    glove_dir="data",
+    silent=False,
+    pair_prefix="de_en",
+):
+    return load_pretrained_word_vectors(
+        vocab, lang=lang, emb_dim=emb_dim, glove_dir=glove_dir, silent=silent
+    )

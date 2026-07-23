@@ -48,11 +48,7 @@ def get_batch_size(study, token_type):
 
 
 class AsyncEvaluationQueue:
-    """Offloads evaluation and ledger synchronization to background CPU threads,
-
-    allowing the GPU to immediately begin training the next model without VRAM
-    contention.
-    """
+    """Offloads evaluation and ledger synchronization to background CPU threads."""
 
     def __init__(self, max_workers=2):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -174,9 +170,7 @@ def print_study_model_and_batch_info(
         f" Attention: {attention_type})"
     )
     print(f" ├─ Dimensions:               Emb={emb_dim} | Hidden={hidden_dim}")
-    print(
-        f" ├─ Batch Size (N samples):   {batch_num} sequences / batch"
-    )
+    print(f" ├─ Batch Size (N samples):   {batch_num} sequences / batch")
     print(
         f" ├─ Batch Shape Estimate:     [{batch_num}, {seq_len}]"
         f" ({batch_memory_mb:.4f} MB per batch tensor)"
@@ -674,6 +668,10 @@ def execute_tuning(stage="coarse", token_type="word", epochs=1, num_trials=5):
             batch_size,
             "--epochs",
             str(epochs),
+            "--src_lang",
+            "en",
+            "--trg_lang",
+            "de",
         ]
 
         try:
@@ -886,6 +884,10 @@ def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
                     batch_size,
                     "--epochs",
                     str(epochs),
+                    "--src_lang",
+                    "en",
+                    "--trg_lang",
+                    "de",
                 ]
             )
 
@@ -893,20 +895,19 @@ def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
 
     eval_queue.sync_study()
 
-
 def execute_study_b(
     epochs, rnn_type, bidirectional, token_type, eval_queue: AsyncEvaluationQueue
 ):
-    """Executes Study B: Input Embedding Representation & Dimensionality Benchmarking."""
+    """Executes Study B: Input Embedding Representation & Dimensionality Benchmarking (EN -> DE)."""
     hparams = get_best_hyperparameters("coarse", token_type, rnn_type=rnn_type)
     configs = (
         [
             ("B1", "scratch", "False", "256"),
-            ("B2", "word2vec", "True", "256"),
-            ("B3", "word2vec", "False", "256"),
+            ("B2", "word2vec", "True", "300"),
+            ("B3", "word2vec", "False", "300"),
             ("B4", "scratch", "True", "256"),
-            ("B5", "glove", "True", "256"),
-            ("B6", "glove", "False", "256"),
+            ("B5", "glove", "True", "300"),
+            ("B6", "glove", "False", "300"),
         ]
         if token_type == "word"
         else [
@@ -927,7 +928,7 @@ def execute_study_b(
         exp_id = f"{token_type.upper()}_{exp}"
 
         print_study_model_and_batch_info(
-            study_name="Study B (Embedding Representation Analysis)",
+            study_name="Study B (Embedding Representation Analysis - EN->DE)",
             exp_id=exp_id,
             token_type=token_type,
             rnn_type=rnn_type,
@@ -965,13 +966,16 @@ def execute_study_b(
                     batch_size,
                     "--epochs",
                     str(epochs),
+                    "--src_lang",
+                    "en",
+                    "--trg_lang",
+                    "de",
                 ]
             )
 
         eval_queue.submit_evaluation(exp_id, rnn_type, token_type)
 
     eval_queue.sync_study()
-
 
 def execute_study_c(
     epochs,
@@ -983,7 +987,7 @@ def execute_study_c(
     emb_dim,
     eval_queue: AsyncEvaluationQueue,
 ):
-    """Executes Study C: Attention Mechanism Optimization (Luong vs Bahdanau vs None)."""
+    """Executes Study C: Attention Mechanism Optimization (Luong vs Bahdanau vs None) (EN -> DE)."""
     hparams = get_best_hyperparameters("coarse", token_type, rnn_type=rnn_type)
     configs = [
         ("C1", rnn_type, "none", "False"),
@@ -1005,7 +1009,7 @@ def execute_study_c(
         exp_id = f"{token_type.upper()}_{exp}"
 
         print_study_model_and_batch_info(
-            study_name="Study C (Attention Mechanism Optimization)",
+            study_name="Study C (Attention Mechanism Optimization - EN->DE)",
             exp_id=exp_id,
             token_type=token_type,
             rnn_type=cell,
@@ -1048,13 +1052,16 @@ def execute_study_c(
                     batch_size,
                     "--epochs",
                     str(epochs),
+                    "--src_lang",
+                    "en",
+                    "--trg_lang",
+                    "de",
                 ]
             )
 
         eval_queue.submit_evaluation(exp_id, cell, token_type)
 
     eval_queue.sync_study()
-
 
 def execute_study_d(
     epochs,

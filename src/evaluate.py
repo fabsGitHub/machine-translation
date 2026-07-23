@@ -139,7 +139,7 @@ def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
     return translated_sentences
 
 
-def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.2, seed=42):
+def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.1, seed=42):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"⌛ Loading checkpoint for evaluation: '{os.path.basename(checkpoint_path)}'")
     
@@ -355,17 +355,9 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.2, seed=42):
     # 1. Update Global Ledger
     ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}.json")
     os.makedirs(ROOT_DIR, exist_ok=True)
-    ledger_data = {}
-    if os.path.exists(ledger_path):
-        try:
-            with open(ledger_path, 'r', encoding='utf-8') as f:
-                ledger_data = json.load(f)
-        except Exception:
-            ledger_data = {}
 
-    ledger_data[experiment_id] = ledger_entry
     with open(ledger_path, 'w', encoding='utf-8') as f:
-        json.dump(ledger_data, f, indent=4)
+        json.dump(ledger_entry, f, indent=4)
 
     # 2. Update Isolated Study Group Ledger Directly
     study_ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}_{study_suffix}.json")
@@ -379,7 +371,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.2, seed=42):
 
     study_data[experiment_id] = ledger_entry
     with open(study_ledger_path, 'w', encoding='utf-8') as f:
-        json.dump(study_data, f, indent=4)
+        json.dump(ledger_entry, f, indent=4)
 
     print(f"✅ Evaluation complete. Metrics saved to {ledger_path} and {study_ledger_path}")
 

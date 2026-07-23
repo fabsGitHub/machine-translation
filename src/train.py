@@ -1,23 +1,23 @@
-import os
-import json
 import argparse
-import time
+import json
+import os
 import random
+import time
 import torch
 
 # Enable TensorFloat-32 (TF32) for Ampere Tensor Cores immediately at startup
 torch.set_float32_matmul_precision('high')
 
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-import torch.distributed as dist
-from torch.utils.data import Sampler, DataLoader
+from torch.utils.data import DataLoader, Sampler
 from utils import set_seed, setup_logging
 
-from dataset import get_dataloader, PAD_IDX
-from models import Encoder, Decoder, Seq2Seq
 from config import load_config
+from dataset import PAD_IDX, get_dataloader
 from embeddings import generate_word2vec_embeddings, load_glove_embeddings_pair
+from models import Decoder, Encoder, Seq2Seq
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -91,13 +91,11 @@ def setup_hardware_precision(device, precision_arg="auto"):
     major_cap, minor_cap = torch.cuda.get_device_capability(device)
     supports_tf32 = False
     
-    # Enable TF32 for Ampere / Ada / Hopper (Compute Capability >= 8.0)
     if major_cap >= 8:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         supports_tf32 = True
 
-    # Resolve Precision Mode
     if precision_arg == "auto":
         if major_cap >= 8 and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
             chosen_precision = "bf16"
@@ -108,13 +106,12 @@ def setup_hardware_precision(device, precision_arg="auto"):
     else:
         chosen_precision = precision_arg.lower()
 
-    # Configure Autocast Dtype and GradScaler
     if chosen_precision == "fp16":
         autocast_dtype = torch.float16
         scaler = torch.amp.GradScaler("cuda")
     elif chosen_precision == "bf16":
         autocast_dtype = torch.bfloat16
-        scaler = None  # BF16 offers dynamic range matching FP32 and does not require loss scaling
+        scaler = None
     else:
         chosen_precision = "fp32"
         autocast_dtype = torch.float32
@@ -197,8 +194,7 @@ def parse_args():
     parser.add_argument("--src_lang", type=str, default="de")
     parser.add_argument("--trg_lang", type=str, default="en")
     parser.add_argument("--resume", type=str2bool, default=True, help="Resume from existing checkpoint if present")
-    parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"],
-                        help="Precision mode: 'auto' chooses optimal setting based on GPU capabilities.")
+    parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"])
     return parser.parse_args()
 
 
@@ -222,9 +218,9 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
                 loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
                 loss = loss / grad_accum_steps
                 
-            if scaler is not None:  # FP16 AMP Path
+            if scaler is not None:
                 scaler.scale(loss).backward()
-            else:  # BF16 AMP Path
+            else:
                 loss.backward()
                 
             if batch_idx == 1 and vram_stats_out is not None:
@@ -240,7 +236,7 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
                     torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-        else:  # Standard Pure FP32 Path
+        else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
             loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
             loss = loss / grad_accum_steps
@@ -320,7 +316,6 @@ def main():
     else:
         device = torch.device("cpu")
 
-    # Dynamic Precision and Hardware Feature Detection
     chosen_precision, autocast_dtype, scaler, can_compile, supports_tf32 = setup_hardware_precision(device, args.precision)
         
     set_seed(42 + rank)
@@ -350,7 +345,7 @@ def main():
         src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
     )
     
-    num_workers = 8  # Optimized for multi-core host CPUs
+    num_workers = 8
     if is_distributed:
         train_sampler = DistributedBatchSamplerWrapper(
             raw_train_loader.batch_sampler, num_replicas=world_size, rank=rank, shuffle=True
@@ -403,31 +398,38 @@ def main():
     silent_logging = rank > 0
     pair_prefix = f"{args.src_lang}_{args.trg_lang}"
     
+    # --- UPDATED EMBEDDING INITIALIZATION ROUTINES ---
     if args.embedding_source == "word2vec":
         pretrained_src_emb = generate_word2vec_embeddings(
-            src_vocab, train_csv, args.src_lang, args.emb_dim, silent=silent_logging, pair_prefix=pair_prefix
+            src_vocab, train_csv, lang=args.src_lang, emb_dim=300, silent=silent_logging, pair_prefix=pair_prefix
         )
         pretrained_trg_emb = generate_word2vec_embeddings(
-            trg_vocab, train_csv, args.trg_lang, args.emb_dim, silent=silent_logging, pair_prefix=pair_prefix
+            trg_vocab, train_csv, lang=args.trg_lang, emb_dim=300, silent=silent_logging, pair_prefix=pair_prefix
         )
     elif args.embedding_source == "glove":
-        glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
-        pretrained_src_emb, pretrained_trg_emb = load_glove_embeddings_pair(src_vocab, trg_vocab, glove_path, 300, silent=silent_logging)
+        glove_dir = os.path.join(ROOT_DIR, "data")
+        pretrained_src_emb, pretrained_trg_emb = load_glove_embeddings_pair(
+            src_vocab, trg_vocab, src_lang=args.src_lang, trg_lang=args.trg_lang, 
+            emb_dim=300, glove_dir=glove_dir, silent=silent_logging
+        )
         
     num_directions = 2 if args.bidirectional else 1
 
     src_vocab_size = src_vocab.padded_size if hasattr(src_vocab, 'padded_size') else len(src_vocab)
     trg_vocab_size = trg_vocab.padded_size if hasattr(trg_vocab, 'padded_size') else len(trg_vocab)
 
+    pretrained_src_dim = pretrained_src_emb.shape[1] if pretrained_src_emb is not None else None
+    pretrained_trg_dim = pretrained_trg_emb.shape[1] if pretrained_trg_emb is not None else None
+
     encoder = Encoder(
         src_vocab_size, args.emb_dim, args.hidden_dim, 2, args.dropout, 
         args.rnn_type, args.bidirectional, pretrained_src_emb, args.freeze_emb, 
-        300 if args.embedding_source == "glove" else None
+        custom_emb_dim=pretrained_src_dim
     )
     decoder = Decoder(
         trg_vocab_size, args.emb_dim, args.hidden_dim * num_directions, args.hidden_dim, 2, 
         args.dropout, args.rnn_type, args.attention_type, pretrained_trg_emb, args.freeze_emb, 
-        300 if args.embedding_source == "glove" else None
+        custom_emb_dim=pretrained_trg_dim
     )
     
     model = Seq2Seq(encoder, decoder, device).to(device)
@@ -462,7 +464,6 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    # Standard dynamic compilation mode safe for dynamic RNN sequence lengths and DDP
     if can_compile:
         try:
             model = torch.compile(model, mode="default", dynamic=True)
@@ -472,7 +473,6 @@ def main():
             if rank == 0:
                 print(f"⚠️ torch.compile skipped due to execution environment: {e}")
     
-    # Optimizer Setup
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -505,11 +505,8 @@ def main():
         
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state_dict = checkpoint['model_state_dict']
-        
-        # Clean prefix names if saved under torch.compile / DDP
         clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         
-        # Unwrap model down to its base module before loading state dict
         raw_model = unwrap_model(model)
         raw_model.load_state_dict(clean_state_dict)
         
@@ -533,28 +530,15 @@ def main():
                 val_sampler.set_epoch(epoch)
                 
             train_loss = train_epoch(
-                model, 
-                train_loader, 
-                optimizer, 
-                criterion, 
-                args.clip, 
-                device, 
-                args.tf_ratio, 
-                scaler=scaler,
-                autocast_dtype=autocast_dtype,
-                vram_stats_out=vram_stats,
+                model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, 
+                scaler=scaler, autocast_dtype=autocast_dtype, vram_stats_out=vram_stats,
                 grad_accum_steps=args.grad_accum_steps
             )
             val_loss = evaluate_validation(
-                model, 
-                val_loader, 
-                criterion, 
-                device, 
-                autocast_dtype=autocast_dtype
+                model, val_loader, criterion, device, autocast_dtype=autocast_dtype
             )
             
             epoch_duration = time.time() - epoch_start_time
-            
             loss_history["train"].append(train_loss)
             loss_history["val"].append(val_loss)
             
@@ -617,13 +601,13 @@ def main():
     if rank == 0:
         if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
             try:
-                import subprocess
                 import re
+                import subprocess
                 import sys
                 
                 evaluate_script = os.path.join(SCRIPT_DIR, "evaluate.py")
                 if os.path.exists(evaluate_script):
-                    print(f"\n⌛ Automated Backfill: Executing evaluation metrics extraction (BLEU & METEOR)...")
+                    print("\n⌛ Automated Backfill: Executing evaluation metrics extraction (BLEU & METEOR)...")
                     cmd = [sys.executable, evaluate_script, "evaluate", "--checkpoint", checkpoint_path]
                     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
                     
