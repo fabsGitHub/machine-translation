@@ -586,8 +586,10 @@ def execute_preprocessing(token_type="word", mock_mode=False):
     subprocess.run(cmd, check=True)
 
 
-def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=3):
-    """Executes hyperparameter tuning sweeps across RNN, GRU, and LSTM cell types."""
+def execute_tuning(
+    stage="coarse", token_type="word", epochs=4, num_trials=12, configs_per_rnn=None
+):
+    """Executes hyperparameter tuning sweeps evenly across RNN, GRU, and LSTM cell types."""
     print(
         "\n"
         + "═" * 75
@@ -627,21 +629,29 @@ def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=3):
 
     random.seed(42)
 
-    # Guarantee balanced trial representation for all 3 RNN cell types (LSTM, GRU, RNN)
-    selected_trials = []
-    trials_per_rnn = max(1, num_trials // len(rnn_types))
+    # Determine balanced trials per RNN architecture (e.g. 3 or 4 per cell type)
+    if configs_per_rnn is not None:
+        trials_per_rnn = configs_per_rnn
+    else:
+        trials_per_rnn = max(1, num_trials // len(rnn_types))
 
+    selected_trials = []
     for rnn in rnn_types:
         combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, [rnn]))
         random.shuffle(combos)
         selected_trials.extend(combos[:trials_per_rnn])
 
-    # Fill any remaining trial quota round-robin
-    if len(selected_trials) < num_trials:
+    # Fill any remaining quota round-robin if num_trials exceeds total selected
+    if len(selected_trials) < num_trials and configs_per_rnn is None:
         all_combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, rnn_types))
         remaining = [c for c in all_combos if c not in selected_trials]
         random.shuffle(remaining)
         selected_trials.extend(remaining[:num_trials - len(selected_trials)])
+
+    print(
+        f"📋 Selected {len(selected_trials)} trials total "
+        f"({trials_per_rnn} configs tested per cell type across {rnn_types})."
+    )
 
     best_loss = float("inf")
     best_params = None
@@ -1268,8 +1278,14 @@ def main():
     parser.add_argument(
         "--tune_trials",
         type=int,
-        default=3,
-        help="Number of hyperparameter search trials",
+        default=12,
+        help="Total number of hyperparameter search trials (e.g. 12 = 4 trials per cell type)",
+    )
+    parser.add_argument(
+        "--configs_per_rnn",
+        type=int,
+        default=None,
+        help="Explicitly force N trials per cell type (e.g. 3 or 4 per cell type)",
     )
     parser.add_argument(
         "--no_preprocess",
@@ -1306,6 +1322,7 @@ def main():
             token_type=args.token_type,
             epochs=TUNE_1_EPOCHS,
             num_trials=args.tune_trials,
+            configs_per_rnn=args.configs_per_rnn,
         )
 
     # 2. Studies A, B, C - 6 Epochs
@@ -1344,6 +1361,7 @@ def main():
             token_type=args.token_type,
             epochs=TUNE_2_EPOCHS,
             num_trials=args.tune_trials,
+            configs_per_rnn=args.configs_per_rnn,
         )
 
     best_settings = get_best_empirical_settings(args.token_type)
