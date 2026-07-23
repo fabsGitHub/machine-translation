@@ -1,12 +1,11 @@
+from concurrent.futures import ProcessPoolExecutor
 import os
 import random
-from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence
-from utils import pad_vocab_size
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
@@ -19,8 +18,11 @@ SOS_IDX = 2
 EOS_IDX = 3
 
 
+def pad_vocab_size(size, multiple=16):
+    return ((size + multiple - 1) // multiple) * multiple
+
+
 def _build_vocab_worker(chunk, token_type):
-    """Worker process function to compute unique token sets from text chunks."""
     unique_tokens = set()
     if token_type == "char":
         for sentence in chunk:
@@ -31,12 +33,19 @@ def _build_vocab_worker(chunk, token_type):
     return unique_tokens
 
 
-def _numericalize_chunk_worker(chunk_src, chunk_trg, token_type, src_stoi, trg_stoi, src_max_idx, trg_max_idx):
-    """Worker process function to numericalize source/target text pairs into NumPy arrays."""
+def _numericalize_chunk_worker(
+    chunk_src,
+    chunk_trg,
+    token_type,
+    src_stoi,
+    trg_stoi,
+    src_max_idx,
+    trg_max_idx,
+):
     results = []
     src_get = src_stoi.get
     trg_get = trg_stoi.get
-    is_char = (token_type == "char")
+    is_char = token_type == "char"
 
     for src_text, trg_text in zip(chunk_src, chunk_trg):
         s_str = str(src_text).strip()
@@ -45,7 +54,6 @@ def _numericalize_chunk_worker(chunk_src, chunk_trg, token_type, src_stoi, trg_s
         src_tokens = list(s_str) if is_char else s_str.split()
         trg_tokens = list(t_str) if is_char else t_str.split()
 
-        # Source sequence processing
         src_idx = [SOS_IDX]
         for t in src_tokens:
             idx = src_get(t, UNK_IDX)
@@ -54,7 +62,6 @@ def _numericalize_chunk_worker(chunk_src, chunk_trg, token_type, src_stoi, trg_s
             src_idx.append(idx)
         src_idx.append(EOS_IDX)
 
-        # Target sequence processing
         trg_idx = [SOS_IDX]
         for t in trg_tokens:
             idx = trg_get(t, UNK_IDX)
@@ -65,30 +72,35 @@ def _numericalize_chunk_worker(chunk_src, chunk_trg, token_type, src_stoi, trg_s
 
         results.append((
             np.array(src_idx, dtype=np.int64),
-            np.array(trg_idx, dtype=np.int64)
+            np.array(trg_idx, dtype=np.int64),
         ))
     return results
 
 
 class Vocabulary:
+
     def __init__(self, token_type="word", pad_multiple=16):
         self.token_type = token_type
         self.pad_multiple = pad_multiple
-        self.itos = {PAD_IDX: PAD_TOKEN, UNK_IDX: UNK_TOKEN, SOS_IDX: SOS_TOKEN, EOS_TOKEN: EOS_TOKEN}
-        self.stoi = {PAD_TOKEN: PAD_IDX, UNK_TOKEN: UNK_IDX, SOS_TOKEN: SOS_IDX, EOS_TOKEN: EOS_IDX}
+        self.itos = {
+            PAD_IDX: PAD_TOKEN,
+            UNK_IDX: UNK_TOKEN,
+            SOS_IDX: SOS_TOKEN,
+            EOS_IDX: EOS_TOKEN,
+        }
+        self.stoi = {
+            PAD_TOKEN: PAD_IDX,
+            UNK_TOKEN: UNK_IDX,
+            SOS_TOKEN: SOS_IDX,
+            EOS_TOKEN: EOS_IDX,
+        }
 
     def __len__(self):
-        """Returns the actual unpadded vocabulary size."""
         return len(self.itos)
 
     @property
     def padded_size(self):
-        """Returns vocabulary size padded to nearest multiple for Tensor Core optimization."""
         return pad_vocab_size(len(self.itos), multiple=self.pad_multiple)
-
-    def get_padded_size(self, multiple=16):
-        """Legacy helper for backward compatibility."""
-        return pad_vocab_size(len(self.itos), multiple=multiple)
 
     def tokenize(self, text):
         text = str(text).strip()
@@ -98,14 +110,21 @@ class Vocabulary:
 
     def build_vocab(self, sentence_list):
         num_sentences = len(sentence_list)
-        # Multiprocess token extraction across CPU cores for large datasets
         if num_sentences >= 10000:
             num_workers = min(32, os.cpu_count() or 16)
             chunk_size = (num_sentences + num_workers - 1) // num_workers
-            chunks = [sentence_list[i:i + chunk_size] for i in range(0, num_sentences, chunk_size)]
+            chunks = [
+                sentence_list[i : i + chunk_size]
+                for i in range(0, num_sentences, chunk_size)
+            ]
 
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(_build_vocab_worker, chunk, self.token_type) for chunk in chunks]
+                futures = [
+                    executor.submit(
+                        _build_vocab_worker, chunk, self.token_type
+                    )
+                    for chunk in chunks
+                ]
                 all_unique = set()
                 for future in futures:
                     all_unique.update(future.result())
@@ -130,7 +149,6 @@ class Vocabulary:
 
         for token in tokenized:
             idx = self.stoi.get(token, UNK_IDX)
-            # Guard against any index equal to or exceeding vocab boundary
             if not (0 <= idx <= max_valid_idx):
                 idx = UNK_IDX
             indices.append(idx)
@@ -139,7 +157,16 @@ class Vocabulary:
 
 
 class PretokenizedNMTDataset(Dataset):
-    def __init__(self, csv_path, src_lang="de", trg_lang="en", token_type="word", src_vocab=None, trg_vocab=None):
+
+    def __init__(
+        self,
+        csv_path,
+        src_lang="de",
+        trg_lang="en",
+        token_type="word",
+        src_vocab=None,
+        trg_vocab=None,
+    ):
         self.src_lang = src_lang
         self.trg_lang = trg_lang
         self.token_type = token_type
@@ -147,9 +174,10 @@ class PretokenizedNMTDataset(Dataset):
         cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
         os.makedirs(cache_dir, exist_ok=True)
         base_name = os.path.basename(csv_path).replace(".csv", "")
-        cache_path = os.path.join(cache_dir, f"matrix_{base_name}_{token_type}.pt")
+        cache_path = os.path.join(
+            cache_dir, f"matrix_{base_name}_{token_type}.pt"
+        )
 
-        # FAST PATH: Load instantly from pre-serialized binary disk cache if present
         if os.path.exists(cache_path):
             cached = torch.load(cache_path, weights_only=False)
             self.src_data = cached["src_data"]
@@ -158,14 +186,18 @@ class PretokenizedNMTDataset(Dataset):
             self.trg_offsets = cached["trg_offsets"]
             self.src_lengths = cached["src_lengths"]
             self.trg_lengths = cached["trg_lengths"]
-            self.src_vocab = src_vocab if src_vocab is not None else cached["src_vocab"]
-            self.trg_vocab = trg_vocab if trg_vocab is not None else cached["trg_vocab"]
+            self.src_vocab = (
+                src_vocab if src_vocab is not None else cached["src_vocab"]
+            )
+            self.trg_vocab = (
+                trg_vocab if trg_vocab is not None else cached["trg_vocab"]
+            )
             return
 
         df = pd.read_csv(csv_path)
         src_texts = df[src_lang].astype(str).tolist()
         trg_texts = df[trg_lang].astype(str).tolist()
-        del df  # Free raw dataframe memory to reduce IPC overhead in worker processes
+        del df
 
         if src_vocab is None:
             self.src_vocab = Vocabulary(token_type)
@@ -182,13 +214,18 @@ class PretokenizedNMTDataset(Dataset):
         num_samples = len(src_texts)
         raw_data = []
 
-        # Vectorize numericalization across host CPU cores via ProcessPoolExecutor
         if num_samples >= 5000:
             num_workers = min(32, os.cpu_count() or 16)
             chunk_size = (num_samples + num_workers - 1) // num_workers
 
-            src_chunks = [src_texts[i:i + chunk_size] for i in range(0, num_samples, chunk_size)]
-            trg_chunks = [trg_texts[i:i + chunk_size] for i in range(0, num_samples, chunk_size)]
+            src_chunks = [
+                src_texts[i : i + chunk_size]
+                for i in range(0, num_samples, chunk_size)
+            ]
+            trg_chunks = [
+                trg_texts[i : i + chunk_size]
+                for i in range(0, num_samples, chunk_size)
+            ]
 
             src_max_idx = len(self.src_vocab.itos) - 1
             trg_max_idx = len(self.trg_vocab.itos) - 1
@@ -211,16 +248,25 @@ class PretokenizedNMTDataset(Dataset):
                     raw_data.extend(future.result())
         else:
             for src, trg in zip(src_texts, trg_texts):
-                src_num = np.array([SOS_IDX] + self.src_vocab.numericalize(src) + [EOS_IDX], dtype=np.int64)
-                trg_num = np.array([SOS_IDX] + self.trg_vocab.numericalize(trg) + [EOS_IDX], dtype=np.int64)
+                src_num = np.array(
+                    [SOS_IDX] + self.src_vocab.numericalize(src) + [EOS_IDX],
+                    dtype=np.int64,
+                )
+                trg_num = np.array(
+                    [SOS_IDX] + self.trg_vocab.numericalize(trg) + [EOS_IDX],
+                    dtype=np.int64,
+                )
                 raw_data.append((src_num, trg_num))
 
-        # Flatten storage into contiguous 1D NumPy arrays to eliminate IPC serialization bloat
         src_arrays = [pair[0] for pair in raw_data]
         trg_arrays = [pair[1] for pair in raw_data]
 
-        self.src_lengths = np.array([len(s) for s in src_arrays], dtype=np.int32)
-        self.trg_lengths = np.array([len(t) for t in trg_arrays], dtype=np.int32)
+        self.src_lengths = np.array(
+            [len(s) for s in src_arrays], dtype=np.int32
+        )
+        self.trg_lengths = np.array(
+            [len(t) for t in trg_arrays], dtype=np.int32
+        )
 
         self.src_offsets = np.zeros(num_samples + 1, dtype=np.int64)
         self.trg_offsets = np.zeros(num_samples + 1, dtype=np.int64)
@@ -228,12 +274,19 @@ class PretokenizedNMTDataset(Dataset):
         np.cumsum(self.src_lengths, out=self.src_offsets[1:])
         np.cumsum(self.trg_lengths, out=self.trg_offsets[1:])
 
-        self.src_data = np.concatenate(src_arrays) if src_arrays else np.array([], dtype=np.int64)
-        self.trg_data = np.concatenate(trg_arrays) if trg_arrays else np.array([], dtype=np.int64)
+        self.src_data = (
+            np.concatenate(src_arrays)
+            if src_arrays
+            else np.array([], dtype=np.int64)
+        )
+        self.trg_data = (
+            np.concatenate(trg_arrays)
+            if trg_arrays
+            else np.array([], dtype=np.int64)
+        )
 
         del raw_data, src_arrays, trg_arrays
 
-        # Save binary dataset tensor cache to disk
         torch.save({
             "src_data": self.src_data,
             "trg_data": self.trg_data,
@@ -260,25 +313,24 @@ class PretokenizedNMTDataset(Dataset):
 
 
 class BucketBatchSampler(Sampler):
-    """
-    Groups sequences of similar lengths together to minimize PAD computation
-    using megabatch bucketing to preserve batch variance and optimize sorting.
-    """
+
     def __init__(self, dataset, batch_size, shuffle=True, mega_batch_mult=100):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.mega_batch_size = batch_size * mega_batch_mult
 
-        if hasattr(self.dataset, 'src_lengths'):
+        if hasattr(self.dataset, "src_lengths"):
             self.lengths = self.dataset.src_lengths
-        elif hasattr(self.dataset, 'data'):
-            self.lengths = np.array([len(item[0]) for item in self.dataset.data], dtype=np.int32)
+        elif hasattr(self.dataset, "data"):
+            self.lengths = np.array(
+                [len(item[0]) for item in self.dataset.data], dtype=np.int32
+            )
         else:
-            self.lengths = np.array([len(self.dataset[i][0]) for i in range(len(self.dataset))], dtype=np.int32)
-
-    def _get_src_len(self, idx):
-        return int(self.lengths[idx])
+            self.lengths = np.array(
+                [len(self.dataset[i][0]) for i in range(len(self.dataset))],
+                dtype=np.int32,
+            )
 
     def __iter__(self):
         indices = np.arange(len(self.dataset))
@@ -288,13 +340,12 @@ class BucketBatchSampler(Sampler):
         batches = []
         lengths = self.lengths
         for i in range(0, len(indices), self.mega_batch_size):
-            mega_batch = indices[i:i + self.mega_batch_size]
-
-            sorted_order = np.argsort(lengths[mega_batch])
-            sorted_mega = mega_batch[sorted_order]
-
-            for j in range(0, len(sorted_mega), self.batch_size):
-                batches.append(sorted_mega[j:j + self.batch_size])
+            mega_batch = indices[i : i + self.mega_batch_size]
+            sorted_order = mega_batch[np.argsort(lengths[mega_batch])]
+            for j in range(0, len(sorted_order), self.batch_size):
+                batch = sorted_order[j : j + self.batch_size]
+                if len(batch) == self.batch_size or not self.shuffle:
+                    batches.append(batch)
 
         if self.shuffle:
             random.shuffle(batches)
@@ -313,23 +364,44 @@ def collate_fn(batch):
     return src_padded, trg_padded
 
 
-def get_dataloader(csv_path, batch_size=512, shuffle=True, src_vocab=None, trg_vocab=None,
-                   src_lang="de", trg_lang="en", token_type="word", num_workers=16):
+def get_dataloader(
+    csv_path,
+    batch_size=128,
+    shuffle=True,
+    src_vocab=None,
+    trg_vocab=None,
+    src_lang="de",
+    trg_lang="en",
+    token_type="word",
+):
     dataset = PretokenizedNMTDataset(
-        csv_path, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type,
-        src_vocab=src_vocab, trg_vocab=trg_vocab
+        csv_path=csv_path,
+        src_lang=src_lang,
+        trg_lang=trg_lang,
+        token_type=token_type,
+        src_vocab=src_vocab,
+        trg_vocab=trg_vocab,
     )
 
-    sampler = BucketBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
-    use_workers = num_workers > 0
+    if shuffle:
+        sampler = BucketBatchSampler(
+            dataset, batch_size=batch_size, shuffle=True
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=True,
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=True,
+        )
 
-    loader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=use_workers,
-        prefetch_factor=4 if use_workers else None
-    )
     return loader, dataset.src_vocab, dataset.trg_vocab

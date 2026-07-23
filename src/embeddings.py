@@ -3,241 +3,132 @@ import numpy as np
 import torch
 
 
-def load_pretrained_word_vectors(
-    vocab, lang="en", emb_dim=300, glove_dir="data", silent=False
-):
-    """Loads pre-trained Word2Vec/FastText vectors for EN, DE, SV.
+def _get_cache_dir():
+    cache_dir = os.path.join("data", ".embeddings_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
 
-    Checks local volume directory first before attempting remote API downloads.
-    """
-    local_file_candidates = {
-        "en": [
-            "GoogleNews-vectors-negative300.bin.gz",
-            "GoogleNews-vectors-negative300.bin",
-            "cc.en.300.vec",
-            "wiki.en.vec",
-        ],
-        "de": [
-            "wiki.de.vec",
-            "cc.de.300.vec",
-            "fasttext-wiki-news-subwords-300.vec",
-            "glove.de.300d.txt",
-        ],
-        "sv": [
-            "wiki.sv.vec",
-            "cc.sv.300.vec",
-            "fasttext-wiki-news-subwords-300.vec",
-            "glove.sv.300d.txt",
-        ],
-    }
 
-    candidates = local_file_candidates.get(lang, [])
-    filepath = None
+def load_word2vec_keyed_vectors(filepath, binary=False):
+    """Loads KeyedVectors using fast binary PyTorch disk caching to eliminate 12-min parse overhead."""
+    cache_dir = _get_cache_dir()
+    base_name = os.path.basename(filepath).replace(".", "_")
+    pt_cache_path = os.path.join(cache_dir, f"cache_{base_name}.pt")
 
-    # Check for local file existence
-    for cand in candidates:
-        full_p = os.path.join(glove_dir, cand)
-        if os.path.exists(full_p):
-            filepath = full_p
-            break
-        elif os.path.exists(cand):
-            filepath = cand
-            break
-
-    wv = None
-
-    # Option A: Load from local volume file
-    if filepath:
-        if not silent:
-            print(
-                f"📦 [Word2Vec/FastText] Loading local file for '{lang}' from: {filepath}"
-            )
+    if os.path.exists(pt_cache_path):
         try:
-            from gensim.models import KeyedVectors
+            return torch.load(pt_cache_path, weights_only=False)
+        except Exception:
+            pass
 
-            is_binary = filepath.endswith(".bin") or filepath.endswith(".bin.gz")
-            wv = KeyedVectors.load_word2vec_format(filepath, binary=is_binary)
-        except Exception as e:
-            if not silent:
-                print(
-                    f"⚠️ Failed to parse local file with Gensim ({e}). Falling back..."
-                )
+    # Rank 0 handles initial parsing if distributed
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        torch.distributed.barrier()
+        if os.path.exists(pt_cache_path):
+            return torch.load(pt_cache_path, weights_only=False)
 
-    # Option B: Download via Gensim API if local file doesn't exist
-    if wv is None:
-        try:
-            import gensim.downloader as api
+    from gensim.models import KeyedVectors
 
-            model_name_map = {
-                "en": "word2vec-google-news-300",
-                "de": "fasttext-wiki-news-subwords-300",
-                "sv": "fasttext-wiki-news-subwords-300",
-            }
-            model_name = model_name_map.get(lang, "word2vec-google-news-300")
-            if not silent:
-                print(
-                    f"📦 [Word2Vec] Local file not found. Attempting download via Gensim API ({model_name})..."
-                )
-            wv = api.load(model_name)
-        except Exception as e:
-            if not silent:
-                print(
-                    f"⚠️ Could not download Word2Vec model via Gensim API ({e}). Falling back to randomized initialization."
-                )
-            return torch.randn(len(vocab), emb_dim) * 0.01
+    print(
+        f"📦 Loading pre-trained vectors from {filepath} (Building fast binary"
+        " cache)..."
+    )
+    wv = KeyedVectors.load_word2vec_format(filepath, binary=binary)
 
-    # Populate embedding matrix
-    actual_dim = wv.vector_size
-    weights = torch.randn(len(vocab), actual_dim) * 0.01
+    vector_dict = {word: wv[word] for word in wv.key_to_index}
+    torch.save(vector_dict, pt_cache_path)
+    print(f"⚡ Saved fast binary embedding cache -> {pt_cache_path}")
 
-    found = 0
-    stoi_dict = (
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        torch.distributed.barrier()
+
+    return vector_dict
+
+
+def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"):
+    """Fills PyTorch tensor embedding weights with smart token matching heuristics."""
+    vocab_size = len(vocab)
+    weights = torch.randn(vocab_size, emb_dim) * 0.01
+
+    if token_type == "char":
+        print(
+            "⚠️ [Word2Vec/GloVe] Token level is 'char'. Pre-trained word vectors"
+            " are word-level. Using standard initialized embeddings."
+        )
+        return weights
+
+    stoi = (
         vocab.stoi if hasattr(vocab, "stoi") else getattr(vocab, "word2idx", {})
     )
-
-    for token, idx in stoi_dict.items():
-        if token in wv:
-            weights[idx] = torch.from_numpy(wv[token].copy())
-            found += 1
-        elif token.lower() in wv:
-            weights[idx] = torch.from_numpy(wv[token.lower()].copy())
-            found += 1
-
-    if not silent:
-        coverage = (found / max(1, len(vocab))) * 100
-        print(
-            f"✅ Loaded {found}/{len(vocab)} tokens ({coverage:.1f}%) from pre-trained vectors ({lang})."
-        )
-
-    return weights
-
-
-def load_language_matched_glove(
-    vocab, lang="en", emb_dim=300, glove_dir="data", silent=False
-):
-    """Loads language-matched GloVe / FastText text vector files (.txt / .vec) from disk."""
-    lang_file_map = {
-        "en": [
-            f"glove.6B.{emb_dim}d.txt",
-            "glove.6B.300d.txt",
-            "glove.en.300d.txt",
-            "cc.en.300.vec",
-        ],
-        "de": [
-            "glove.de.300d.txt",
-            "wiki.de.vec",
-            "cc.de.300.vec",
-            "german_glove.txt",
-            f"glove.de.{emb_dim}d.txt",
-        ],
-        "sv": [
-            "glove.sv.300d.txt",
-            "wiki.sv.vec",
-            "cc.sv.300.vec",
-            f"glove.sv.{emb_dim}d.txt",
-        ],
-    }
-
-    candidates = lang_file_map.get(
-        lang, [f"glove.{lang}.300d.txt", "glove.6B.300d.txt"]
-    )
-    filepath = None
-
-    for cand in candidates:
-        full_p = os.path.join(glove_dir, cand)
-        if os.path.exists(full_p):
-            filepath = full_p
-            break
-        elif os.path.exists(cand):
-            filepath = cand
-            break
-
-    embeddings_dict = {}
-    detected_dim = emb_dim
-
-    if filepath and os.path.exists(filepath):
-        if not silent:
-            print(
-                f"📖 [GloVe/Text] Loading language-matched vectors for '{lang}' from: {filepath}"
-            )
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                parts = line.rstrip().split(" ")
-                if (
-                    len(parts) < 10
-                ):  # Skip header lines (e.g. FastText "2000000 300")
-                    continue
-                word = parts[0]
-                vector = np.asarray(parts[1:], dtype="float32")
-                embeddings_dict[word] = vector
-                detected_dim = len(vector)
-    else:
-        if not silent:
-            print(
-                f"⚠️ [GloVe/Text] Language vector file for '{lang}' not found in {candidates}. Falling back to random initialization."
-            )
-
-    weights = torch.randn(len(vocab), detected_dim) * 0.01
     found = 0
-    stoi_dict = (
-        vocab.stoi if hasattr(vocab, "stoi") else getattr(vocab, "word2idx", {})
+    special_tokens = {"<PAD>", "<UNK>", "<SOS>", "<EOS>"}
+
+    for token, idx in stoi.items():
+        if token in special_tokens:
+            if token == "<PAD>":
+                weights[idx] = torch.zeros(emb_dim)
+            continue
+
+        candidates = [
+            token,
+            token.lower(),
+            token.strip(".,!?\"'()[]{}"),
+            token.capitalize(),
+        ]
+        matched_vec = None
+        for cand in candidates:
+            if cand in vector_dict:
+                matched_vec = vector_dict[cand]
+                break
+
+        if matched_vec is not None:
+            weights[idx] = torch.from_numpy(matched_vec.copy())
+            found += 1
+
+    total_eval = max(1, len(stoi) - len(special_tokens))
+    coverage = (found / total_eval) * 100.0
+    print(
+        f"✅ Loaded {found}/{total_eval} tokens ({coverage:.1f}%) from"
+        " pre-trained vectors."
     )
-
-    for token, idx in stoi_dict.items():
-        if token in embeddings_dict:
-            weights[idx] = torch.from_numpy(embeddings_dict[token])
-            found += 1
-        elif token.lower() in embeddings_dict:
-            weights[idx] = torch.from_numpy(embeddings_dict[token.lower()])
-            found += 1
-
-    if not silent:
-        coverage = (found / max(1, len(vocab))) * 100
-        print(
-            f"✅ [GloVe Language Alignment] Matched {found}/{len(vocab)} tokens ({coverage:.1f}%) for language '{lang}'."
-        )
-
     return weights
-
-import zipfile
-import urllib.request
-
-def download_and_extract_glove(glove_dir="data"):
-    """Downloads and extracts Stanford GloVe embeddings if not present locally."""
-    os.makedirs(glove_dir, exist_ok=True)
-    glove_url = "https://nlp.stanford.edu/data/glove.6B.zip"
-    zip_path = os.path.join(glove_dir, "glove.6B.zip")
-
-    # Check if extracted files already exist
-    existing_files = os.listdir(glove_dir) if os.path.exists(glove_dir) else []
-    if not any(f.startswith("glove") and f.endswith(".txt") for f in existing_files):
-        if not os.path.exists(zip_path):
-            print(f"📥 Downloading GloVe embeddings from {glove_url}...")
-            urllib.request.urlretrieve(glove_url, zip_path)
-        print("📦 Extracting GloVe embeddings...")
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(glove_dir)
-        print("✅ GloVe extraction complete.")
 
 
 def generate_word2vec_embeddings(
-    vocab, train_csv=None, lang="en", emb_dim=300, silent=False, pair_prefix=None
+    vocab,
+    train_csv=None,
+    lang="en",
+    emb_dim=300,
+    silent=False,
+    pair_prefix=None,
+    token_type="word",
 ):
-    """Wrapper mapping generate_word2vec_embeddings to load_pretrained_word_vectors."""
-    return load_pretrained_word_vectors(
-        vocab=vocab, lang=lang, emb_dim=emb_dim, silent=silent
-    )
+    if token_type == "char":
+        if not silent:
+            print("⚠️ Token level is 'char'. Skipping Word2Vec loading.")
+        return None
 
+    if lang == "de":
+        vec_file = os.path.join("data", "wiki.de.vec")
+        binary = False
+    else:
+        vec_file = os.path.join("data", "GoogleNews-vectors-negative300.bin")
+        binary = True
 
-def precompute_word2vec_embeddings(
-    vocab=None, train_csv=None, lang="en", emb_dim=300, silent=False, pair_prefix=None, **kwargs
-):
-    """Pre-computes or caches Word2Vec embeddings for offline processing."""
-    if vocab is not None:
-        return load_pretrained_word_vectors(
-            vocab=vocab, lang=lang, emb_dim=emb_dim, silent=silent
+    if not os.path.exists(vec_file):
+        if not silent:
+            print(f"⚠️ Vector file {vec_file} not found. Skipping.")
+        return None
+
+    try:
+        vector_dict = load_word2vec_keyed_vectors(vec_file, binary=binary)
+        return populate_embedding_matrix(
+            vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
         )
-    return None
+    except Exception as e:
+        if not silent:
+            print(f"⚠️ Failed to load Word2Vec for {lang}: {e}")
+        return None
 
 
 def load_glove_embeddings_pair(
@@ -248,39 +139,44 @@ def load_glove_embeddings_pair(
     emb_dim=300,
     glove_dir="data",
     silent=False,
+    token_type="word",
 ):
-    if not silent:
-        print(
-            f"🌐 [Embedding Pipeline] Building Language-Matched Matrices: Src={src_lang.upper()} | Trg={trg_lang.upper()}"
+    if token_type == "char":
+        if not silent:
+            print("⚠️ Token level is 'char'. Skipping GloVe loading.")
+        return None, None
+
+    glove_path = os.path.join(glove_dir, f"glove.6B.{emb_dim}d.txt")
+    if not os.path.exists(glove_path):
+        if not silent:
+            print(f"⚠️ GloVe file {glove_path} not found. Skipping.")
+        return None, None
+
+    try:
+        cache_dir = _get_cache_dir()
+        pt_cache = os.path.join(cache_dir, f"cache_glove_6B_{emb_dim}d.pt")
+        if os.path.exists(pt_cache):
+            vector_dict = torch.load(pt_cache, weights_only=False)
+        else:
+            print(f"📦 Parsing GloVe text vectors from {glove_path}...")
+            vector_dict = {}
+            with open(glove_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.rstrip().split(" ")
+                    word = parts[0]
+                    vec = np.array(parts[1:], dtype=np.float32)
+                    vector_dict[word] = vec
+            torch.save(vector_dict, pt_cache)
+            print(f"⚡ Saved binary GloVe cache -> {pt_cache}")
+
+        src_emb = populate_embedding_matrix(
+            src_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
         )
-
-    src_weights = load_language_matched_glove(
-        src_vocab,
-        lang=src_lang,
-        emb_dim=emb_dim,
-        glove_dir=glove_dir,
-        silent=silent,
-    )
-    trg_weights = load_language_matched_glove(
-        trg_vocab,
-        lang=trg_lang,
-        emb_dim=emb_dim,
-        glove_dir=glove_dir,
-        silent=silent,
-    )
-
-    return src_weights, trg_weights
-
-
-def generate_word2vec_embeddings(
-    vocab,
-    train_csv=None,
-    lang="en",
-    emb_dim=300,
-    glove_dir="data",
-    silent=False,
-    pair_prefix="de_en",
-):
-    return load_pretrained_word_vectors(
-        vocab, lang=lang, emb_dim=emb_dim, glove_dir=glove_dir, silent=silent
-    )
+        trg_emb = populate_embedding_matrix(
+            trg_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
+        )
+        return src_emb, trg_emb
+    except Exception as e:
+        if not silent:
+            print(f"⚠️ GloVe loading error: {e}")
+        return None, None
