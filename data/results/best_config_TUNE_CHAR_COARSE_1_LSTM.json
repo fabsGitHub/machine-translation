@@ -1,0 +1,64 @@
+{
+    "experiment": "TUNE_CHAR_COARSE_1",
+    "rnn_type": "LSTM",
+    "bidirectional": false,
+    "epochs": 5,
+    "patience": 3,
+    "min_delta": 0.0001,
+    "lr": 0.0005,
+    "warmup_epochs": 1,
+    "weight_decay": 0.0001,
+    "dropout": 0.2,
+    "emb_dim": 64,
+    "hidden_dim": 1024,
+    "batch_size": 512,
+    "grad_accum_steps": 4,
+    "clip": 1.0,
+    "tf_start": 1.0,
+    "tf_end": 0.3,
+    "tf_decay_mode": "linear",
+    "attention_type": "none",
+    "token_type": "char",
+    "embedding_source": "scratch",
+    "freeze_emb": false,
+    "src_lang": "en",
+    "trg_lang": "de",
+    "resume": true,
+    "precision": "auto",
+    "train_time": 115.7,
+    "best_val_loss": 2.9749066829681396,
+    "val_loss": 2.9749066829681396,
+    "epochs_trained": 2,
+    "loss_history": {
+        "train": [
+            3.7087903022766113,
+            2.9770655632019043,
+            2.9660167694091797
+        ],
+        "val": [
+            3.0152101516723633,
+            2.9749066829681396,
+            2.974980115890503
+        ],
+        "lr": [
+            0.0001,
+            0.0005,
+            0.0004282411613907041
+        ],
+        "tf_ratio": [
+            1.0,
+            0.825,
+            0.65
+        ]
+    },
+    "hardware_precision": "bf16",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "vram_model_mb": 98.9,
+    "vram_gradients_mb": 98.9,
+    "vram_optimizer_mb": 197.79,
+    "vram_activations_mb": 8681.7,
+    "vram_allocated_mb": 523.83,
+    "vram_reserved_mb": 20698.0,
+    "vram_peak_mb": 9077.28,
+    "vram_peak_gb": 20.213
+}
