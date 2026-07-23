@@ -1,8 +1,8 @@
 {
-    "experiment": "TUNE_WORD_COARSE_3",
+    "experiment": "WORD_A4",
     "rnn_type": "GRU",
     "bidirectional": true,
-    "epochs": 4,
+    "epochs": 6,
     "lr": 0.0005,
     "dropout": 0.4,
     "emb_dim": 512,
@@ -19,18 +19,18 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "128.5",
-    "best_val_loss": 7.112775802612305,
-    "val_loss": 7.112775802612305,
+    "train_time": "129.6",
+    "best_val_loss": 7.112247467041016,
+    "val_loss": 7.112247467041016,
     "epochs_trained": 1,
     "loss_history": {
         "train": [
-            7.135038375854492,
-            6.7461652755737305
+            7.135123252868652,
+            6.747227668762207
         ],
         "val": [
-            7.112775802612305,
-            7.416009426116943
+            7.112247467041016,
+            7.4086503982543945
         ]
     },
     "hardware_precision": "bf16",
@@ -42,5 +42,11 @@
     "vram_allocated_mb": 3858.28,
     "vram_reserved_mb": 14402.0,
     "vram_peak_mb": 9278.27,
-    "vram_peak_gb": 14.064
+    "vram_peak_gb": 14.064,
+    "bleu": 0.02,
+    "Target Metric (BLEU)": 0.02,
+    "bleu_score": 0.02,
+    "overall_corpus_bleu": 0.02,
+    "meteor": 0.0492,
+    "mean_meteor": 0.0492
 }

@@ -1,0 +1,8 @@
+{
+    "lr": 0.0005,
+    "dropout": 0.4,
+    "emb_dim": 256,
+    "hidden_dim": 256,
+    "rnn_type": "RNN",
+    "val_loss": 6.962872505187988
+}

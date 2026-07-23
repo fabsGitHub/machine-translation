@@ -1,9 +1,9 @@
 {
-    "experiment": "TUNE_WORD_COARSE_1",
-    "rnn_type": "RNN",
+    "experiment": "WORD_B1",
+    "rnn_type": "GRU",
     "bidirectional": true,
-    "epochs": 4,
-    "lr": 0.001,
+    "epochs": 6,
+    "lr": 0.0005,
     "dropout": 0.4,
     "emb_dim": 256,
     "hidden_dim": 512,
@@ -19,28 +19,26 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "115.8",
-    "best_val_loss": 7.505019187927246,
-    "val_loss": 7.505019187927246,
+    "train_time": "119.9",
+    "best_val_loss": 7.092514991760254,
+    "val_loss": 7.092514991760254,
     "epochs_trained": 1,
     "loss_history": {
         "train": [
-            7.194327354431152,
-            7.010159015655518
+            7.194218158721924
         ],
         "val": [
-            7.505019187927246,
-            8.378920555114746
+            7.092514991760254
         ]
     },
     "hardware_precision": "bf16",
     "gpu_name": "NVIDIA GeForce RTX 4090",
-    "vram_model_mb": 315.7,
-    "vram_gradients_mb": 315.7,
-    "vram_optimizer_mb": 631.39,
-    "vram_activations_mb": 7062.68,
-    "vram_allocated_mb": 3240.28,
-    "vram_reserved_mb": 13086.0,
-    "vram_peak_mb": 8325.47,
-    "vram_peak_gb": 12.779
+    "vram_model_mb": 340.74,
+    "vram_gradients_mb": 340.74,
+    "vram_optimizer_mb": 0.0,
+    "vram_activations_mb": 4585.19,
+    "vram_allocated_mb": 1955.42,
+    "vram_reserved_mb": 6482.0,
+    "vram_peak_mb": 5266.68,
+    "vram_peak_gb": 6.33
 }
