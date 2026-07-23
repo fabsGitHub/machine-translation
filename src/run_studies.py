@@ -238,7 +238,6 @@ def run_cmd(args_list):
     )
 
 
-# Optimized: Retain GPU execution during evaluation runs
 def run_auto_evaluation(experiment_id, rnn_type):
     """Executes model evaluation with GPU acceleration when available."""
     target_model = os.path.join(OUTPUT_DIR, f"best_model_{experiment_id}_{rnn_type}.pt")
@@ -251,7 +250,6 @@ def run_auto_evaluation(experiment_id, rnn_type):
             target_model,
         ]
         env = os.environ.copy()
-        # Environment override removed to allow fast CUDA evaluation inference
         try:
             subprocess.run(cmd, check=True, env=env)
         except subprocess.CalledProcessError:
@@ -589,7 +587,7 @@ def execute_preprocessing(token_type="word", mock_mode=False):
 
 
 def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=3):
-    """Executes hyperparameter tuning sweeps and logs results to CSV."""
+    """Executes hyperparameter tuning sweeps across RNN, GRU, and LSTM cell types."""
     print(
         "\n"
         + "═" * 75
@@ -627,12 +625,23 @@ def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=3):
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
 
-    param_combinations = list(
-        itertools.product(lrs, dropouts, emb_dims, hidden_dims, rnn_types)
-    )
     random.seed(42)
-    random.shuffle(param_combinations)
-    selected_trials = param_combinations[:num_trials]
+
+    # Guarantee balanced trial representation for all 3 RNN cell types (LSTM, GRU, RNN)
+    selected_trials = []
+    trials_per_rnn = max(1, num_trials // len(rnn_types))
+
+    for rnn in rnn_types:
+        combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, [rnn]))
+        random.shuffle(combos)
+        selected_trials.extend(combos[:trials_per_rnn])
+
+    # Fill any remaining trial quota round-robin
+    if len(selected_trials) < num_trials:
+        all_combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, rnn_types))
+        remaining = [c for c in all_combos if c not in selected_trials]
+        random.shuffle(remaining)
+        selected_trials.extend(remaining[:num_trials - len(selected_trials)])
 
     best_loss = float("inf")
     best_params = None
@@ -640,7 +649,7 @@ def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=3):
     for idx, (lr, drop, emb_d, hid_d, rnn) in enumerate(selected_trials, 1):
         exp_id = f"TUNE_{token_type.upper()}_{stage.upper()}_{idx}"
         print(
-            f"\n🧪 [Trial {idx}/{num_trials}] -> LR={lr}, Dropout={drop},"
+            f"\n🧪 [Trial {idx}/{len(selected_trials)}] -> LR={lr}, Dropout={drop},"
             f" Emb={emb_d}, Hidden={hid_d}, Cell={rnn}"
         )
 
