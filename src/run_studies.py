@@ -1259,7 +1259,7 @@ def main():
     parser.add_argument(
         "--tune_trials",
         type=int,
-        default=5,
+        default=3,
         help="Number of hyperparameter search trials",
     )
     parser.add_argument(
