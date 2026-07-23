@@ -182,7 +182,7 @@ def print_study_model_and_batch_info(
 def run_cmd(args_list):
     """Executes distributed PyTorch training sub-process via PyTorch DDP launcher."""
     if "--grad_accum_steps" not in args_list:
-        args_list = ["--grad_accum_steps", "8"] + args_list
+        args_list = ["--grad_accum_steps", "4"] + args_list
 
     i = 0
     kv = {}

@@ -38,17 +38,16 @@ class DistributedBatchSamplerWrapper(Sampler):
             self.batch_sampler.set_epoch(epoch)
 
     def __iter__(self):
-        initial_seed = random.randint(0, 1000000)
-        random.seed(self.epoch)
+        # Use isolated random generator instance to avoid polluting global random seed
+        rng = random.Random(self.epoch + 42 + self.rank)
         batches = list(self.batch_sampler)
         if self.shuffle:
-            random.shuffle(batches)
+            rng.shuffle(batches)
             
         if len(batches) % self.num_replicas != 0:
             padding_size = self.num_replicas - (len(batches) % self.num_replicas)
             batches += batches[:padding_size]
             
-        random.seed(initial_seed + self.rank)
         for i in range(self.rank, len(batches), self.num_replicas):
             yield batches[i]
 
@@ -179,6 +178,8 @@ def parse_args():
     parser.add_argument("--rnn_type", type=str, default="LSTM", choices=["RNN", "LSTM", "GRU"])
     parser.add_argument("--bidirectional", type=str2bool, default=True)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience (epochs without loss improvement)")
+    parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum validation loss change to count as improvement")
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--emb_dim", type=int, default=256)
@@ -345,7 +346,6 @@ def main():
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
 
-    # Optimized: Prevent redundant DataLoader construction, core oversubscription & worker process leaks
     num_workers = 8
     if is_distributed:
         raw_train_loader, src_vocab, trg_vocab = get_dataloader(
@@ -404,7 +404,6 @@ def main():
     silent_logging = rank > 0
     pair_prefix = f"{args.src_lang}_{args.trg_lang}"
     
-    # --- EMBEDDING INITIALIZATION ROUTINES ---
     if args.embedding_source == "word2vec":
         pretrained_src_emb = generate_word2vec_embeddings(
             src_vocab, train_csv, lang=args.src_lang, emb_dim=300, silent=silent_logging, pair_prefix=pair_prefix
@@ -458,14 +457,13 @@ def main():
         print(f" ├─ Grad Accumulation Steps:    {args.grad_accum_steps}")
         print(f" ├─ Effective Batch Size (p/GPU):{effective_batch_per_gpu}")
         print(f" ├─ Global Effective Batch:     {global_effective_batch} sequence(s) across {world_size} rank(s)")
+        print(f" ├─ Early Stopping Patience:    {args.patience} epochs (Min Delta: {args.min_delta})")
         print(f" ├─ Total Trainable Parameters: {total_params:,}")
         print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
     
-    # ------------------------------------------------------------------
-    # 1. RESUME CHECKPOINT (Before torch.compile & DDP wrapping)
-    # ------------------------------------------------------------------
     best_val_loss = float("inf")
+    patience_counter = 0
     start_train_time = time.time()
     loss_history = {"train": [], "val": []}
     
@@ -482,7 +480,6 @@ def main():
         state_dict = checkpoint['model_state_dict']
         clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         
-        # Robust key mapping: handles standard parameters and compiled _orig_mod keys
         target_state = model.state_dict()
         adapted_state_dict = {}
         for k, v in clean_state_dict.items():
@@ -501,9 +498,6 @@ def main():
             loss_history = checkpoint['loss_history']
             start_epoch = len(loss_history.get("train", []))
 
-    # ------------------------------------------------------------------
-    # 2. COMPILE ENCODER GRAPH
-    # ------------------------------------------------------------------
     if can_compile:
         try:
             model.encoder = torch.compile(model.encoder, mode="default")
@@ -513,9 +507,6 @@ def main():
             if rank == 0:
                 print(f"⚠️ torch.compile skipped: {e}")
 
-    # ------------------------------------------------------------------
-    # 3. WRAP DISTRIBUTED DATA PARALLEL
-    # ------------------------------------------------------------------
     if is_distributed:
         if device.type == "cuda":
             model = nn.parallel.DistributedDataParallel(
@@ -524,9 +515,6 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    # ------------------------------------------------------------------
-    # 4. INITIALIZE OPTIMIZER & LOSS FUNCTION
-    # ------------------------------------------------------------------
     if device.type == "cuda":
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
         if rank == 0:
@@ -579,8 +567,10 @@ def main():
                 time_fmt = f"{mins:02d}m {secs:02d}s" if mins > 0 else f"{epoch_duration:.2f}s"
                 print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Time: {time_fmt}")
                 
-            if val_loss < best_val_loss:
+            # Early stopping check with patience and min_delta tolerance
+            if val_loss < (best_val_loss - args.min_delta):
                 best_val_loss = val_loss
+                patience_counter = 0
                 if rank == 0:
                     config_dict = vars(args).copy()
                     config_dict.update({
@@ -604,8 +594,9 @@ def main():
                     with open(config_json_path, 'w') as f:
                         json.dump(config_dict, f, indent=4)
             else:
+                patience_counter += 1
                 if rank == 0:
-                    print(f"🛑 Early stopping triggered: Loss did not improve from {best_val_loss:.4f}.")
+                    print(f"⚠️ Validation loss did not improve ({val_loss:.4f} >= {best_val_loss:.4f}). Patience: {patience_counter}/{args.patience}")
                     try:
                         if os.path.exists(config_json_path):
                             with open(config_json_path, 'r') as f:
@@ -616,7 +607,11 @@ def main():
                                 json.dump(c_data, f, indent=4)
                     except Exception:
                         pass
-                break
+                        
+                if patience_counter >= args.patience:
+                    if rank == 0:
+                        print(f"🛑 Early stopping triggered after {patience_counter} epoch(s) without improvement.")
+                    break
 
     if rank == 0:
         if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
