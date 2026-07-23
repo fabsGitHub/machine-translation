@@ -5,7 +5,7 @@ import time
 import random
 import torch
 
-# 1. Enable TensorFloat-32 (TF32) for Ampere Tensor Cores immediately at startup
+# Enable TensorFloat-32 (TF32) for Ampere Tensor Cores immediately at startup
 torch.set_float32_matmul_precision('high')
 
 import torch.nn as nn
@@ -340,7 +340,6 @@ def main():
         src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
     )
     
-    # 3. Optimized DataLoader Parameters to prevent CPU worker starvation
     num_workers = 8  # Optimized for multi-core host CPUs
     if is_distributed:
         train_sampler = DistributedBatchSamplerWrapper(
@@ -453,17 +452,17 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    # 1. Compile Model Graph to fuse kernels and remove Python loop overheads
+    # Standard dynamic compilation mode safe for dynamic RNN sequence lengths and DDP
     if can_compile:
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, mode="default", dynamic=True)
             if rank == 0:
-                print("⚡ Compiled Model Graph with TorchInductor (mode='reduce-overhead').")
+                print("⚡ Compiled Model Graph with TorchInductor (mode='default', dynamic=True).")
         except Exception as e:
             if rank == 0:
                 print(f"⚠️ torch.compile skipped due to execution environment: {e}")
     
-    # 2. Fast Optimizer Setup: 8-bit AdamW via bitsandbytes or native Fused AdamW
+    # Optimizer Setup
     try:
         import bitsandbytes as bnb
         optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr, weight_decay=1e-4)

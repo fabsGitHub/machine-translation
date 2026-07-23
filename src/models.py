@@ -1,3 +1,4 @@
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -207,8 +208,9 @@ class Decoder(nn.Module):
         )
 
         # FAST PATH: Fused cuDNN pass when teacher forcing triggers on non-attention models
+        # Host-side Python random eliminates GPU-to-CPU sync and CUDA graph breaks
         use_teacher_forcing = self.training and (
-            (torch.rand(1, device=trg.device).item() < teacher_forcing_ratio)
+            (random.random() < teacher_forcing_ratio)
             if teacher_forcing_ratio > 0.0
             else False
         )
