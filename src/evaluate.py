@@ -356,8 +356,17 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.1, seed=42):
     ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}.json")
     os.makedirs(ROOT_DIR, exist_ok=True)
 
+    global_data = {}
+    if os.path.exists(ledger_path):
+        try:
+            with open(ledger_path, 'r', encoding='utf-8') as f:
+                global_data = json.load(f)
+        except Exception:
+            global_data = {}
+
+    global_data[experiment_id] = ledger_entry
     with open(ledger_path, 'w', encoding='utf-8') as f:
-        json.dump(ledger_entry, f, indent=4)
+        json.dump(global_data, f, indent=4)
 
     # 2. Update Isolated Study Group Ledger Directly
     study_ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}_{study_suffix}.json")
@@ -371,7 +380,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.1, seed=42):
 
     study_data[experiment_id] = ledger_entry
     with open(study_ledger_path, 'w', encoding='utf-8') as f:
-        json.dump(ledger_entry, f, indent=4)
+        json.dump(study_data, f, indent=4)
 
     print(f"✅ Evaluation complete. Metrics saved to {ledger_path} and {study_ledger_path}")
 
