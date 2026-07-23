@@ -166,6 +166,7 @@ class PretokenizedNMTDataset(Dataset):
         token_type="word",
         src_vocab=None,
         trg_vocab=None,
+        mock_mode=False,
     ):
         self.src_lang = src_lang
         self.trg_lang = trg_lang

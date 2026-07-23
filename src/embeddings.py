@@ -79,20 +79,14 @@ def load_word2vec_keyed_vectors(filepath, binary=False):
 
 
 def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"):
-    """Fills PyTorch tensor embedding weights with smart token matching heuristics."""
     vocab_size = len(vocab)
     weights = torch.randn(vocab_size, emb_dim) * 0.01
 
     if token_type == "char":
-        print(
-            "⚠️ [Word2Vec/GloVe] Token level is 'char'. Pre-trained word vectors"
-            " are word-level. Using standard initialized embeddings."
-        )
+        print("⚠️ [Word2Vec/GloVe] Token level is 'char'. Pre-trained word vectors are word-level. Using standard initialized embeddings.")
         return weights
 
-    stoi = (
-        vocab.stoi if hasattr(vocab, "stoi") else getattr(vocab, "word2idx", {})
-    )
+    stoi = vocab.stoi if hasattr(vocab, "stoi") else getattr(vocab, "word2idx", {})
     found = 0
     special_tokens = {"<PAD>", "<UNK>", "<SOS>", "<EOS>"}
 
@@ -102,12 +96,16 @@ def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"
                 weights[idx] = torch.zeros(emb_dim)
             continue
 
+        clean_token = token.strip(".,!?\"'()[]{}")
         candidates = [
             token,
+            clean_token,
             token.lower(),
-            token.strip(".,!?\"'()[]{}"),
+            clean_token.lower(),
             token.capitalize(),
+            clean_token.capitalize()
         ]
+
         matched_vec = None
         for cand in candidates:
             if cand in vector_dict:
@@ -120,10 +118,7 @@ def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"
 
     total_eval = max(1, len(stoi) - len(special_tokens))
     coverage = (found / total_eval) * 100.0
-    print(
-        f"✅ Loaded {found}/{total_eval} tokens ({coverage:.1f}%) from"
-        " pre-trained vectors."
-    )
+    print(f"✅ Loaded {found}/{total_eval} tokens ({coverage:.1f}%) from pre-trained vectors.")
     return weights
 
 
@@ -200,39 +195,18 @@ def load_glove_embeddings_pair(
             print("⚠️ Token level is 'char'. Skipping GloVe loading.")
         return None, None
 
-    glove_path = download_and_extract_glove(
-        glove_dir=glove_dir, emb_dim=emb_dim
-    )
-    if glove_path is None or not os.path.exists(glove_path):
+    glove_path = download_and_extract_glove(glove_dir=glove_dir, emb_dim=emb_dim)
+    if not glove_path or not os.path.exists(glove_path):
         if not silent:
-            print(f"⚠️ GloVe file {glove_path} not found. Skipping.")
+            print("⚠️ GloVe embeddings file unavailable.")
         return None, None
 
     try:
-        cache_dir = _get_cache_dir()
-        pt_cache = os.path.join(cache_dir, f"cache_glove_6B_{emb_dim}d.pt")
-        if os.path.exists(pt_cache):
-            vector_dict = torch.load(pt_cache, weights_only=False)
-        else:
-            print(f"📦 Parsing GloVe text vectors from {glove_path}...")
-            vector_dict = {}
-            with open(glove_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.rstrip().split(" ")
-                    word = parts[0]
-                    vec = np.array(parts[1:], dtype=np.float32)
-                    vector_dict[word] = vec
-            torch.save(vector_dict, pt_cache)
-            print(f"⚡ Saved binary GloVe cache -> {pt_cache}")
-
-        src_emb = populate_embedding_matrix(
-            src_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
-        )
-        trg_emb = populate_embedding_matrix(
-            trg_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
-        )
+        vector_dict = load_word2vec_keyed_vectors(glove_path, binary=False)
+        src_emb = populate_embedding_matrix(src_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type)
+        trg_emb = populate_embedding_matrix(trg_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type)
         return src_emb, trg_emb
     except Exception as e:
         if not silent:
-            print(f"⚠️ GloVe loading error: {e}")
+            print(f"⚠️ Failed to load GloVe embeddings: {e}")
         return None, None
