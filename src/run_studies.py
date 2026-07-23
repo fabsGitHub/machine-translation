@@ -588,7 +588,7 @@ def execute_preprocessing(token_type="word", mock_mode=False):
     subprocess.run(cmd, check=True)
 
 
-def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=5):
+def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=3):
     """Executes hyperparameter tuning sweeps and logs results to CSV."""
     print(
         "\n"
