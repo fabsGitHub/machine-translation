@@ -44,7 +44,7 @@ def get_batch_size(study, token_type):
     if config_batch is not None:
         return str(config_batch)
 
-    return "4096" if token_type == "char" else "1024"
+    return "1024" if token_type == "char" else "512"
 
 
 class AsyncEvaluationQueue:

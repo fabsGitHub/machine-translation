@@ -7,7 +7,7 @@ DEFAULT_CONFIG = {
         "float32_matmul_precision": "high",
     },
     "data": {
-        "sample_rate": 0.01,
+        "sample_rate": 0.1,
         "test_split": 0.1,
         "seed": 42,
         "max_word_len": 50,
