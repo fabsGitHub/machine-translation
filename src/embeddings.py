@@ -113,6 +113,13 @@ def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"
                 break
 
         if matched_vec is not None:
+            # Adjust vector length to match requested emb_dim (truncation/padding)
+            vec_len = len(matched_vec)
+            if vec_len > emb_dim:
+                matched_vec = matched_vec[:emb_dim]
+            elif vec_len < emb_dim:
+                matched_vec = np.pad(matched_vec, (0, emb_dim - vec_len), mode="constant")
+
             weights[idx] = torch.from_numpy(matched_vec.copy())
             found += 1
 
