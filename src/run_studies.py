@@ -1288,13 +1288,12 @@ def main():
     eval_queue = AsyncEvaluationQueue(max_workers=2)
 
     if args.study in ["tune", "all"]:
-        if args.study == "tune":
-            execute_tuning(
-                stage=args.tune_stage,
-                token_type=args.token_type,
-                epochs=args.epochs,
-                num_trials=args.tune_trials,
-            )
+        execute_tuning(
+            stage=args.tune_stage,
+            token_type=args.token_type,
+            epochs=args.epochs,
+            num_trials=args.tune_trials,
+        )
 
     if args.study in ["all", "A"]:
         execute_study_a(args.epochs, args.token_type, eval_queue)
