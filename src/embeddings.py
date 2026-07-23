@@ -1,4 +1,6 @@
 import os
+import urllib.request
+import zipfile
 import numpy as np
 import torch
 
@@ -7,6 +9,37 @@ def _get_cache_dir():
     cache_dir = os.path.join("data", ".embeddings_cache")
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
+
+
+def download_and_extract_glove(glove_dir="data", emb_dim=300):
+    """Downloads and extracts GloVe vectors if they do not already exist."""
+    os.makedirs(glove_dir, exist_ok=True)
+    txt_path = os.path.join(glove_dir, f"glove.6B.{emb_dim}d.txt")
+
+    if os.path.exists(txt_path):
+        return txt_path
+
+    zip_path = os.path.join(glove_dir, "glove.6B.zip")
+    url = "https://nlp.stanford.edu/data/glove.6B.zip"
+
+    if not os.path.exists(zip_path):
+        print(f"📥 Downloading GloVe embeddings from {url}...")
+        try:
+            urllib.request.urlretrieve(url, zip_path)
+        except Exception as e:
+            print(f"⚠️ Failed to download GloVe: {e}")
+            return None
+
+    print(f"📦 Extracting {zip_path} to {glove_dir}...")
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(glove_dir)
+        print("✅ GloVe embeddings extracted successfully.")
+    except Exception as e:
+        print(f"⚠️ Failed to extract GloVe: {e}")
+        return None
+
+    return txt_path
 
 
 def load_word2vec_keyed_vectors(filepath, binary=False):
@@ -131,6 +164,27 @@ def generate_word2vec_embeddings(
         return None
 
 
+# Alias expected by preprocess.py
+def precompute_word2vec_embeddings(
+    vocab,
+    train_csv=None,
+    lang="en",
+    emb_dim=300,
+    silent=False,
+    pair_prefix=None,
+    token_type="word",
+):
+    return generate_word2vec_embeddings(
+        vocab=vocab,
+        train_csv=train_csv,
+        lang=lang,
+        emb_dim=emb_dim,
+        silent=silent,
+        pair_prefix=pair_prefix,
+        token_type=token_type,
+    )
+
+
 def load_glove_embeddings_pair(
     src_vocab,
     trg_vocab,
@@ -146,8 +200,10 @@ def load_glove_embeddings_pair(
             print("⚠️ Token level is 'char'. Skipping GloVe loading.")
         return None, None
 
-    glove_path = os.path.join(glove_dir, f"glove.6B.{emb_dim}d.txt")
-    if not os.path.exists(glove_path):
+    glove_path = download_and_extract_glove(
+        glove_dir=glove_dir, emb_dim=emb_dim
+    )
+    if glove_path is None or not os.path.exists(glove_path):
         if not silent:
             print(f"⚠️ GloVe file {glove_path} not found. Skipping.")
         return None, None
