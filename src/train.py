@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import random
 import time
@@ -11,6 +12,7 @@ torch.set_float32_matmul_precision('high')
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Sampler
 from utils import set_seed, setup_logging
 
@@ -38,7 +40,6 @@ class DistributedBatchSamplerWrapper(Sampler):
             self.batch_sampler.set_epoch(epoch)
 
     def __iter__(self):
-        # Use isolated random generator instance to avoid polluting global random seed
         rng = random.Random(self.epoch + 42 + self.rank)
         batches = list(self.batch_sampler)
         if self.shuffle:
@@ -52,7 +53,6 @@ class DistributedBatchSamplerWrapper(Sampler):
             yield batches[i]
 
     def __len__(self):
-        import math
         return math.ceil(len(self.batch_sampler) / self.num_replicas)
 
 
@@ -82,7 +82,7 @@ def str2bool(v):
 def setup_hardware_precision(device, precision_arg="auto"):
     """
     Dynamically configures hardware precision (FP32, FP16 AMP, BF16 AMP) 
-    and hardware features (TF32, torch.compile) based on detected CUDA Compute Capability.
+    and hardware features (TF32, torch.compile) based on CUDA Compute Capability.
     """
     if device.type != "cuda":
         return "fp32", torch.float32, None, False, False
@@ -172,22 +172,60 @@ def get_vram_breakdown(model, optimizer, device):
     }
 
 
+def configure_param_groups(model, weight_decay=1e-4):
+    """
+    Separates parameters into 2D weight matrices (weight decay enabled)
+    and 1D bias, norm, or embedding parameters (weight decay disabled).
+    """
+    decay_params = []
+    no_decay_params = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 1D tensors (biases, layer norms) or embedding lookup tables
+        if param.ndim <= 1 or "embedding" in name.lower() or "emb" in name.lower():
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+            
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0}
+    ]
+
+
+def compute_scheduled_tf_ratio(epoch, total_epochs, initial_tf=1.0, final_tf=0.3, mode="linear"):
+    """Calculates scheduled teacher forcing ratio per epoch."""
+    if total_epochs <= 1:
+        return initial_tf
+    progress = epoch / max(1, total_epochs - 1)
+    if mode == "exponential":
+        return initial_tf * ((final_tf / initial_tf) ** progress)
+    else:  # Linear decay
+        return initial_tf - progress * (initial_tf - final_tf)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Unified Seq2Seq NMT Training Interface")
     parser.add_argument("--experiment", type=str, required=True)
     parser.add_argument("--rnn_type", type=str, default="LSTM", choices=["RNN", "LSTM", "GRU"])
     parser.add_argument("--bidirectional", type=str2bool, default=True)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=5, help="Total training epochs (default set to 5)")
     parser.add_argument("--patience", type=int, default=3, help="Early stopping patience (epochs without loss improvement)")
     parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum validation loss change to count as improvement")
     parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--warmup_epochs", type=int, default=1, help="Warmup epochs for LR scheduler (1 epoch default for 5-epoch run)")
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
-    parser.add_argument("--tf_ratio", type=float, default=0.5)
+    parser.add_argument("--tf_start", type=float, default=1.0, help="Initial teacher forcing ratio")
+    parser.add_argument("--tf_end", type=float, default=0.3, help="Final teacher forcing ratio (0.3 tuned for ~5 epochs)")
+    parser.add_argument("--tf_decay_mode", type=str, default="linear", choices=["linear", "exponential"])
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
     parser.add_argument("--token_type", type=str, default="word", choices=["word", "char"])
     parser.add_argument("--embedding_source", type=str, default="scratch", choices=["scratch", "word2vec", "glove"])
@@ -453,10 +491,11 @@ def main():
         print(f" ├─ Dynamic Compilation:        {'Supported' if can_compile else 'Disabled / Incompatible CC < 7.0'}")
         print(f" ├─ Experiment ID:              {args.experiment}")
         print(f" ├─ Architecture:               {args.rnn_type} ({'Bidirectional' if args.bidirectional else 'Unidirectional'})")
+        print(f" ├─ Base Learning Rate:         {args.lr}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
         print(f" ├─ Grad Accumulation Steps:    {args.grad_accum_steps}")
-        print(f" ├─ Effective Batch Size (p/GPU):{effective_batch_per_gpu}")
         print(f" ├─ Global Effective Batch:     {global_effective_batch} sequence(s) across {world_size} rank(s)")
+        print(f" ├─ Scheduled Teacher Forcing:  {args.tf_start:.2f} ➔ {args.tf_end:.2f} ({args.tf_decay_mode.capitalize()} Decay)")
         print(f" ├─ Early Stopping Patience:    {args.patience} epochs (Min Delta: {args.min_delta})")
         print(f" ├─ Total Trainable Parameters: {total_params:,}")
         print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
@@ -465,12 +504,49 @@ def main():
     best_val_loss = float("inf")
     patience_counter = 0
     start_train_time = time.time()
-    loss_history = {"train": [], "val": []}
+    loss_history = {"train": [], "val": [], "lr": [], "tf_ratio": []}
     
     exp_tag = args.experiment if f"_{args.rnn_type}" in args.experiment else f"{args.experiment}_{args.rnn_type}"
     checkpoint_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_tag}.pt")
     config_json_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_tag}.json")
     start_epoch = 0
+
+    if can_compile:
+        try:
+            model.encoder = torch.compile(model.encoder, mode="default")
+            if rank == 0:
+                print("⚡ Compiled Encoder Graph with TorchInductor.")
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ torch.compile skipped: {e}")
+
+    if is_distributed:
+        if device.type == "cuda":
+            model = nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True
+            )
+        else:
+            model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        
+    # Configure parameter groups with filtered weight decay
+    param_groups = configure_param_groups(model, weight_decay=args.weight_decay)
+    
+    if device.type == "cuda":
+        optimizer = optim.AdamW(param_groups, lr=args.lr, fused=True)
+        if rank == 0:
+            print("⚡ Using Native PyTorch Fused AdamW Optimizer with Weight Decay filtering.")
+    else:
+        optimizer = optim.AdamW(param_groups, lr=args.lr)
+
+    # Dynamic Warmup + Cosine Annealing LR Scheduler suited for short 5-epoch runs
+    warmup_epochs = min(args.warmup_epochs, max(1, args.epochs // 4))
+    cosine_epochs = max(1, args.epochs - warmup_epochs)
+    
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.2, end_factor=1.0, total_iters=warmup_epochs)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=1e-5)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
+
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     if args.resume and os.path.exists(checkpoint_path):
         if rank == 0:
@@ -492,38 +568,25 @@ def main():
 
         model.load_state_dict(adapted_state_dict)
         
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception:
+                if rank == 0:
+                    print("⚠️ Could not load optimizer state; maintaining fresh optimizer state.")
+                    
+        if 'scheduler_state_dict' in checkpoint:
+            try:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception:
+                pass
+
         if 'best_val_loss' in checkpoint.get('config', {}):
             best_val_loss = checkpoint['config']['best_val_loss']
         if 'loss_history' in checkpoint and isinstance(checkpoint['loss_history'], dict):
             loss_history = checkpoint['loss_history']
             start_epoch = len(loss_history.get("train", []))
 
-    if can_compile:
-        try:
-            model.encoder = torch.compile(model.encoder, mode="default")
-            if rank == 0:
-                print("⚡ Compiled Encoder Graph with TorchInductor.")
-        except Exception as e:
-            if rank == 0:
-                print(f"⚠️ torch.compile skipped: {e}")
-
-    if is_distributed:
-        if device.type == "cuda":
-            model = nn.parallel.DistributedDataParallel(
-                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True
-            )
-        else:
-            model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
-        
-    if device.type == "cuda":
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
-        if rank == 0:
-            print("⚡ Using Native PyTorch Fused AdamW Optimizer (torch.optim.AdamW fused=True).")
-    else:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    
     vram_stats = {}
     
     if start_epoch >= args.epochs:
@@ -533,12 +596,18 @@ def main():
         for epoch in range(start_epoch, args.epochs):
             epoch_start_time = time.time()
             
+            # Dynamic Teacher Forcing Schedule Calculation
+            current_tf_ratio = compute_scheduled_tf_ratio(
+                epoch, args.epochs, initial_tf=args.tf_start, final_tf=args.tf_end, mode=args.tf_decay_mode
+            )
+            current_lr = optimizer.param_groups[0]['lr']
+
             if is_distributed and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
                 val_sampler.set_epoch(epoch)
                 
             train_loss = train_epoch(
-                model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, 
+                model, train_loader, optimizer, criterion, args.clip, device, current_tf_ratio, 
                 scaler=scaler, autocast_dtype=autocast_dtype, vram_stats_out=vram_stats,
                 grad_accum_steps=args.grad_accum_steps
             )
@@ -546,9 +615,14 @@ def main():
                 model, val_loader, criterion, device, autocast_dtype=autocast_dtype
             )
             
+            # Step the learning rate scheduler at epoch boundaries
+            scheduler.step()
+
             epoch_duration = time.time() - epoch_start_time
             loss_history["train"].append(train_loss)
             loss_history["val"].append(val_loss)
+            loss_history["lr"].append(current_lr)
+            loss_history["tf_ratio"].append(current_tf_ratio)
             
             if rank == 0 and epoch == start_epoch and vram_stats:
                 print("─" * 75)
@@ -565,7 +639,7 @@ def main():
             if rank == 0:
                 mins, secs = divmod(int(epoch_duration), 60)
                 time_fmt = f"{mins:02d}m {secs:02d}s" if mins > 0 else f"{epoch_duration:.2f}s"
-                print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Time: {time_fmt}")
+                print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.6f} | TF: {current_tf_ratio:.2f} | Time: {time_fmt}")
                 
             # Early stopping check with patience and min_delta tolerance
             if val_loss < (best_val_loss - args.min_delta):
@@ -574,7 +648,7 @@ def main():
                 if rank == 0:
                     config_dict = vars(args).copy()
                     config_dict.update({
-                        "train_time": f"{time.time() - start_train_time:.1f}", 
+                        "train_time": round(time.time() - start_train_time, 1), 
                         "best_val_loss": best_val_loss, 
                         "val_loss": best_val_loss,
                         "epochs_trained": len(loss_history["train"]),
@@ -586,6 +660,8 @@ def main():
                     torch.save({
                         'config': config_dict, 
                         'model_state_dict': get_clean_state_dict(model), 
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
                         'src_vocab': src_vocab, 
                         'trg_vocab': trg_vocab,
                         'loss_history': loss_history

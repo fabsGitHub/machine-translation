@@ -587,7 +587,7 @@ def execute_preprocessing(token_type="word", mock_mode=False):
 
 
 def execute_tuning(
-    stage="coarse", token_type="word", epochs=4, num_trials=12, configs_per_rnn=None
+    stage="coarse", token_type="word", epochs=4, num_trials=15, configs_per_rnn=None
 ):
     """Executes hyperparameter tuning sweeps evenly across RNN, GRU, and LSTM cell types."""
     print(

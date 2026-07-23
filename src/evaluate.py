@@ -325,7 +325,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.1, seed=42):
         "trg_lang": trg_lang,
         "resume": config.get("resume", False),
         "precision": config.get("precision", "auto"),
-        "train_time": str(config.get("train_time", -1)),
+        "train_time": config.get("train_time", -1),
         "best_val_loss": config.get("best_val_loss"),
         "val_loss": config.get("val_loss"),
         "epochs_trained": config.get("epochs_trained"),
