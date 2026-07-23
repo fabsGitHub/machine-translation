@@ -1,10 +1,10 @@
 {
-    "experiment": "TUNE_WORD_COARSE_5",
+    "experiment": "TUNE_WORD_COARSE_6",
     "rnn_type": "GRU",
     "bidirectional": true,
     "epochs": 4,
     "lr": 0.0005,
-    "dropout": 0.3,
+    "dropout": 0.2,
     "emb_dim": 256,
     "hidden_dim": 256,
     "batch_size": 128,
@@ -19,18 +19,18 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "110.3",
-    "best_val_loss": 6.9540605545043945,
-    "val_loss": 6.9540605545043945,
+    "train_time": "108.5",
+    "best_val_loss": 6.961401462554932,
+    "val_loss": 6.961401462554932,
     "epochs_trained": 1,
     "loss_history": {
         "train": [
-            7.387328624725342,
-            6.741142272949219
+            7.38386344909668,
+            6.726325511932373
         ],
         "val": [
-            6.9540605545043945,
-            7.052131652832031
+            6.961401462554932,
+            7.072037696838379
         ]
     },
     "hardware_precision": "bf16",
