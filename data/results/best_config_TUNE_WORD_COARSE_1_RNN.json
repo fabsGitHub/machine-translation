@@ -7,8 +7,8 @@
     "dropout": 0.4,
     "emb_dim": 256,
     "hidden_dim": 512,
-    "batch_size": 256,
-    "grad_accum_steps": 2,
+    "batch_size": 128,
+    "grad_accum_steps": 8,
     "clip": 1.0,
     "tf_ratio": 0.5,
     "attention_type": "none",
@@ -19,32 +19,28 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "402.4",
-    "best_val_loss": 6.780975341796875,
-    "val_loss": 6.780975341796875,
-    "epochs_trained": 3,
+    "train_time": "119.3",
+    "best_val_loss": 7.50604248046875,
+    "val_loss": 7.50604248046875,
+    "epochs_trained": 1,
     "loss_history": {
         "train": [
-            6.636410236358643,
-            5.949209690093994,
-            5.643065452575684,
-            5.644448280334473
+            7.19448184967041,
+            7.014098167419434
         ],
         "val": [
-            6.885080814361572,
-            6.805972576141357,
-            6.780975341796875,
-            7.32985782623291
+            7.50604248046875,
+            8.379738807678223
         ]
     },
     "hardware_precision": "bf16",
-    "gpu_name": "NVIDIA GeForce RTX 3090",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
     "vram_model_mb": 315.7,
     "vram_gradients_mb": 315.7,
-    "vram_optimizer_mb": 0.0,
-    "vram_activations_mb": 4804.25,
-    "vram_allocated_mb": 2219.41,
-    "vram_reserved_mb": 6576.0,
-    "vram_peak_mb": 5435.64,
-    "vram_peak_gb": 6.422
+    "vram_optimizer_mb": 631.39,
+    "vram_activations_mb": 7062.68,
+    "vram_allocated_mb": 3240.28,
+    "vram_reserved_mb": 13086.0,
+    "vram_peak_mb": 8325.47,
+    "vram_peak_gb": 12.779
 }
