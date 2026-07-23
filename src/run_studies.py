@@ -39,7 +39,7 @@ def get_batch_size(study, token_type):
     if config_batch is not None:
         return str(config_batch)
 
-    return "1024" if token_type == "char" else "256"
+    return "2048" if token_type == "char" else "512"
 
 
 class AsyncEvaluationQueue:
@@ -138,7 +138,7 @@ def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, b
 
 def run_cmd(args_list):
     if "--grad_accum_steps" not in args_list:
-        args_list = ["--grad_accum_steps", "4"] + args_list
+        args_list = ["--grad_accum_steps", "2"] + args_list
 
     i = 0
     kv = {}

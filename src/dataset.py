@@ -150,7 +150,7 @@ def collate_fn(batch):
 
 
 def get_dataloader(csv_path, batch_size=512, shuffle=True, src_vocab=None, trg_vocab=None,
-                   src_lang="de", trg_lang="en", token_type="word", num_workers=6):
+                   src_lang="de", trg_lang="en", token_type="word", num_workers=16):
     dataset = PretokenizedNMTDataset(
         csv_path, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type,
         src_vocab=src_vocab, trg_vocab=trg_vocab

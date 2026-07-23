@@ -31,7 +31,7 @@ def precompute_word2vec_embeddings(csv_path, vocab, lang_col, emb_dim=256, cache
         df = pd.read_csv(csv_path)
         sentences = [vocab.tokenize(str(text)) for text in df[lang_col].tolist()]
         
-        w2v_model = Word2Vec(sentences=sentences, vector_size=emb_dim, window=5, min_count=1, workers=16)
+        w2v_model = Word2Vec(sentences=sentences, vector_size=emb_dim, window=5, min_count=1, workers=28)
 
         weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
         for word, idx in vocab.stoi.items():
