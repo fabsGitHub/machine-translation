@@ -3,12 +3,14 @@
     "rnn_type": "LSTM",
     "bidirectional": true,
     "epochs": 4,
+    "patience": 3,
+    "min_delta": 0.0001,
     "lr": 0.0003,
     "dropout": 0.3,
     "emb_dim": 128,
     "hidden_dim": 256,
     "batch_size": 128,
-    "grad_accum_steps": 8,
+    "grad_accum_steps": 4,
     "clip": 1.0,
     "tf_ratio": 0.5,
     "attention_type": "none",
@@ -19,18 +21,22 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "107.2",
-    "best_val_loss": 6.867639064788818,
-    "val_loss": 6.867639064788818,
+    "train_time": "104.8",
+    "best_val_loss": 6.862948417663574,
+    "val_loss": 6.862948417663574,
     "epochs_trained": 1,
     "loss_history": {
         "train": [
-            7.863466739654541,
-            6.795363903045654
+            7.325990200042725,
+            6.733927249908447,
+            6.6972336769104,
+            6.6802496910095215
         ],
         "val": [
-            6.867639064788818,
-            6.930408477783203
+            6.862948417663574,
+            6.9236931800842285,
+            7.015275001525879,
+            7.102238178253174
         ]
     },
     "hardware_precision": "bf16",
@@ -38,9 +44,9 @@
     "vram_model_mb": 164.31,
     "vram_gradients_mb": 164.31,
     "vram_optimizer_mb": 328.61,
-    "vram_activations_mb": 7037.53,
-    "vram_allocated_mb": 2634.72,
-    "vram_reserved_mb": 12678.0,
-    "vram_peak_mb": 7694.76,
-    "vram_peak_gb": 12.381
+    "vram_activations_mb": 6797.97,
+    "vram_allocated_mb": 2590.75,
+    "vram_reserved_mb": 12458.0,
+    "vram_peak_mb": 7455.19,
+    "vram_peak_gb": 12.166
 }
