@@ -3,12 +3,12 @@ import json
 import argparse
 import time
 import random
-from contextlib import nullcontext
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.utils.data import Sampler, DataLoader
+from utils import set_seed, setup_logging
 
 from dataset import get_dataloader, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
@@ -272,6 +272,8 @@ def main():
     val_csv = os.path.join(processed_dir, f"val_{args.src_lang}_{args.trg_lang}.csv")
 
     if rank == 0:
+        exp_tag = args.experiment if f"_{args.rnn_type}" in args.experiment else f"{args.experiment}_{args.rnn_type}"
+        setup_logging(log_filename=f"train_{exp_tag}.log", log_dir=OUTPUT_DIR, rank=rank)
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
 
@@ -349,6 +351,7 @@ def main():
     model = Seq2Seq(encoder, decoder, device).to(device)
 
     if rank == 0:
+        
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         model_size_mb = (total_params * 4) / (1024 ** 2)
         gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"

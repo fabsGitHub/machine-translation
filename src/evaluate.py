@@ -1,8 +1,6 @@
 import os
-import sys
 import json
 import re
-import csv
 import time
 import glob
 import multiprocessing
@@ -14,6 +12,7 @@ from torch.utils.data import DataLoader, Subset
 import nltk
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 from nltk.translate.meteor_score import meteor_score
+from utils import setup_logging
 
 import matplotlib
 matplotlib.use('Agg')
@@ -478,6 +477,7 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
 
 
 def main():
+    setup_logging(log_filename="evaluation.log", log_dir=OUTPUT_DIR)
     parser = argparse.ArgumentParser(description="NMT Evaluation & Analysis Interface")
     subparsers = parser.add_subparsers(dest="mode")
 

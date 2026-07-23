@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 matplotlib.use('Agg') 
 
 from config import load_config
-from utils import set_seed, check_artifact_cache, is_cache_valid
+from utils import set_seed, check_artifact_cache, is_cache_valid, setup_logging
 from evaluate import generate_all_reports, visualize_attention
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -705,6 +705,8 @@ if __name__ == "__main__":
     parser.add_argument("--tune_strategy", type=str, default="random")
     parser.add_argument("--tune_samples", type=int, default=3)
     args = parser.parse_args()
+    
+    setup_logging(log_filename=f"orchestrator_{args.study}_{args.token_type}.log", log_dir=OUTPUT_DIR)
     
     runtime_epochs = 1 if args.mock else args.epochs
     target_pathways = ["word", "char"] if args.token_type == "both" else [args.token_type]

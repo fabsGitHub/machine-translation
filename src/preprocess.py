@@ -5,6 +5,7 @@ import tarfile
 import urllib.request
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from utils import setup_logging
 
 from config import load_config
 from dataset import PretokenizedNMTDataset
@@ -302,6 +303,8 @@ def main():
         choices=["word", "char", "both"],
     )
     args = parser.parse_args()
+    
+    setup_logging(log_filename=f"preprocess_{args.token_type}.log", log_dir="data/results")
 
     config = load_config()
     sample_rate = config.get("data", {}).get("sample_rate", 1.0)
