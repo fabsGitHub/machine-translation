@@ -195,7 +195,7 @@ def configure_param_groups(model, weight_decay=1e-4):
     ]
 
 
-def compute_scheduled_tf_ratio(epoch, total_epochs, initial_tf=1.0, final_tf=0.3, mode="linear"):
+def compute_scheduled_tf_ratio(epoch, total_epochs, initial_tf=1.0, final_tf=0.7, mode="linear"):
     """Calculates scheduled teacher forcing ratio per epoch."""
     if total_epochs <= 1:
         return initial_tf

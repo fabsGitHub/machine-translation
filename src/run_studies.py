@@ -587,7 +587,7 @@ def execute_preprocessing(token_type="word", mock_mode=False):
 
 
 def execute_tuning(
-    stage="coarse", token_type="word", epochs=4, num_trials=15, configs_per_rnn=None
+    stage="coarse", token_type="word", epochs=5, num_trials=12, configs_per_rnn=None
 ):
     """Executes hyperparameter tuning sweeps evenly across RNN, GRU, and LSTM cell types."""
     print(
@@ -598,7 +598,7 @@ def execute_tuning(
         + "═" * 75
     )
 
-    lrs = [0.0003, 0.0005, 0.001, 0.002]
+    lrs = [0.0001, 0.0003, 0.0005, 0.001]
     dropouts = [0.2, 0.3, 0.4]
     emb_dims = [128, 256, 512] if token_type == "word" else [32, 64, 128]
     hidden_dims = [256, 512, 1024]
@@ -1296,7 +1296,7 @@ def main():
     args = parser.parse_args()
 
     # Dynamic epoch schedule definitions
-    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 4
+    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 5
     TUNE_2_EPOCHS = args.epochs if args.epochs is not None else 6
     STUDY_ABC_EPOCHS = args.epochs if args.epochs is not None else 6
     STUDY_DE_EPOCHS = args.epochs if args.epochs is not None else 6
