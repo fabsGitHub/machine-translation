@@ -224,7 +224,7 @@ def parse_args():
     parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_start", type=float, default=1.0, help="Initial teacher forcing ratio")
-    parser.add_argument("--tf_end", type=float, default=0.3, help="Final teacher forcing ratio (0.3 tuned for ~5 epochs)")
+    parser.add_argument("--tf_end", type=float, default=0.7, help="Final teacher forcing ratio (0.3 tuned for ~5 epochs)")
     parser.add_argument("--tf_decay_mode", type=str, default="linear", choices=["linear", "exponential"])
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
     parser.add_argument("--token_type", type=str, default="word", choices=["word", "char"])
