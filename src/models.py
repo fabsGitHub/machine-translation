@@ -220,11 +220,10 @@ class Decoder(nn.Module):
             )
             return torch.cat([zero_step, predictions], dim=1)
 
-        output_list = [
-            torch.zeros(
-                batch_size, self.vocab_size, device=trg.device, dtype=encoder_outputs.dtype
-            )
-        ]
+        # Pre-allocate output tensor directly in VRAM to eliminate dynamic list allocations & stacking
+        outputs = torch.zeros(
+            batch_size, trg_len, self.vocab_size, device=trg.device, dtype=encoder_outputs.dtype
+        )
         input_token = trg[:, 0]
 
         if self.training and teacher_forcing_ratio > 0.0:
@@ -236,19 +235,19 @@ class Decoder(nn.Module):
             pred, hidden, _ = self.forward_step(
                 input_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc
             )
-            output_list.append(pred)
-            next_tf = trg[:, t].contiguous()
+            outputs[:, t] = pred
+            next_tf = trg[:, t]
             input_token = next_tf if tf_mask[t - 1] else pred.argmax(dim=1)
 
-        return torch.stack(output_list, dim=1)
+        return outputs
 
 
 class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device):
+    def __init__(self, encoder, decoder, device=None):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
-        self.device = device
+        # Device attribute removed; retrieve dynamically from parameters when needed
 
         if encoder.rnn.bidirectional:
             enc_hidden_dim = encoder.rnn.hidden_size * 2

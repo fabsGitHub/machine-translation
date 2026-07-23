@@ -215,7 +215,11 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
         if use_amp:
             with torch.autocast(device_type=device.type, dtype=autocast_dtype):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-                loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+                output_dim = output.shape[-1]
+                output_flat = output[:, 1:].reshape(-1, output_dim)
+                trg_flat = trg[:, 1:].reshape(-1)
+
+                loss = criterion(output_flat, trg_flat)
                 loss = loss / grad_accum_steps
                 
             if scaler is not None:
@@ -224,7 +228,8 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
                 loss.backward()
                 
             if batch_idx == 1 and vram_stats_out is not None:
-                vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
+                with torch.no_grad():
+                    vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
                 
             if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
                 if scaler is not None:
@@ -238,12 +243,17 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
                 optimizer.zero_grad(set_to_none=True)
         else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
-            loss = criterion(output[:, 1:].transpose(1, 2).contiguous(), trg[:, 1:])
+            output_dim = output.shape[-1]
+            output_flat = output[:, 1:].reshape(-1, output_dim)
+            trg_flat = trg[:, 1:].reshape(-1)
+
+            loss = criterion(output_flat, trg_flat)
             loss = loss / grad_accum_steps
             loss.backward()
             
             if batch_idx == 1 and vram_stats_out is not None and device.type == "cuda":
-                vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
+                with torch.no_grad():
+                    vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
                 
             if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), clip)

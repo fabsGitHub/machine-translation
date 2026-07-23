@@ -367,13 +367,14 @@ def collate_fn(batch):
 
 def get_dataloader(
     csv_path,
-    batch_size=128,
+    batch_size=256,
     shuffle=True,
     src_vocab=None,
     trg_vocab=None,
     src_lang="de",
     trg_lang="en",
     token_type="word",
+    num_workers=8,
 ):
     dataset = PretokenizedNMTDataset(
         csv_path=csv_path,
@@ -392,8 +393,10 @@ def get_dataloader(
             dataset,
             batch_sampler=sampler,
             collate_fn=collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
+            prefetch_factor=4 if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False,
         )
     else:
         loader = DataLoader(
@@ -401,8 +404,10 @@ def get_dataloader(
             batch_size=batch_size,
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
+            prefetch_factor=4 if num_workers > 0 else None,
+            persistent_workers=True if num_workers > 0 else False,
         )
 
     return loader, dataset.src_vocab, dataset.trg_vocab
