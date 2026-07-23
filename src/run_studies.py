@@ -44,7 +44,7 @@ def get_batch_size(study, token_type):
     if config_batch is not None:
         return str(config_batch)
 
-    return "512" if token_type == "char" else "256"
+    return "256" if token_type == "char" else "128"
 
 
 class AsyncEvaluationQueue:
@@ -183,7 +183,7 @@ def print_study_model_and_batch_info(
 def run_cmd(args_list):
     """Executes distributed PyTorch training sub-process via PyTorch DDP launcher."""
     if "--grad_accum_steps" not in args_list:
-        args_list = ["--grad_accum_steps", "2"] + args_list
+        args_list = ["--grad_accum_steps", "8"] + args_list
 
     i = 0
     kv = {}
@@ -593,13 +593,13 @@ def execute_preprocessing(token_type="word", mock_mode=False):
     subprocess.run(cmd, check=True)
 
 
-def execute_tuning(stage="coarse", token_type="word", epochs=1, num_trials=5):
+def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=5):
     """Executes hyperparameter tuning sweeps and logs results to CSV."""
     print(
         "\n"
         + "═" * 75
         + f"\n🔍 RUNNING HYPERPARAMETER TUNING ({stage.upper()} -"
-        f" {token_type.upper()})\n"
+        f" {token_type.upper()} | {epochs} Epochs)\n"
         + "═" * 75
     )
 
@@ -895,6 +895,7 @@ def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
 
     eval_queue.sync_study()
 
+
 def execute_study_b(
     epochs, rnn_type, bidirectional, token_type, eval_queue: AsyncEvaluationQueue
 ):
@@ -976,6 +977,7 @@ def execute_study_b(
         eval_queue.submit_evaluation(exp_id, rnn_type, token_type)
 
     eval_queue.sync_study()
+
 
 def execute_study_c(
     epochs,
@@ -1062,6 +1064,7 @@ def execute_study_c(
         eval_queue.submit_evaluation(exp_id, cell, token_type)
 
     eval_queue.sync_study()
+
 
 def execute_study_d(
     epochs,
@@ -1231,7 +1234,7 @@ def main():
         "--study",
         type=str,
         default="all",
-        choices=["all", "A", "B", "C", "D", "E", "tune", "postprocess"],
+        choices=["all", "A", "B", "C", "D", "E", "tune", "fine_tune", "postprocess"],
         help="Specify study suite to run or execute 'all'",
     )
     parser.add_argument(
@@ -1249,8 +1252,8 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=config.get("training", {}).get("epochs", 1),
-        help="Number of epochs per model run",
+        default=None,
+        help="Override epoch scheduling across all stages with explicit integer",
     )
     parser.add_argument(
         "--tune_stage",
@@ -1273,12 +1276,18 @@ def main():
 
     args = parser.parse_args()
 
+    # Dynamic epoch schedule definitions
+    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 4
+    TUNE_2_EPOCHS = args.epochs if args.epochs is not None else 6
+    STUDY_ABC_EPOCHS = args.epochs if args.epochs is not None else 6
+    STUDY_DE_EPOCHS = args.epochs if args.epochs is not None else 6
+
     print("\n" + "═" * 80)
     print("🚀 NMT PERFORMANCE INFRASTRUCTURE ORCHESTRATOR INITIALIZED")
     print(
         f"   Mode: {args.study.upper()} | Token Level: {args.token_type.upper()}"
-        f" | Epochs: {args.epochs} | GPU Device Count:"
-        f" {torch.cuda.device_count() if torch.cuda.is_available() else 0}"
+        f" | Dynamic Epoch Strategy: [Tune1: {TUNE_1_EPOCHS}, Studies A-C: {STUDY_ABC_EPOCHS}, Tune2: {TUNE_2_EPOCHS}, Studies D-E: {STUDY_DE_EPOCHS}]"
+        f" | GPUs: {torch.cuda.device_count() if torch.cuda.is_available() else 0}"
     )
     print("═" * 80 + "\n")
 
@@ -1287,22 +1296,24 @@ def main():
 
     eval_queue = AsyncEvaluationQueue(max_workers=2)
 
-    if args.study in ["tune", "all"]:
+    # 1. First Tuning Pass (Coarse Sweep) - 4 Epochs
+    if args.study in ["tune", "all"] and args.tune_stage == "coarse":
         execute_tuning(
-            stage=args.tune_stage,
+            stage="coarse",
             token_type=args.token_type,
-            epochs=args.epochs,
+            epochs=TUNE_1_EPOCHS,
             num_trials=args.tune_trials,
         )
 
+    # 2. Studies A, B, C - 6 Epochs
     if args.study in ["all", "A"]:
-        execute_study_a(args.epochs, args.token_type, eval_queue)
+        execute_study_a(STUDY_ABC_EPOCHS, args.token_type, eval_queue)
 
     best_settings = get_best_empirical_settings(args.token_type)
 
     if args.study in ["all", "B"]:
         execute_study_b(
-            args.epochs,
+            STUDY_ABC_EPOCHS,
             best_settings["rnn_type"],
             best_settings["bidirectional"],
             args.token_type,
@@ -1313,7 +1324,7 @@ def main():
 
     if args.study in ["all", "C"]:
         execute_study_c(
-            args.epochs,
+            STUDY_ABC_EPOCHS,
             args.token_type,
             best_settings["rnn_type"],
             best_settings["bidirectional"],
@@ -1323,11 +1334,21 @@ def main():
             eval_queue,
         )
 
+    # 3. Second Tuning Pass (Fine Sweep) - 6 Epochs
+    if args.study in ["all", "fine_tune"] or (args.study == "tune" and args.tune_stage == "fine"):
+        execute_tuning(
+            stage="fine",
+            token_type=args.token_type,
+            epochs=TUNE_2_EPOCHS,
+            num_trials=args.tune_trials,
+        )
+
     best_settings = get_best_empirical_settings(args.token_type)
 
+    # 4. Studies D and E - 6 Epochs
     if args.study in ["all", "D"]:
         execute_study_d(
-            args.epochs,
+            STUDY_DE_EPOCHS,
             args.token_type,
             best_settings["rnn_type"],
             best_settings["bidirectional"],
@@ -1340,7 +1361,7 @@ def main():
 
     if args.study in ["all", "E"]:
         execute_study_e(
-            args.epochs,
+            STUDY_DE_EPOCHS,
             args.token_type,
             best_settings["rnn_type"],
             best_settings["bidirectional"],
