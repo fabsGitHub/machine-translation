@@ -57,8 +57,18 @@ class DistributedBatchSamplerWrapper(Sampler):
         return math.ceil(len(self.batch_sampler) / self.num_replicas)
 
 
+def unwrap_model(model):
+    """Recursively unwraps DistributedDataParallel and torch.compile wrappers."""
+    while hasattr(model, "module") or hasattr(model, "_orig_mod"):
+        if hasattr(model, "module"):
+            model = model.module
+        if hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+    return model
+
+
 def get_clean_state_dict(model):
-    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = unwrap_model(model)
     state_dict = raw_model.state_dict()
     clean_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     return clean_dict
@@ -129,7 +139,7 @@ def get_vram_breakdown(model, optimizer, device):
             "vram_peak_gb": 0.0
         }
     
-    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = unwrap_model(model)
     
     model_bytes = sum(p.numel() * p.element_size() for p in raw_model.parameters())
     grad_bytes = sum(p.grad.numel() * p.grad.element_size() for p in raw_model.parameters() if p.grad is not None)
@@ -494,8 +504,14 @@ def main():
             print(f"🔄 Resuming model weights from existing checkpoint: {checkpoint_path}")
         
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        raw_model = model.module if hasattr(model, "module") else model
-        raw_model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        
+        # Clean prefix names if saved under torch.compile / DDP
+        clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        
+        # Unwrap model down to its base module before loading state dict
+        raw_model = unwrap_model(model)
+        raw_model.load_state_dict(clean_state_dict)
         
         if 'best_val_loss' in checkpoint.get('config', {}):
             best_val_loss = checkpoint['config']['best_val_loss']
