@@ -313,13 +313,22 @@ def _cache_single_pair(src, trg, processed_dir, token_type):
                 trg_vocab=train_ds.trg_vocab,
             )
 
+        # preprocess.py
         if token_type in ["word", "both"]:
             for dim in [128, 256]:
                 precompute_word2vec_embeddings(
-                    train_csv, train_ds.src_vocab, src, emb_dim=dim, pair_prefix=pair_tag
+                    vocab=train_ds.src_vocab,
+                    train_csv=train_csv,
+                    lang=src,
+                    emb_dim=dim,
+                    pair_prefix=pair_tag
                 )
                 precompute_word2vec_embeddings(
-                    train_csv, train_ds.trg_vocab, trg, emb_dim=dim, pair_prefix=pair_tag
+                    vocab=train_ds.trg_vocab,
+                    train_csv=train_csv,
+                    lang=trg,
+                    emb_dim=dim,
+                    pair_prefix=pair_tag
                 )
 
 
