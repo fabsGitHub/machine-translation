@@ -28,23 +28,23 @@
             6.636410236358643,
             5.949209690093994,
             5.643065452575684,
-            5.507350444793701
+            5.669579029083252
         ],
         "val": [
             6.885080814361572,
             6.805972576141357,
             6.780975341796875,
-            6.87958288192749
+            7.3178391456604
         ]
     },
     "hardware_precision": "bf16",
     "gpu_name": "NVIDIA GeForce RTX 3090",
     "vram_model_mb": 315.7,
     "vram_gradients_mb": 315.7,
-    "vram_optimizer_mb": 160.39,
-    "vram_activations_mb": 12324.71,
-    "vram_allocated_mb": 3888.8,
-    "vram_reserved_mb": 23608.0,
-    "vram_peak_mb": 13116.49,
-    "vram_peak_gb": 23.055
+    "vram_optimizer_mb": 0.0,
+    "vram_activations_mb": 16476.01,
+    "vram_allocated_mb": 5495.3,
+    "vram_reserved_mb": 18740.0,
+    "vram_peak_mb": 17107.41,
+    "vram_peak_gb": 18.301
 }
