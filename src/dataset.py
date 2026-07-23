@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Sampler
+torch.set_num_threads(1)
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"

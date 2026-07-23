@@ -48,7 +48,7 @@ def get_batch_size(study, token_type):
 
 
 class AsyncEvaluationQueue:
-    """Offloads evaluation and ledger synchronization to background CPU threads."""
+    """Offloads evaluation and ledger synchronization to background execution threads."""
 
     def __init__(self, max_workers=2):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -60,7 +60,6 @@ class AsyncEvaluationQueue:
         def _task():
             print(
                 f"\n⚡ [Async Eval Started] -> {experiment_id} ({rnn_type})"
-                " [Forced CPU Mode]"
             )
             run_auto_evaluation(experiment_id, rnn_type)
             with eval_lock:
@@ -239,11 +238,10 @@ def run_cmd(args_list):
     )
 
 
+# Optimized: Retain GPU execution during evaluation runs
 def run_auto_evaluation(experiment_id, rnn_type):
-    """Executes model evaluation strictly on CPU to eliminate GPU VRAM contention."""
-    target_model = os.path.join(
-        OUTPUT_DIR, f"best_model_{experiment_id}_{rnn_type}.pt"
-    )
+    """Executes model evaluation with GPU acceleration when available."""
+    target_model = os.path.join(OUTPUT_DIR, f"best_model_{experiment_id}_{rnn_type}.pt")
     if os.path.exists(target_model):
         cmd = [
             sys.executable,
@@ -253,14 +251,11 @@ def run_auto_evaluation(experiment_id, rnn_type):
             target_model,
         ]
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ""
+        # Environment override removed to allow fast CUDA evaluation inference
         try:
             subprocess.run(cmd, check=True, env=env)
         except subprocess.CalledProcessError:
-            print(
-                f"⚠️ Process protection enabled for {experiment_id}. Processing"
-                " via fallback structures."
-            )
+            print(f"⚠️ Evaluation failed for {experiment_id}.")
 
 
 def sync_ledger_to_token_type(token_type):
@@ -736,7 +731,6 @@ def execute_tuning(stage="coarse", token_type="word", epochs=4, num_trials=5):
 def run_automated_post_processing(token_type, rnn_type):
     """Executes evaluation aggregation, pivot evaluation, and attention heatmap generation."""
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ""
 
     try:
         subprocess.run(

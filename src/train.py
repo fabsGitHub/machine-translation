@@ -345,18 +345,21 @@ def main():
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
 
-    raw_train_loader, src_vocab, trg_vocab = get_dataloader(
-        train_csv, batch_size=args.batch_size, shuffle=True, 
-        src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
-    )
-    raw_val_loader, _, _ = get_dataloader(
-        val_csv, batch_size=args.batch_size, shuffle=False, 
-        src_vocab=src_vocab, trg_vocab=trg_vocab, 
-        src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
-    )
-    
+    # Optimized: Prevent redundant DataLoader construction, core oversubscription & worker process leaks
     num_workers = 8
     if is_distributed:
+        raw_train_loader, src_vocab, trg_vocab = get_dataloader(
+            train_csv, batch_size=args.batch_size, shuffle=True, 
+            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
+            num_workers=0
+        )
+        raw_val_loader, _, _ = get_dataloader(
+            val_csv, batch_size=args.batch_size, shuffle=False, 
+            src_vocab=src_vocab, trg_vocab=trg_vocab, 
+            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
+            num_workers=0
+        )
+        
         train_sampler = DistributedBatchSamplerWrapper(
             raw_train_loader.batch_sampler, num_replicas=world_size, rank=rank, shuffle=True
         )
@@ -385,23 +388,16 @@ def main():
     else:
         train_sampler = None
         val_sampler = None
-        train_loader = DataLoader(
-            raw_train_loader.dataset,
-            batch_sampler=raw_train_loader.batch_sampler,
-            collate_fn=raw_train_loader.collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
+        train_loader, src_vocab, trg_vocab = get_dataloader(
+            train_csv, batch_size=args.batch_size, shuffle=True, 
+            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
+            num_workers=num_workers
         )
-        val_loader = DataLoader(
-            raw_val_loader.dataset,
-            batch_sampler=raw_val_loader.batch_sampler,
-            collate_fn=raw_val_loader.collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
+        val_loader, _, _ = get_dataloader(
+            val_csv, batch_size=args.batch_size, shuffle=False, 
+            src_vocab=src_vocab, trg_vocab=trg_vocab, 
+            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
+            num_workers=num_workers
         )
     
     pretrained_src_emb, pretrained_trg_emb = None, None
@@ -466,6 +462,16 @@ def main():
         print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
     
+    # Optimized: Target torch.compile specifically at the Encoder module to eliminate Inductor guard overhead
+    if can_compile:
+        try:
+            model.encoder = torch.compile(model.encoder, mode="default")
+            if rank == 0:
+                print("⚡ Compiled Encoder Graph with TorchInductor.")
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ torch.compile skipped: {e}")
+
     if is_distributed:
         if device.type == "cuda":
             model = nn.parallel.DistributedDataParallel(
@@ -474,29 +480,13 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    if can_compile:
-        try:
-            model = torch.compile(model, mode="default", dynamic=True)
-            if rank == 0:
-                print("⚡ Compiled Model Graph with TorchInductor (mode='default', dynamic=True).")
-        except Exception as e:
-            if rank == 0:
-                print(f"⚠️ torch.compile skipped due to execution environment: {e}")
-    
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # Optimized: Utilize Native PyTorch Fused AdamW on Ampere Tensor Cores
+    if device.type == "cuda":
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
         if rank == 0:
-            print("⚡ Using BitsAndBytes 8-bit AdamW Optimizer (optim.AdamW8bit).")
-    except ImportError:
-        try:
-            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
-            if rank == 0:
-                print("⚡ Using Native PyTorch Fused AdamW Optimizer (torch.optim.AdamW).")
-        except Exception:
-            optimizer = optim.Adam(model.parameters(), lr=args.lr)
-            if rank == 0:
-                print("⚡ Using Standard Adam Optimizer.")
+            print("⚡ Using Native PyTorch Fused AdamW Optimizer (torch.optim.AdamW fused=True).")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     

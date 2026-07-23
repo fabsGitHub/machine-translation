@@ -226,10 +226,11 @@ class Decoder(nn.Module):
         )
         input_token = trg[:, 0]
 
+        # Sample teacher-forcing decisions using CPU Python booleans to eliminate GPU-CPU sync stalls
         if self.training and teacher_forcing_ratio > 0.0:
-            tf_mask = torch.rand(trg_len - 1, device=trg.device) < teacher_forcing_ratio
+            use_tf_steps = [random.random() < teacher_forcing_ratio for _ in range(trg_len - 1)]
         else:
-            tf_mask = torch.zeros(trg_len - 1, dtype=torch.bool, device=trg.device)
+            use_tf_steps = [False] * (trg_len - 1)
 
         for t in range(1, trg_len):
             pred, hidden, _ = self.forward_step(
@@ -237,7 +238,8 @@ class Decoder(nn.Module):
             )
             outputs[:, t] = pred
             next_tf = trg[:, t]
-            input_token = next_tf if tf_mask[t - 1] else pred.argmax(dim=1)
+            # Pure Python boolean check; zero CUDA synchronization overhead
+            input_token = next_tf if use_tf_steps[t - 1] else pred.argmax(dim=1)
 
         return outputs
 
