@@ -28,13 +28,13 @@
             6.636410236358643,
             5.949209690093994,
             5.643065452575684,
-            5.669579029083252
+            5.644448280334473
         ],
         "val": [
             6.885080814361572,
             6.805972576141357,
             6.780975341796875,
-            7.3178391456604
+            7.32985782623291
         ]
     },
     "hardware_precision": "bf16",
@@ -42,9 +42,9 @@
     "vram_model_mb": 315.7,
     "vram_gradients_mb": 315.7,
     "vram_optimizer_mb": 0.0,
-    "vram_activations_mb": 16476.01,
-    "vram_allocated_mb": 5495.3,
-    "vram_reserved_mb": 18740.0,
-    "vram_peak_mb": 17107.41,
-    "vram_peak_gb": 18.301
+    "vram_activations_mb": 4804.25,
+    "vram_allocated_mb": 2219.41,
+    "vram_reserved_mb": 6576.0,
+    "vram_peak_mb": 5435.64,
+    "vram_peak_gb": 6.422
 }
