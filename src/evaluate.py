@@ -233,9 +233,9 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.1, seed=42):
         src_dev = src.to(device, non_blocking=True)
         batch_hyps = translate_batch(model, src_dev, trg_vocab, device, max_len=max_len)
         hypotheses.extend(batch_hyps)
-        
-        trg_np = trg.numpy()
-        src_np = src.numpy()
+
+        trg_np = trg.detach().cpu().numpy()
+        src_np = src.detach().cpu().numpy()
         
         for i in range(len(trg_np)):
             ref_tokens = [trg_itos[idx] for idx in trg_np[i] if idx not in (PAD_IDX, SOS_IDX, EOS_IDX)]
@@ -471,6 +471,12 @@ def generate_all_reports(token_type="word"):
     print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
 
 
+import os
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
 def visualize_attention(model_path, sample_text=None, output_path=None):
     """Extracts attention alignments from model checkpoint and saves Seaborn heatmap visualization."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -479,57 +485,116 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
         return
 
     print(f"📊 Generating attention heatmap for model: '{os.path.basename(model_path)}'")
-    
+
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    config = checkpoint['config']
-    state_dict = checkpoint['model_state_dict']
-    src_vocab = checkpoint.get('src_vocab')
-    trg_vocab = checkpoint.get('trg_vocab')
+    config = checkpoint["config"]
+    state_dict = checkpoint["model_state_dict"]
+    src_vocab = checkpoint.get("src_vocab")
+    trg_vocab = checkpoint.get("trg_vocab")
 
-    token_type = config.get('token_type', 'word')
-    is_bidi = config.get('bidirectional', True)
-    enc_hidden_dim = config['hidden_dim'] * (2 if is_bidi else 1)
+    token_type = config.get("token_type", "word")
+    is_bidi = config.get("bidirectional", True)
+    enc_hidden_dim = config["hidden_dim"] * (2 if is_bidi else 1)
 
-    enc_rnn_in_dim = state_dict['encoder.project.weight'].shape[0] if 'encoder.project.weight' in state_dict else state_dict['encoder.embedding.weight'].shape[1]
-    dec_rnn_in_dim = state_dict['decoder.project.weight'].shape[0] if 'decoder.project.weight' in state_dict else state_dict['decoder.embedding.weight'].shape[1]
+    enc_rnn_in_dim = (
+        state_dict["encoder.project.weight"].shape[0]
+        if "encoder.project.weight" in state_dict
+        else state_dict["encoder.embedding.weight"].shape[1]
+    )
+    dec_rnn_in_dim = (
+        state_dict["decoder.project.weight"].shape[0]
+        if "decoder.project.weight" in state_dict
+        else state_dict["decoder.embedding.weight"].shape[1]
+    )
 
-    enc = Encoder(state_dict['encoder.embedding.weight'].shape[0], enc_rnn_in_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], bidirectional=is_bidi)
-    dec = Decoder(state_dict['decoder.embedding.weight'].shape[0], dec_rnn_in_dim, enc_hidden_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], attention_type=config.get('attention_type', 'none'))
+    enc = Encoder(
+        state_dict["encoder.embedding.weight"].shape[0],
+        enc_rnn_in_dim,
+        config["hidden_dim"],
+        config.get("n_layers", 2),
+        config.get("dropout", 0.3),
+        rnn_type=config["rnn_type"],
+        bidirectional=is_bidi,
+    )
+    dec = Decoder(
+        state_dict["decoder.embedding.weight"].shape[0],
+        dec_rnn_in_dim,
+        enc_hidden_dim,
+        config["hidden_dim"],
+        config.get("n_layers", 2),
+        config.get("dropout", 0.3),
+        rnn_type=config["rnn_type"],
+        attention_type=config.get("attention_type", "none"),
+    )
 
-    if 'encoder.project.weight' in state_dict: 
-        enc.embedding = torch.nn.Embedding(state_dict['encoder.embedding.weight'].shape[0], state_dict['encoder.embedding.weight'].shape[1])
-        enc.project = torch.nn.Linear(state_dict['encoder.project.weight'].shape[1], state_dict['encoder.project.weight'].shape[0])
-    if 'decoder.project.weight' in state_dict: 
-        dec.embedding = torch.nn.Embedding(state_dict['decoder.embedding.weight'].shape[0], state_dict['decoder.embedding.weight'].shape[1])
-        dec.project = torch.nn.Linear(state_dict['decoder.project.weight'].shape[1], state_dict['decoder.project.weight'].shape[0])
-    if 'decoder.fc_out.weight' in state_dict: 
-        dec.fc_out = torch.nn.Linear(state_dict['decoder.fc_out.weight'].shape[1], state_dict['decoder.fc_out.weight'].shape[0])
+    if "encoder.project.weight" in state_dict:
+        enc.embedding = torch.nn.Embedding(
+            state_dict["encoder.embedding.weight"].shape[0],
+            state_dict["encoder.embedding.weight"].shape[1],
+        )
+        enc.project = torch.nn.Linear(
+            state_dict["encoder.project.weight"].shape[1],
+            state_dict["encoder.project.weight"].shape[0],
+        )
+    if "decoder.project.weight" in state_dict:
+        dec.embedding = torch.nn.Embedding(
+            state_dict["decoder.embedding.weight"].shape[0],
+            state_dict["decoder.embedding.weight"].shape[1],
+        )
+        dec.project = torch.nn.Linear(
+            state_dict["decoder.project.weight"].shape[1],
+            state_dict["decoder.project.weight"].shape[0],
+        )
+    if "decoder.fc_out.weight" in state_dict:
+        dec.fc_out = torch.nn.Linear(
+            state_dict["decoder.fc_out.weight"].shape[1],
+            state_dict["decoder.fc_out.weight"].shape[0],
+        )
 
     model = Seq2Seq(enc, dec, device).to(device)
     model.load_state_dict(state_dict)
     model.eval()
 
     if not sample_text:
-        sample_text = "das ist ein beispiel zur visualisierung" if token_type == "word" else "beispiel"
+        sample_text = (
+            "das ist ein beispiel zur visualisierung"
+            if token_type == "word"
+            else "beispiel"
+        )
 
     if token_type == "char":
         src_tokens = list(sample_text)
     else:
         src_tokens = sample_text.strip().split()
 
-    src_indices = [SOS_IDX] + [src_vocab.stoi.get(t, src_vocab.stoi.get('<unk>', 0)) for t in src_tokens] + [EOS_IDX]
-    src_tensor = torch.tensor(src_indices, dtype=torch.long, device=device).unsqueeze(0)
+    # Build sequence with special tokens
+    display_src_tokens = ["<sos>"] + src_tokens + ["<eos>"]
+    src_indices = (
+        [SOS_IDX]
+        + [
+            src_vocab.stoi.get(t, src_vocab.stoi.get("<unk>", 0))
+            for t in src_tokens
+        ]
+        + [EOS_IDX]
+    )
+    src_tensor = torch.tensor(
+        src_indices, dtype=torch.long, device=device
+    ).unsqueeze(0)
 
     attentions = []
     trg_tokens = []
     max_len = 50 if token_type == "word" else 250
     is_cuda = device.type == "cuda"
 
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=is_cuda):
+    with torch.inference_mode(), torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=is_cuda
+    ):
         encoder_outputs, hidden = model.encoder(src_tensor)
         hidden = model._bridge_hidden(hidden)
-        
-        current_token = torch.full((1,), SOS_IDX, dtype=torch.long, device=device)
+
+        current_token = torch.full(
+            (1,), SOS_IDX, dtype=torch.long, device=device
+        )
 
         proj_enc = (
             model.decoder.attention.U_a(encoder_outputs)
@@ -539,7 +604,12 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
 
         pred_tensors = []
         for _ in range(max_len):
-            out = model.decoder.forward_step(current_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
+            out = model.decoder.forward_step(
+                current_token,
+                hidden,
+                encoder_outputs,
+                proj_enc_outputs=proj_enc,
+            )
             attn_w = None
             if isinstance(out, tuple):
                 prediction = out[0]
@@ -550,13 +620,16 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
                 prediction = out
 
             if attn_w is not None:
-                attentions.append(attn_w.squeeze(0).cpu())
+                attentions.append(attn_w.squeeze(0))
 
             pred_tensor = prediction.argmax(dim=1)
             pred_tensors.append(pred_tensor)
             current_token = pred_tensor.contiguous()
 
-        # Bulk GPU-to-CPU transfer outside the step loop to avoid stream stalls
+            if pred_tensor.item() == EOS_IDX:
+                break
+
+        # Bulk GPU-to-CPU transfer
         if pred_tensors:
             pred_indices = torch.cat(pred_tensors).cpu().tolist()
         else:
@@ -564,36 +637,56 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
 
         for pred_val in pred_indices:
             if pred_val == EOS_IDX:
+                trg_tokens.append("<eos>")
                 break
             trg_tokens.append(trg_vocab.itos.get(pred_val, "<unk>"))
 
     if not attentions:
-        print("⚠️ Model does not output attention weights (attention_type='none').")
+        print(
+            "⚠️ Model does not output attention weights (attention_type='none')."
+        )
         return
 
-    attn_matrix = torch.stack(attentions).numpy()
+    # Safely convert stacked attention tensors (handling CUDA + bfloat16 -> float32 CPU -> NumPy)
+    attn_matrix = (
+        torch.stack(attentions[: len(trg_tokens)]).float().cpu().numpy()
+    )
 
-    plt.figure(figsize=(10, 8))
+    # Plotting
+    fig_width = max(8, len(display_src_tokens) * 0.5)
+    fig_height = max(6, len(trg_tokens) * 0.4)
+
+    plt.figure(figsize=(fig_width, fig_height))
     sns.heatmap(
         attn_matrix,
-        xticklabels=src_tokens,
+        xticklabels=display_src_tokens,
         yticklabels=trg_tokens,
         cmap="viridis",
         annot=False,
+        cbar=True,
     )
-    plt.xlabel("Source Tokens")
-    plt.ylabel("Target Tokens")
-    plt.title(f"Attention Heatmap ({config.get('experiment', 'NMT')})")
+    plt.xlabel("Source Tokens", fontsize=11, fontweight="bold")
+    plt.ylabel("Target Tokens", fontsize=11, fontweight="bold")
+    plt.title(
+        f"Attention Heatmap ({config.get('experiment', 'NMT')})",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+    plt.xticks(rotation=45, ha="right")
+    plt.yticks(rotation=0)
     plt.tight_layout()
 
     if not output_path:
-        output_path = os.path.join(OUTPUT_DIR, f"attention_{config.get('experiment', 'viz')}.png")
+        output_path = os.path.join(
+            OUTPUT_DIR, f"attention_{config.get('experiment', 'viz')}.png"
+        )
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=300)
+    plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"✅ Attention visualization saved -> {output_path}")
-
+    
 
 def main():
     setup_logging(log_filename="evaluation.log", log_dir=OUTPUT_DIR)

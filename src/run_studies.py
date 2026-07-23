@@ -54,7 +54,7 @@ class AsyncEvaluationQueue:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.futures = []
 
-    def submit_evaluation(self, experiment_id, rnn_type):
+    def submit_evaluation(self, experiment_id, rnn_type, token_type):
         """Queues evaluation in the background without holding a global lock during computation."""
 
         def _task():
@@ -1287,6 +1287,112 @@ def execute_study_e(
     eval_queue.sync_study()
 
 
+def run_pipeline_for_token_type(target_token_type, args):
+    """Executes the full pipeline for a single target token type (word or char)."""
+    # Dynamic epoch schedule definitions
+    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 5
+    TUNE_2_EPOCHS = args.epochs if args.epochs is not None else 6
+    STUDY_ABC_EPOCHS = args.epochs if args.epochs is not None else 6
+    STUDY_DE_EPOCHS = args.epochs if args.epochs is not None else 6
+
+    print("\n" + "═" * 80)
+    print(f"🚀 EXECUTING PIPELINE FOR TOKEN LEVEL: {target_token_type.upper()}")
+    print(
+        f"   Mode: {args.study.upper()}"
+        f" | Dynamic Epoch Strategy: [Tune1: {TUNE_1_EPOCHS}, Studies A-C: {STUDY_ABC_EPOCHS}, Tune2: {TUNE_2_EPOCHS}, Studies D-E: {STUDY_DE_EPOCHS}]"
+        f" | GPUs: {torch.cuda.device_count() if torch.cuda.is_available() else 0}"
+    )
+    print("═" * 80 + "\n")
+
+    if not args.no_preprocess and args.study != "postprocess":
+        execute_preprocessing(token_type=target_token_type, mock_mode=args.mock)
+
+    eval_queue = AsyncEvaluationQueue(max_workers=2)
+
+    # 1. First Tuning Pass (Coarse Sweep) - 5 Epochs
+    if args.study in ["tune", "all"] and args.tune_stage == "coarse":
+        execute_tuning(
+            stage="coarse",
+            token_type=target_token_type,
+            epochs=TUNE_1_EPOCHS,
+            num_trials=args.tune_trials,
+            configs_per_rnn=args.configs_per_rnn,
+        )
+
+    # 2. Studies A, B, C - 6 Epochs
+    if args.study in ["all", "A"]:
+        execute_study_a(STUDY_ABC_EPOCHS, target_token_type, eval_queue)
+
+    best_settings = get_best_empirical_settings(target_token_type)
+
+    if args.study in ["all", "B"]:
+        execute_study_b(
+            STUDY_ABC_EPOCHS,
+            best_settings["rnn_type"],
+            best_settings["bidirectional"],
+            target_token_type,
+            eval_queue,
+        )
+
+    best_settings = get_best_empirical_settings(target_token_type)
+
+    if args.study in ["all", "C"]:
+        execute_study_c(
+            STUDY_ABC_EPOCHS,
+            target_token_type,
+            best_settings["rnn_type"],
+            best_settings["bidirectional"],
+            best_settings["embedding_source"],
+            best_settings["freeze_emb"],
+            best_settings["emb_dim"],
+            eval_queue,
+        )
+
+    # 3. Second Tuning Pass (Fine Sweep) - 6 Epochs
+    if args.study in ["all", "fine_tune"] or (args.study == "tune" and args.tune_stage == "fine"):
+        execute_tuning(
+            stage="fine",
+            token_type=target_token_type,
+            epochs=TUNE_2_EPOCHS,
+            num_trials=args.tune_trials,
+            configs_per_rnn=args.configs_per_rnn,
+        )
+
+    best_settings = get_best_empirical_settings(target_token_type)
+
+    # 4. Studies D and E - 6 Epochs
+    if args.study in ["all", "D"]:
+        execute_study_d(
+            STUDY_DE_EPOCHS,
+            target_token_type,
+            best_settings["rnn_type"],
+            best_settings["bidirectional"],
+            best_settings["embedding_source"],
+            best_settings["freeze_emb"],
+            best_settings["attention_type"],
+            best_settings["emb_dim"],
+            eval_queue,
+        )
+
+    if args.study in ["all", "E"]:
+        execute_study_e(
+            STUDY_DE_EPOCHS,
+            target_token_type,
+            best_settings["rnn_type"],
+            best_settings["bidirectional"],
+            best_settings["embedding_source"],
+            best_settings["freeze_emb"],
+            best_settings["attention_type"],
+            best_settings["emb_dim"],
+            eval_queue,
+        )
+
+    eval_queue.shutdown()
+
+    if args.study in ["all", "postprocess"]:
+        run_automated_post_processing(target_token_type, best_settings["rnn_type"])
+
+
 def main():
     setup_logging(log_filename="run_studies.log", log_dir=OUTPUT_DIR)
 
@@ -1304,8 +1410,8 @@ def main():
         "--token_type",
         type=str,
         default="word",
-        choices=["word", "char"],
-        help="Tokenization level",
+        choices=["word", "char", "both"],
+        help="Tokenization level: 'word', 'char', or 'both' (sequential execution)",
     )
     parser.add_argument(
         "--mock",
@@ -1345,108 +1451,17 @@ def main():
 
     args = parser.parse_args()
 
-    # Dynamic epoch schedule definitions
-    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 5
-    TUNE_2_EPOCHS = args.epochs if args.epochs is not None else 6
-    STUDY_ABC_EPOCHS = args.epochs if args.epochs is not None else 6
-    STUDY_DE_EPOCHS = args.epochs if args.epochs is not None else 6
-
     print("\n" + "═" * 80)
     print("🚀 NMT PERFORMANCE INFRASTRUCTURE ORCHESTRATOR INITIALIZED")
-    print(
-        f"   Mode: {args.study.upper()} | Token Level: {args.token_type.upper()}"
-        f" | Dynamic Epoch Strategy: [Tune1: {TUNE_1_EPOCHS}, Studies A-C: {STUDY_ABC_EPOCHS}, Tune2: {TUNE_2_EPOCHS}, Studies D-E: {STUDY_DE_EPOCHS}]"
-        f" | GPUs: {torch.cuda.device_count() if torch.cuda.is_available() else 0}"
-    )
     print("═" * 80 + "\n")
 
-    if not args.no_preprocess and args.study != "postprocess":
-        execute_preprocessing(token_type=args.token_type, mock_mode=args.mock)
-
-    eval_queue = AsyncEvaluationQueue(max_workers=2)
-
-    # 1. First Tuning Pass (Coarse Sweep) - 5 Epochs
-    if args.study in ["tune", "all"] and args.tune_stage == "coarse":
-        execute_tuning(
-            stage="coarse",
-            token_type=args.token_type,
-            epochs=TUNE_1_EPOCHS,
-            num_trials=args.tune_trials,
-            configs_per_rnn=args.configs_per_rnn,
-        )
-
-    # 2. Studies A, B, C - 6 Epochs
-    if args.study in ["all", "A"]:
-        execute_study_a(STUDY_ABC_EPOCHS, args.token_type, eval_queue)
-
-    best_settings = get_best_empirical_settings(args.token_type)
-
-    if args.study in ["all", "B"]:
-        execute_study_b(
-            STUDY_ABC_EPOCHS,
-            best_settings["rnn_type"],
-            best_settings["bidirectional"],
-            args.token_type,
-            eval_queue,
-        )
-
-    best_settings = get_best_empirical_settings(args.token_type)
-
-    if args.study in ["all", "C"]:
-        execute_study_c(
-            STUDY_ABC_EPOCHS,
-            args.token_type,
-            best_settings["rnn_type"],
-            best_settings["bidirectional"],
-            best_settings["embedding_source"],
-            best_settings["freeze_emb"],
-            best_settings["emb_dim"],
-            eval_queue,
-        )
-
-    # 3. Second Tuning Pass (Fine Sweep) - 6 Epochs
-    if args.study in ["all", "fine_tune"] or (args.study == "tune" and args.tune_stage == "fine"):
-        execute_tuning(
-            stage="fine",
-            token_type=args.token_type,
-            epochs=TUNE_2_EPOCHS,
-            num_trials=args.tune_trials,
-            configs_per_rnn=args.configs_per_rnn,
-        )
-
-    best_settings = get_best_empirical_settings(args.token_type)
-
-    # 4. Studies D and E - 6 Epochs
-    if args.study in ["all", "D"]:
-        execute_study_d(
-            STUDY_DE_EPOCHS,
-            args.token_type,
-            best_settings["rnn_type"],
-            best_settings["bidirectional"],
-            best_settings["embedding_source"],
-            best_settings["freeze_emb"],
-            best_settings["attention_type"],
-            best_settings["emb_dim"],
-            eval_queue,
-        )
-
-    if args.study in ["all", "E"]:
-        execute_study_e(
-            STUDY_DE_EPOCHS,
-            args.token_type,
-            best_settings["rnn_type"],
-            best_settings["bidirectional"],
-            best_settings["embedding_source"],
-            best_settings["freeze_emb"],
-            best_settings["attention_type"],
-            best_settings["emb_dim"],
-            eval_queue,
-        )
-
-    eval_queue.shutdown()
-
-    if args.study in ["all", "postprocess"]:
-        run_automated_post_processing(args.token_type, best_settings["rnn_type"])
+    # Handle sequential pipeline execution if 'both' option is chosen
+    if args.token_type == "both":
+        print("🔄 [MODE SWITCH] Sequential pipeline execution for WORD and CHAR levels triggered.")
+        for t_type in ["word", "char"]:
+            run_pipeline_for_token_type(t_type, args)
+    else:
+        run_pipeline_for_token_type(args.token_type, args)
 
     print("\n" + "═" * 80)
     print(
