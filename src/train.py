@@ -404,7 +404,7 @@ def main():
     silent_logging = rank > 0
     pair_prefix = f"{args.src_lang}_{args.trg_lang}"
     
-    # --- UPDATED EMBEDDING INITIALIZATION ROUTINES ---
+    # --- EMBEDDING INITIALIZATION ROUTINES ---
     if args.embedding_source == "word2vec":
         pretrained_src_emb = generate_word2vec_embeddings(
             src_vocab, train_csv, lang=args.src_lang, emb_dim=300, silent=silent_logging, pair_prefix=pair_prefix
@@ -462,34 +462,9 @@ def main():
         print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
     
-    # Optimized: Target torch.compile specifically at the Encoder module to eliminate Inductor guard overhead
-    if can_compile:
-        try:
-            model.encoder = torch.compile(model.encoder, mode="default")
-            if rank == 0:
-                print("⚡ Compiled Encoder Graph with TorchInductor.")
-        except Exception as e:
-            if rank == 0:
-                print(f"⚠️ torch.compile skipped: {e}")
-
-    if is_distributed:
-        if device.type == "cuda":
-            model = nn.parallel.DistributedDataParallel(
-                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True
-            )
-        else:
-            model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
-        
-    # Optimized: Utilize Native PyTorch Fused AdamW on Ampere Tensor Cores
-    if device.type == "cuda":
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
-        if rank == 0:
-            print("⚡ Using Native PyTorch Fused AdamW Optimizer (torch.optim.AdamW fused=True).")
-    else:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    
+    # ------------------------------------------------------------------
+    # 1. RESUME CHECKPOINT (Before torch.compile & DDP wrapping)
+    # ------------------------------------------------------------------
     best_val_loss = float("inf")
     start_train_time = time.time()
     loss_history = {"train": [], "val": []}
@@ -507,14 +482,59 @@ def main():
         state_dict = checkpoint['model_state_dict']
         clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
         
-        raw_model = unwrap_model(model)
-        raw_model.load_state_dict(clean_state_dict)
+        # Robust key mapping: handles standard parameters and compiled _orig_mod keys
+        target_state = model.state_dict()
+        adapted_state_dict = {}
+        for k, v in clean_state_dict.items():
+            if k in target_state:
+                adapted_state_dict[k] = v
+            elif k.replace("encoder.", "encoder._orig_mod.") in target_state:
+                adapted_state_dict[k.replace("encoder.", "encoder._orig_mod.")] = v
+            else:
+                adapted_state_dict[k] = v
+
+        model.load_state_dict(adapted_state_dict)
         
         if 'best_val_loss' in checkpoint.get('config', {}):
             best_val_loss = checkpoint['config']['best_val_loss']
         if 'loss_history' in checkpoint and isinstance(checkpoint['loss_history'], dict):
             loss_history = checkpoint['loss_history']
             start_epoch = len(loss_history.get("train", []))
+
+    # ------------------------------------------------------------------
+    # 2. COMPILE ENCODER GRAPH
+    # ------------------------------------------------------------------
+    if can_compile:
+        try:
+            model.encoder = torch.compile(model.encoder, mode="default")
+            if rank == 0:
+                print("⚡ Compiled Encoder Graph with TorchInductor.")
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ torch.compile skipped: {e}")
+
+    # ------------------------------------------------------------------
+    # 3. WRAP DISTRIBUTED DATA PARALLEL
+    # ------------------------------------------------------------------
+    if is_distributed:
+        if device.type == "cuda":
+            model = nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True
+            )
+        else:
+            model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        
+    # ------------------------------------------------------------------
+    # 4. INITIALIZE OPTIMIZER & LOSS FUNCTION
+    # ------------------------------------------------------------------
+    if device.type == "cuda":
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4, fused=True)
+        if rank == 0:
+            print("⚡ Using Native PyTorch Fused AdamW Optimizer (torch.optim.AdamW fused=True).")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     
     vram_stats = {}
     
