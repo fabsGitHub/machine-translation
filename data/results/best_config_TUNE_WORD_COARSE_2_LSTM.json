@@ -6,13 +6,17 @@
     "patience": 3,
     "min_delta": 0.0001,
     "lr": 0.0003,
+    "warmup_epochs": 1,
+    "weight_decay": 0.0001,
     "dropout": 0.3,
     "emb_dim": 128,
     "hidden_dim": 256,
     "batch_size": 128,
     "grad_accum_steps": 4,
     "clip": 1.0,
-    "tf_ratio": 0.5,
+    "tf_start": 1.0,
+    "tf_end": 0.3,
+    "tf_decay_mode": "linear",
     "attention_type": "none",
     "token_type": "word",
     "embedding_source": "scratch",
@@ -21,22 +25,30 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "104.8",
-    "best_val_loss": 6.862948417663574,
-    "val_loss": 6.862948417663574,
-    "epochs_trained": 1,
+    "train_time": 120.2,
+    "best_val_loss": 6.803768634796143,
+    "val_loss": 6.803768634796143,
+    "epochs_trained": 2,
     "loss_history": {
         "train": [
-            7.325990200042725,
-            6.733927249908447,
-            6.6972336769104,
-            6.6802496910095215
+            8.634624481201172,
+            6.737753868103027,
+            6.578131198883057
         ],
         "val": [
-            6.862948417663574,
-            6.9236931800842285,
-            7.015275001525879,
-            7.102238178253174
+            6.880914688110352,
+            6.803768634796143,
+            6.86246395111084
+        ],
+        "lr": [
+            5.9999999999999995e-05,
+            0.0003,
+            0.00022749999999999997
+        ],
+        "tf_ratio": [
+            1.0,
+            0.7666666666666667,
+            0.5333333333333334
         ]
     },
     "hardware_precision": "bf16",
@@ -44,9 +56,9 @@
     "vram_model_mb": 164.31,
     "vram_gradients_mb": 164.31,
     "vram_optimizer_mb": 328.61,
-    "vram_activations_mb": 6797.97,
-    "vram_allocated_mb": 2590.75,
-    "vram_reserved_mb": 12458.0,
-    "vram_peak_mb": 7455.19,
-    "vram_peak_gb": 12.166
+    "vram_activations_mb": 8068.85,
+    "vram_allocated_mb": 2942.54,
+    "vram_reserved_mb": 13518.0,
+    "vram_peak_mb": 8726.07,
+    "vram_peak_gb": 13.201
 }
