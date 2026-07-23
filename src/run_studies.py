@@ -137,8 +137,9 @@ def print_study_model_and_batch_info(study_name, exp_id, token_type, rnn_type, b
 
 
 def run_cmd(args_list):
+    # Optimized default gradient accumulation step (1-2 steps) for GTX 1070 speedup
     if "--grad_accum_steps" not in args_list:
-        args_list = ["--grad_accum_steps", "16"] + args_list
+        args_list = ["--grad_accum_steps", "2"] + args_list
 
     i = 0
     kv = {}
@@ -169,6 +170,8 @@ def run_cmd(args_list):
         except (ValueError, IndexError): pass
 
     nproc = max(1, torch.cuda.device_count())
+    
+    # DDP Launch Execution via torch.distributed.run
     command = [
         sys.executable, "-m", "torch.distributed.run",
         f"--nproc_per_node={nproc}",

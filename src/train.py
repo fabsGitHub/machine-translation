@@ -12,7 +12,6 @@ from utils import set_seed, setup_logging
 
 from dataset import get_dataloader, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
-from utils import set_seed
 from config import load_config
 from embeddings import generate_word2vec_embeddings, load_glove_embeddings_pair
 
@@ -141,7 +140,7 @@ def parse_args():
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Gradient accumulation steps")
+    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps (Optimized 1-2 for GTX 1070)")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_ratio", type=float, default=0.5)
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
@@ -165,6 +164,7 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
         if batch_idx == 1 and device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         
+        # Standard FP32 path (Active when scaler is None, e.g., on GTX 1070 or CPU)
         if scaler is not None and device.type == "cuda":
             with torch.amp.autocast(device_type=device.type):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
@@ -208,13 +208,13 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
     return total_loss
 
 
-def evaluate_validation(model, dataloader, criterion, device):
+def evaluate_validation(model, dataloader, criterion, device, is_gtx1070=False):
     model.eval()
     epoch_loss_tensor = torch.zeros((), device=device)
     with torch.no_grad():
         for src, trg in dataloader:
             src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
-            if device.type == "cuda":
+            if device.type == "cuda" and not is_gtx1070:
                 with torch.amp.autocast(device_type=device.type):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
                     output_dim = output.shape[-1]
@@ -252,9 +252,17 @@ def main():
         if not dist.is_initialized():
             dist.init_process_group(backend=backend, init_method="env://")
     
+    is_gtx1070 = False
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        gpu_name = torch.cuda.get_device_name(device)
+        major_cap = torch.cuda.get_device_capability(device)[0]
+        
+        # Hardware Check: GTX 1070 / Pascal GPUs (Compute Capability 6.1) suffer a 64x speed hit in FP16.
+        if "1070" in gpu_name or major_cap < 7:
+            is_gtx1070 = True
+            
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(device)
     else:
@@ -276,6 +284,8 @@ def main():
         setup_logging(log_filename=f"train_{exp_tag}.log", log_dir=OUTPUT_DIR, rank=rank)
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
+        if is_gtx1070:
+            print("🚀 GTX 1070 / Pascal GPU Detected: Enforcing Pure FP32 Precision (3x–4x Faster Execution Target).")
 
     raw_train_loader, src_vocab, trg_vocab = get_dataloader(
         train_csv, batch_size=args.batch_size, shuffle=True, 
@@ -351,7 +361,6 @@ def main():
     model = Seq2Seq(encoder, decoder, device).to(device)
 
     if rank == 0:
-        
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         model_size_mb = (total_params * 4) / (1024 ** 2)
         gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
@@ -361,6 +370,7 @@ def main():
         print("\n" + "─" * 75)
         print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
         print(f" ├─ Target Device:              {gpu_name}")
+        print(f" ├─ Precision Strategy:         {'Standard FP32 (GTX 1070 Optimized)' if is_gtx1070 else 'AMP FP16 Autocast'}")
         print(f" ├─ Experiment ID:              {args.experiment}")
         print(f" ├─ Architecture:               {args.rnn_type} ({'Bidirectional' if args.bidirectional else 'Unidirectional'})")
         print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
@@ -405,7 +415,9 @@ def main():
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    
+    # Force pure FP32 on GTX 1070 (scaler=None) to prevent FP16 performance degradation
+    scaler = torch.amp.GradScaler("cuda") if (device.type == "cuda" and not is_gtx1070) else None
     
     best_val_loss = float("inf")
     start_train_time = time.time()
@@ -455,11 +467,9 @@ def main():
                 vram_stats_out=vram_stats,
                 grad_accum_steps=args.grad_accum_steps
             )
-            val_loss = evaluate_validation(model, val_loader, criterion, device)
+            val_loss = evaluate_validation(model, val_loader, criterion, device, is_gtx1070=is_gtx1070)
             
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
+            # REMOVED: empty_cache() calls per epoch eliminated to avoid GPU synchronization stalls
             epoch_duration = time.time() - epoch_start_time
             
             loss_history["train"].append(train_loss)

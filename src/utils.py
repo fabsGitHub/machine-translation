@@ -93,3 +93,12 @@ def is_cache_valid(model_path, config_path, epochs):
         return trained_epochs >= epochs
     except Exception:
         return False
+    
+def pad_vocab_size(vocab_size: int, multiple: int = 8) -> int:
+    """
+    Pads the vocabulary size to the nearest upper multiple of `multiple` (default: 8)
+    for GPU Tensor Core hardware efficiency and memory alignment.
+    """
+    if vocab_size % multiple == 0:
+        return vocab_size
+    return ((vocab_size + multiple - 1) // multiple) * multiple
