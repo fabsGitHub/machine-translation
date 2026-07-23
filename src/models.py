@@ -1,4 +1,3 @@
-import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -200,9 +199,18 @@ class Decoder(nn.Module):
     ):
         batch_size, trg_len = trg.shape
 
+        # Pre-compute Bahdanau projection once to avoid repeated projection inside step loops
+        proj_enc = (
+            self.attention.U_a(encoder_outputs)
+            if self.attention_type == "bahdanau"
+            else None
+        )
+
         # FAST PATH: Fused cuDNN pass when teacher forcing triggers on non-attention models
         use_teacher_forcing = self.training and (
-            random.random() < teacher_forcing_ratio
+            (torch.rand(1, device=trg.device).item() < teacher_forcing_ratio)
+            if teacher_forcing_ratio > 0.0
+            else False
         )
 
         if use_teacher_forcing and self.attention_type == "none":
@@ -230,25 +238,20 @@ class Decoder(nn.Module):
         ]
         input_token = trg[:, 0]  # <SOS> token
 
-        # Pre-compute teacher forcing decision vector across sequence steps
-        use_tf_steps = [
-            (self.training and random.random() < teacher_forcing_ratio)
-            for _ in range(1, trg_len)
-        ]
-
-        # Pre-project encoder outputs once if using Bahdanau attention
-        proj_enc = (
-            self.attention.U_a(encoder_outputs)
-            if self.attention_type == "bahdanau"
-            else None
-        )
+        # Pre-compute teacher forcing decision vector across sequence steps using PyTorch random ops
+        if self.training and teacher_forcing_ratio > 0.0:
+            tf_mask = torch.rand(trg_len - 1, device=trg.device) < teacher_forcing_ratio
+        else:
+            tf_mask = torch.zeros(trg_len - 1, dtype=torch.bool, device=trg.device)
 
         for t in range(1, trg_len):
             pred, hidden, _ = self.forward_step(
                 input_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc
             )
             output_list.append(pred)
-            input_token = trg[:, t] if use_tf_steps[t - 1] else pred.argmax(dim=1)
+            # Enforce contiguous layout to prevent stride mismatch re-compiles
+            next_tf = trg[:, t].contiguous()
+            input_token = next_tf if tf_mask[t - 1] else pred.argmax(dim=1)
 
         return torch.stack(output_list, dim=1)
 

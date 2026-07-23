@@ -8,6 +8,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
+import torch._dynamo
 from torch.utils.data import DataLoader, Subset
 import nltk
 from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
@@ -24,6 +25,8 @@ from models import Encoder, Decoder, Seq2Seq
 
 # Enable TensorCore TF32 execution globally for Ampere GPUs
 torch.set_float32_matmul_precision('high')
+# Increase Dynamo cache limit to safely handle dynamic autoregressive step shapes
+torch._dynamo.config.cache_size_limit = 64
 
 nltk.download('wordnet', quiet=True)
 nltk.download('omw-1.4', quiet=True)
@@ -57,13 +60,18 @@ def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
             else None
         )
         
-        # Optimized Code: Accumulate tokens on GPU and transfer in bulk post-loop
+        # Step-by-step decoding while propagating hidden state forward
         for _ in range(max_len):
             out = model.decoder.forward_step(current_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
-            prediction = out[0] if isinstance(out, tuple) else out
+            if isinstance(out, tuple):
+                prediction = out[0]
+                hidden = out[1]
+            else:
+                prediction = out
+                
             best_guess_tensor = prediction.argmax(dim=1)
             generated_indices.append(best_guess_tensor)
-            current_token = best_guess_tensor  # Avoid in-place copy_() synchronization overhead
+            current_token = best_guess_tensor.contiguous()
 
         if generated_indices:
             indices_cpu = torch.stack(generated_indices, dim=1).cpu().numpy()
@@ -72,7 +80,7 @@ def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
             
         itos = trg_vocab.itos
         tokens = []
-        for idx in indices_cpu:
+        for idx in indices_cpu[0]:
             if idx == EOS_IDX:
                 break
             if idx != PAD_IDX:
@@ -99,13 +107,18 @@ def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
             else None
         )
         
-        # Decode max_len tokens without in-place tensor slice assignments
+        # Decode max_len tokens updating hidden states each step
         for t in range(max_len):
             out = model.decoder.forward_step(current_tokens, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
-            prediction = out[0] if isinstance(out, tuple) else out
+            if isinstance(out, tuple):
+                prediction = out[0]
+                hidden = out[1]
+            else:
+                prediction = out
+
             best_guess = prediction.argmax(dim=1)
             output_list.append(best_guess)
-            current_tokens = best_guess
+            current_tokens = best_guess.contiguous()
         
         outputs = torch.stack(output_list, dim=1) if output_list else torch.empty((batch_size, 0), dtype=torch.long, device=device)
         
@@ -148,6 +161,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
             test_csv = os.path.join(ROOT_DIR, "data", "processed", legacy_file)
             
     if not os.path.exists(test_csv): 
+        print(f"❌ Test dataset CSV file not found at: {test_csv}")
         return
         
     eval_batch_size = config.get('batch_size_char', 4096) if token_type == "char" else config.get('batch_size_word', 1024)
@@ -237,14 +251,16 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
     num_workers = min(32, os.cpu_count() or 16)
     
     chunk_size = max(100, len(meteor_pairs) // (num_workers * 4))
-    chunks = [meteor_pairs[i:i + chunk_size] for i in range(0, len(meteor_pairs), chunk_size)]
+    chunks = [meteor_pairs[i:i + chunk_size] for i in range(0, len(meteor_pairs), chunk_size)] if meteor_pairs else []
     
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        chunk_results = pool.map(_worker_meteor_chunk, chunks)
+    if chunks:
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            chunk_results = pool.map(_worker_meteor_chunk, chunks)
+        meteor_scores = [score for sublist in chunk_results for score in sublist]
+    else:
+        meteor_scores = []
         
-    meteor_scores = [score for sublist in chunk_results for score in sublist]
-        
-    bleu_score = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1) * 100
+    bleu_score = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1) * 100 if hypotheses else 0.0
     mean_meteor = np.mean(meteor_scores) if meteor_scores else 0.0
     
     print(f"✨ Score Summary [{experiment_id}] -> BLEU: {bleu_score:.2f} | METEOR: {mean_meteor:.4f}")
@@ -320,7 +336,7 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
 
 def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
     """Parses isolated study evaluation ledgers into a consolidated DataFrame."""
-    pattern = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}_*.json")
+    pattern = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}*.json")
     ledger_data = {}
     
     for filepath in glob.glob(pattern):
@@ -487,7 +503,7 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
 
             pred_tensor = prediction.argmax(dim=1)
             pred_tensors.append(pred_tensor)
-            current_token.copy_(pred_tensor)
+            current_token = pred_tensor.contiguous()
 
         # Bulk GPU-to-CPU transfer outside the step loop to avoid stream stalls
         if pred_tensors:
@@ -522,6 +538,7 @@ def visualize_attention(model_path, sample_text=None, output_path=None):
     if not output_path:
         output_path = os.path.join(OUTPUT_DIR, f"attention_{config.get('experiment', 'viz')}.png")
 
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.savefig(output_path, dpi=300)
     plt.close()
     print(f"✅ Attention visualization saved -> {output_path}")
