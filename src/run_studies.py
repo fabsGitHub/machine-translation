@@ -54,7 +54,7 @@ class AsyncEvaluationQueue:
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.futures = []
 
-    def submit_evaluation(self, experiment_id, rnn_type, token_type):
+    def submit_evaluation(self, experiment_id, rnn_type):
         """Queues evaluation in the background without holding a global lock during computation."""
 
         def _task():
@@ -589,7 +589,11 @@ def execute_preprocessing(token_type="word", mock_mode=False):
 def execute_tuning(
     stage="coarse", token_type="word", epochs=5, num_trials=12, configs_per_rnn=None
 ):
-    """Executes hyperparameter tuning sweeps evenly across RNN, GRU, and LSTM cell types."""
+    """
+    Executes hyperparameter tuning sweeps.
+    - stage="coarse": Sweeps evenly across RNN, GRU, and LSTM baseline models.
+    - stage="fine": Tests the winner model configuration from Study C over the specified hyperparameter grid.
+    """
     print(
         "\n"
         + "═" * 75
@@ -602,7 +606,6 @@ def execute_tuning(
     dropouts = [0.2, 0.3, 0.4]
     emb_dims = [128, 256, 512] if token_type == "word" else [32, 64, 128]
     hidden_dims = [256, 512, 1024]
-    rnn_types = ["LSTM", "GRU", "RNN"]
 
     batch_size = get_batch_size("TUNE", token_type)
     results_csv = os.path.join(
@@ -614,6 +617,8 @@ def execute_tuning(
         "stage",
         "token_type",
         "rnn_type",
+        "attention_type",
+        "bidirectional",
         "learning_rate",
         "dropout",
         "emb_dim",
@@ -629,38 +634,69 @@ def execute_tuning(
 
     random.seed(42)
 
-    # Determine balanced trials per RNN architecture (e.g. 3 or 4 per cell type)
-    if configs_per_rnn is not None:
-        trials_per_rnn = configs_per_rnn
-    else:
-        trials_per_rnn = max(1, num_trials // len(rnn_types))
-
     selected_trials = []
-    for rnn in rnn_types:
-        combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, [rnn]))
-        random.shuffle(combos)
-        selected_trials.extend(combos[:trials_per_rnn])
 
-    # Fill any remaining quota round-robin if num_trials exceeds total selected
-    if len(selected_trials) < num_trials and configs_per_rnn is None:
-        all_combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, rnn_types))
-        remaining = [c for c in all_combos if c not in selected_trials]
-        random.shuffle(remaining)
-        selected_trials.extend(remaining[:num_trials - len(selected_trials)])
+    if stage == "fine":
+        # Retrieve winner model parameters from Study C
+        winner_c = get_best_empirical_settings(token_type)
+        winner_rnn = winner_c["rnn_type"]
+        winner_attn = winner_c["attention_type"]
+        winner_bidi = winner_c["bidirectional"]
+        winner_emb_src = winner_c["embedding_source"]
+        winner_freeze = winner_c["freeze_emb"]
 
-    print(
-        f"📋 Selected {len(selected_trials)} trials total "
-        f"({trials_per_rnn} configs tested per cell type across {rnn_types})."
-    )
+        print("─" * 75)
+        print(f"🏆 [FINE TUNE CONFIGURATION - STUDY C WINNER]")
+        print(f" ├─ Winner RNN Model:      {winner_rnn}")
+        print(f" ├─ Winner Attention:      {winner_attn}")
+        print(f" ├─ Winner Bidirectional:  {winner_bidi}")
+        print(f" ├─ Winner Embedding Src:  {winner_emb_src}")
+        print(f" └─ Winner Freeze Emb:     {winner_freeze}")
+        print("─" * 75)
+
+        all_combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims))
+        random.shuffle(all_combos)
+
+        # Select target trials
+        trial_combos = all_combos[:num_trials] if num_trials and num_trials < len(all_combos) else all_combos
+        for lr, drop, emb_d, hid_d in trial_combos:
+            selected_trials.append((lr, drop, emb_d, hid_d, winner_rnn, winner_attn, winner_bidi, winner_emb_src, winner_freeze))
+
+        print(f"📋 Configured {len(selected_trials)} fine-tuning trials for Study C Winner Architecture ({winner_rnn} + {winner_attn}).")
+
+    else:
+        # Coarse sweep over all baseline cell types
+        rnn_types = ["LSTM", "GRU", "RNN"]
+        if configs_per_rnn is not None:
+            trials_per_rnn = configs_per_rnn
+        else:
+            trials_per_rnn = max(1, num_trials // len(rnn_types))
+
+        selected_combos = []
+        for rnn in rnn_types:
+            combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, [rnn]))
+            random.shuffle(combos)
+            selected_combos.extend(combos[:trials_per_rnn])
+
+        if len(selected_combos) < num_trials and configs_per_rnn is None:
+            all_combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, rnn_types))
+            remaining = [c for c in all_combos if c not in selected_combos]
+            random.shuffle(remaining)
+            selected_combos.extend(remaining[:num_trials - len(selected_combos)])
+
+        for lr, drop, emb_d, hid_d, rnn in selected_combos:
+            selected_trials.append((lr, drop, emb_d, hid_d, rnn, "none", "False", "scratch", "False"))
+
+        print(f"📋 Configured {len(selected_trials)} coarse trials across cell types {rnn_types}.")
 
     best_loss = float("inf")
     best_params = None
 
-    for idx, (lr, drop, emb_d, hid_d, rnn) in enumerate(selected_trials, 1):
+    for idx, (lr, drop, emb_d, hid_d, rnn, attn, bidi, emb_src, freeze) in enumerate(selected_trials, 1):
         exp_id = f"TUNE_{token_type.upper()}_{stage.upper()}_{idx}"
         print(
             f"\n🧪 [Trial {idx}/{len(selected_trials)}] -> LR={lr}, Dropout={drop},"
-            f" Emb={emb_d}, Hidden={hid_d}, Cell={rnn}"
+            f" Emb={emb_d}, Hidden={hid_d}, Cell={rnn}, Attn={attn}, BiDir={bidi}"
         )
 
         cmd = [
@@ -668,6 +704,14 @@ def execute_tuning(
             exp_id,
             "--rnn_type",
             rnn,
+            "--attention_type",
+            attn,
+            "--bidirectional",
+            bidi,
+            "--embedding_source",
+            emb_src,
+            "--freeze_emb",
+            freeze,
             "--token_type",
             token_type,
             "--lr",
@@ -711,6 +755,10 @@ def execute_tuning(
                     "emb_dim": emb_d,
                     "hidden_dim": hid_d,
                     "rnn_type": rnn,
+                    "attention_type": attn,
+                    "bidirectional": bidi,
+                    "embedding_source": emb_src,
+                    "freeze_emb": freeze,
                     "val_loss": val_loss,
                 }
 
@@ -726,6 +774,8 @@ def execute_tuning(
                 "stage": stage,
                 "token_type": token_type,
                 "rnn_type": rnn,
+                "attention_type": attn,
+                "bidirectional": bidi,
                 "learning_rate": lr,
                 "dropout": drop,
                 "emb_dim": emb_d,
@@ -1279,13 +1329,13 @@ def main():
         "--tune_trials",
         type=int,
         default=12,
-        help="Total number of hyperparameter search trials (e.g. 12 = 4 trials per cell type)",
+        help="Total number of hyperparameter search trials (e.g. 12 trials)",
     )
     parser.add_argument(
         "--configs_per_rnn",
         type=int,
         default=None,
-        help="Explicitly force N trials per cell type (e.g. 3 or 4 per cell type)",
+        help="Explicitly force N trials per cell type in coarse mode",
     )
     parser.add_argument(
         "--no_preprocess",
@@ -1315,7 +1365,7 @@ def main():
 
     eval_queue = AsyncEvaluationQueue(max_workers=2)
 
-    # 1. First Tuning Pass (Coarse Sweep) - 4 Epochs
+    # 1. First Tuning Pass (Coarse Sweep) - 5 Epochs
     if args.study in ["tune", "all"] and args.tune_stage == "coarse":
         execute_tuning(
             stage="coarse",
