@@ -870,7 +870,7 @@ def execute_study_a(epochs, token_type, eval_queue: AsyncEvaluationQueue):
         ckpt_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{cell}.pt")
         cfg_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{cell}.json")
 
-        if not is_cache_valid(ckpt_path, cfg_path, epochs):
+        if not is_cache_valid(ckpt_path, cfg_path):
             run_cmd(
                 hparams
                 + [
@@ -943,7 +943,7 @@ def execute_study_b(
             OUTPUT_DIR, f"best_config_{exp_id}_{rnn_type}.json"
         )
 
-        if not is_cache_valid(ckpt_path, cfg_path, epochs):
+        if not is_cache_valid(ckpt_path, cfg_path):
             run_cmd(
                 hparams
                 + [
@@ -1019,7 +1019,7 @@ def execute_study_c(
         ckpt_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{cell}.pt")
         cfg_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{cell}.json")
 
-        if not is_cache_valid(ckpt_path, cfg_path, epochs):
+        if not is_cache_valid(ckpt_path, cfg_path):
             cmd_hparams = (
                 get_best_hyperparameters("coarse", token_type, rnn_type=cell)
                 if cell == "RNN"
@@ -1099,7 +1099,7 @@ def execute_study_d(
             OUTPUT_DIR, f"best_config_{exp_id}_{rnn_type}.json"
         )
 
-        if not is_cache_valid(ckpt_path, cfg_path, epochs):
+        if not is_cache_valid(ckpt_path, cfg_path):
             run_cmd(
                 hparams
                 + [
@@ -1178,7 +1178,7 @@ def execute_study_e(
             OUTPUT_DIR, f"best_config_{exp_id}_{rnn_type}.json"
         )
 
-        if not is_cache_valid(ckpt_path, cfg_path, epochs):
+        if not is_cache_valid(ckpt_path, cfg_path):
             run_cmd(
                 hparams
                 + [

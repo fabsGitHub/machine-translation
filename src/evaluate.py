@@ -139,7 +139,7 @@ def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
     return translated_sentences
 
 
-def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
+def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.2, seed=42):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"⌛ Loading checkpoint for evaluation: '{os.path.basename(checkpoint_path)}'")
     
@@ -299,25 +299,49 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
         else:
             bucket_analysis_results[b_name] = {"sample_count": 0, "bleu": 0.0, "meteor": 0.0}
 
-    ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}.json")
-    os.makedirs(ROOT_DIR, exist_ok=True)
-    ledger_data = {}
-    if os.path.exists(ledger_path):
-        try:
-            with open(ledger_path, 'r', encoding='utf-8') as f:
-                ledger_data = json.load(f)
-        except Exception:
-            ledger_data = {}
+    # Derive study group suffix (A, B, C, D, E, PIVOT) for isolated study ledgers
+    match = re.search(r"_(A|B|C|D|E)\d*|_(PIVOT)", experiment_id.upper())
+    study_suffix = (match.group(1) or match.group(2)) if match else "MISC"
 
-    ledger_data[experiment_id] = {
+    # Preserving exact individual training study ledger format with added "completed": True
+    ledger_entry = {
         "experiment": experiment_id,
-        "token_type": token_type,
         "rnn_type": config.get("rnn_type"),
         "bidirectional": is_bidi,
+        "epochs": config.get("epochs"),
+        "lr": config.get("lr"),
+        "dropout": config.get("dropout"),
+        "emb_dim": config.get("emb_dim"),
+        "hidden_dim": config.get("hidden_dim"),
+        "batch_size": config.get("batch_size"),
+        "grad_accum_steps": config.get("grad_accum_steps"),
+        "clip": config.get("clip"),
+        "tf_ratio": config.get("tf_ratio"),
         "attention_type": config.get("attention_type", "none"),
+        "token_type": token_type,
         "embedding_source": config.get("embedding_source", "scratch"),
-        "train_time": config.get("train_time", -1),
-        "inference_time": avg_inference_ms,
+        "freeze_emb": config.get("freeze_emb", False),
+        "src_lang": src_lang,
+        "trg_lang": trg_lang,
+        "resume": config.get("resume", False),
+        "precision": config.get("precision", "auto"),
+        "train_time": str(config.get("train_time", -1)),
+        "best_val_loss": config.get("best_val_loss"),
+        "val_loss": config.get("val_loss"),
+        "epochs_trained": config.get("epochs_trained"),
+        "completed": True,
+        "loss_history": config.get("loss_history", {"train": [], "val": []}),
+        "hardware_precision": config.get("hardware_precision", "unknown"),
+        "gpu_name": config.get("gpu_name", "unknown"),
+        "vram_model_mb": config.get("vram_model_mb", 0.0),
+        "vram_gradients_mb": config.get("vram_gradients_mb", 0.0),
+        "vram_optimizer_mb": config.get("vram_optimizer_mb", 0.0),
+        "vram_activations_mb": config.get("vram_activations_mb", 0.0),
+        "vram_allocated_mb": config.get("vram_allocated_mb", 0.0),
+        "vram_reserved_mb": config.get("vram_reserved_mb", 0.0),
+        "vram_peak_mb": config.get("vram_peak_mb", 0.0),
+        "vram_peak_gb": config.get("vram_peak_gb", 0.0),
+        "inference_time": round(avg_inference_ms, 2),
         "metrics": {
             "overall_corpus_bleu": round(bleu_score, 2),
             "mean_meteor": round(mean_meteor, 4),
@@ -328,10 +352,36 @@ def run_evaluation(checkpoint_path, test_csv=None, sample_size=None, seed=42):
         "avg_inference_ms": round(avg_inference_ms, 2)
     }
 
+    # 1. Update Global Ledger
+    ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}.json")
+    os.makedirs(ROOT_DIR, exist_ok=True)
+    ledger_data = {}
+    if os.path.exists(ledger_path):
+        try:
+            with open(ledger_path, 'r', encoding='utf-8') as f:
+                ledger_data = json.load(f)
+        except Exception:
+            ledger_data = {}
+
+    ledger_data[experiment_id] = ledger_entry
     with open(ledger_path, 'w', encoding='utf-8') as f:
         json.dump(ledger_data, f, indent=4)
 
-    print(f"✅ Evaluation complete. Metrics saved to {ledger_path}")
+    # 2. Update Isolated Study Group Ledger Directly
+    study_ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}_{study_suffix}.json")
+    study_data = {}
+    if os.path.exists(study_ledger_path):
+        try:
+            with open(study_ledger_path, 'r', encoding='utf-8') as f:
+                study_data = json.load(f)
+        except Exception:
+            study_data = {}
+
+    study_data[experiment_id] = ledger_entry
+    with open(study_ledger_path, 'w', encoding='utf-8') as f:
+        json.dump(study_data, f, indent=4)
+
+    print(f"✅ Evaluation complete. Metrics saved to {ledger_path} and {study_ledger_path}")
 
 
 def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:

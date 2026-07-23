@@ -106,17 +106,22 @@ def check_artifact_cache(output_dir, experiment_tags):
     return None, None
 
 
-def is_cache_valid(model_path, config_path, epochs):
+def is_cache_valid(model_path, config_path):
     """
-    Checks if a cached checkpoint model has met or exceeded target epoch requirements.
+    Checks if a cached model exists, was successfully completed, 
+    and optionally met target epoch requirements.
     """
     if not (os.path.exists(model_path) and os.path.exists(config_path)):
         return False
+        
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             cfg = json.load(f)
-        trained_epochs = cfg.get("epochs_trained", len(cfg.get("loss_history", {}).get("train", [])))
-        return trained_epochs >= epochs
+            
+        is_completed = bool(cfg.get("completed", False))
+        
+        return is_completed
+        
     except Exception:
         return False
 

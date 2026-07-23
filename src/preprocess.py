@@ -67,6 +67,17 @@ def get_split_path(processed_dir, split_type, src_lang, trg_lang):
     return os.path.join(processed_dir, f"{split_type}_{src_lang}_{trg_lang}.csv")
 
 
+def splits_already_exist(processed_dir):
+    """Checks if all required language pair split CSV files already exist."""
+    pairs = [("de", "en"), ("en", "de"), ("en", "sv")]
+    splits = ["train", "val", "test"]
+    for src, trg in pairs:
+        for split in splits:
+            if not os.path.exists(get_split_path(processed_dir, split, src, trg)):
+                return False
+    return True
+
+
 def locate_raw_files(raw_dir, lang_pair="de-en"):
     """Robust multi-tier file locator across data/raw, Kaggle inputs, and custom structures."""
     l1, l2 = lang_pair.split("-")
@@ -179,7 +190,6 @@ def preprocess_data(
 ):
     df = df.copy()
 
-    # Use PyArrow string backend when available without dropping back to object dtype
     try:
         df[src_col] = df[src_col].astype("string[pyarrow]")
         df[trg_col] = df[trg_col].astype("string[pyarrow]")
@@ -214,7 +224,6 @@ def preprocess_data(
 
     df = df.drop_duplicates()
 
-    # Optimized vectorized word count
     def get_word_len(series):
         return series.str.count(" ") + 1
 
@@ -317,8 +326,7 @@ def _cache_single_pair(src, trg, processed_dir, token_type):
 def execute_offline_caching(processed_dir, token_type="word"):
     """
     Pre-tokenizes CSV splits and caches binary tensors (.pt matrix files)
-    and pre-computed Word2Vec embedding weights locally. Runs sequentially per pair to allow
-    inner dataset worker pools to fully utilize all available host CPU cores without contention.
+    and pre-computed Word2Vec embedding weights locally.
     """
     print("\n" + "─" * 75)
     print("⚡ [OFFLINE BINARY CACHING & TENSOR PRE-SERIALIZATION]")
@@ -359,6 +367,13 @@ def main():
 
     os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(processed_dir, exist_ok=True)
+
+    # Fast short-circuit: Skip downloading and string regex parsing if CSV splits exist
+    if not args.mock and splits_already_exist(processed_dir):
+        print("✓ Processed dataset CSV splits already exist locally. Skipping raw text cleaning.")
+        execute_offline_caching(processed_dir, token_type=args.token_type)
+        print("\n✓ Dataset preprocessing and binary caching completed successfully.")
+        return
 
     if os.path.exists("/kaggle/input"):
         for root, _, files in os.walk("/kaggle/input"):

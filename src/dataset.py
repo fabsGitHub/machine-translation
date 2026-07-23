@@ -140,11 +140,29 @@ class Vocabulary:
 
 class PretokenizedNMTDataset(Dataset):
     def __init__(self, csv_path, src_lang="de", trg_lang="en", token_type="word", src_vocab=None, trg_vocab=None):
-        df = pd.read_csv(csv_path)
         self.src_lang = src_lang
         self.trg_lang = trg_lang
         self.token_type = token_type
 
+        cache_dir = os.path.join(os.path.dirname(csv_path), ".matrix_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        base_name = os.path.basename(csv_path).replace(".csv", "")
+        cache_path = os.path.join(cache_dir, f"matrix_{base_name}_{token_type}.pt")
+
+        # FAST PATH: Load instantly from pre-serialized binary disk cache if present
+        if os.path.exists(cache_path):
+            cached = torch.load(cache_path, weights_only=False)
+            self.src_data = cached["src_data"]
+            self.trg_data = cached["trg_data"]
+            self.src_offsets = cached["src_offsets"]
+            self.trg_offsets = cached["trg_offsets"]
+            self.src_lengths = cached["src_lengths"]
+            self.trg_lengths = cached["trg_lengths"]
+            self.src_vocab = src_vocab if src_vocab is not None else cached["src_vocab"]
+            self.trg_vocab = trg_vocab if trg_vocab is not None else cached["trg_vocab"]
+            return
+
+        df = pd.read_csv(csv_path)
         src_texts = df[src_lang].astype(str).tolist()
         trg_texts = df[trg_lang].astype(str).tolist()
         del df  # Free raw dataframe memory to reduce IPC overhead in worker processes
@@ -215,6 +233,19 @@ class PretokenizedNMTDataset(Dataset):
 
         del raw_data, src_arrays, trg_arrays
 
+        # Save binary dataset tensor cache to disk
+        torch.save({
+            "src_data": self.src_data,
+            "trg_data": self.trg_data,
+            "src_offsets": self.src_offsets,
+            "trg_offsets": self.trg_offsets,
+            "src_lengths": self.src_lengths,
+            "trg_lengths": self.trg_lengths,
+            "src_vocab": self.src_vocab,
+            "trg_vocab": self.trg_vocab,
+        }, cache_path)
+        print(f"⚡ Binary matrix cache saved -> {cache_path}")
+
     def __len__(self):
         return len(self.src_offsets) - 1
 
@@ -239,7 +270,6 @@ class BucketBatchSampler(Sampler):
         self.shuffle = shuffle
         self.mega_batch_size = batch_size * mega_batch_mult
 
-        # Precompute length cache as contiguous 1D NumPy array for fast megabatch sorting
         if hasattr(self.dataset, 'src_lengths'):
             self.lengths = self.dataset.src_lengths
         elif hasattr(self.dataset, 'data'):
@@ -260,12 +290,10 @@ class BucketBatchSampler(Sampler):
         for i in range(0, len(indices), self.mega_batch_size):
             mega_batch = indices[i:i + self.mega_batch_size]
 
-            # Vectorized argsort replacing Python lambda sort
             sorted_order = np.argsort(lengths[mega_batch])
             sorted_mega = mega_batch[sorted_order]
 
             for j in range(0, len(sorted_mega), self.batch_size):
-                # Retain NumPy array slicing directly without Python list conversion overhead
                 batches.append(sorted_mega[j:j + self.batch_size])
 
         if self.shuffle:
@@ -282,12 +310,6 @@ def collate_fn(batch):
     src_list, trg_list = zip(*batch)
     src_padded = pad_sequence(src_list, batch_first=True, padding_value=PAD_IDX)
     trg_padded = pad_sequence(trg_list, batch_first=True, padding_value=PAD_IDX)
-    
-    # Explicitly pin memory in the collate function for asynchronous CUDA transfers
-    # if torch.cuda.is_available():
-    #     src_padded = src_padded.pin_memory()
-    #     trg_padded = trg_padded.pin_memory()
-        
     return src_padded, trg_padded
 
 
