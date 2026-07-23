@@ -230,7 +230,7 @@ def generate_word2vec_embeddings(
 
 
 def precompute_word2vec_embeddings(
-    vocab=None, train_csv=None, lang="en", emb_dim=300, silent=False
+    vocab=None, train_csv=None, lang="en", emb_dim=300, silent=False, pair_prefix=None, **kwargs
 ):
     """Pre-computes or caches Word2Vec embeddings for offline processing."""
     if vocab is not None:
