@@ -17,12 +17,13 @@ UNK_IDX = 1
 SOS_IDX = 2
 EOS_IDX = 3
 
+
 class Vocabulary:
     def __init__(self, token_type="word", pad_multiple=16):
         self.token_type = token_type
         self.pad_multiple = pad_multiple
         self.itos = {PAD_IDX: PAD_TOKEN, UNK_IDX: UNK_TOKEN, SOS_IDX: SOS_TOKEN, EOS_IDX: EOS_TOKEN}
-        self.stoi = {PAD_TOKEN: PAD_IDX, UNK_TOKEN: UNK_IDX, SOS_TOKEN: SOS_IDX, EOS_IDX: EOS_IDX}
+        self.stoi = {PAD_TOKEN: PAD_IDX, UNK_TOKEN: UNK_IDX, SOS_TOKEN: SOS_IDX, EOS_TOKEN: EOS_IDX}
         
     def __len__(self):
         """Returns the actual unpadded vocabulary size."""
@@ -88,7 +89,7 @@ class PretokenizedNMTDataset(Dataset):
         else:
             self.trg_vocab = trg_vocab
 
-        # OPTIMIZATION 1: Store sequences as 1D NumPy arrays to prevent millions of standalone torch.Tensor allocations
+        # Store sequences as 1D NumPy arrays to minimize standalone tensor overhead
         self.data = []
         for src, trg in zip(src_texts, trg_texts):
             src_num = np.array([SOS_IDX] + self.src_vocab.numericalize(src) + [EOS_IDX], dtype=np.int64)
@@ -120,7 +121,6 @@ class BucketBatchSampler(Sampler):
         return len(self.dataset[idx][0])
 
     def __iter__(self):
-        # OPTIMIZATION 3: Megabatch window bucketing instead of global O(N log N) sorting
         indices = list(range(len(self.dataset)))
         if self.shuffle:
             random.shuffle(indices)
@@ -157,7 +157,6 @@ def get_dataloader(csv_path, batch_size=512, shuffle=True, src_vocab=None, trg_v
     )
     
     sampler = BucketBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
-    
     use_workers = num_workers > 0
     
     loader = DataLoader(

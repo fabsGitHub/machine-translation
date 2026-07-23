@@ -19,6 +19,7 @@ class Encoder(nn.Module):
         custom_emb_dim=None,
     ):
         super().__init__()
+        self.rnn_type = rnn_type
         emb_dim_in = custom_emb_dim if custom_emb_dim else emb_dim
         self.embedding = nn.Embedding(vocab_size, emb_dim_in)
 

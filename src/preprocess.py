@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import tarfile
 import urllib.request
 import pandas as pd
@@ -143,27 +144,43 @@ def preprocess_data(
     max_char_len=256,
 ):
     df = df.copy()
-    
-    # Use PyArrow string backend when available for accelerated vectorized string processing
+
+    # Use PyArrow string backend when available without dropping back to object dtype
     try:
         df[src_col] = df[src_col].astype("string[pyarrow]")
         df[trg_col] = df[trg_col].astype("string[pyarrow]")
     except Exception:
-        pass
+        df[src_col] = df[src_col].astype(str)
+        df[trg_col] = df[trg_col].astype(str)
 
-    df[src_col] = df[src_col].astype(str).str.strip()
-    df[trg_col] = df[trg_col].astype(str).str.strip()
+    df[src_col] = df[src_col].str.strip()
+    df[trg_col] = df[trg_col].str.strip()
+    
+    # Filter empty rows and XML tag markers
     df = df[(df[src_col] != "") & (df[trg_col] != "")]
-    df = df[~df[src_col].str.match(r"^\s*<") & ~df[trg_col].str.match(r"^\s*<")]
+    df = df[~df[src_col].str.startswith("<") & ~df[trg_col].str.startswith("<")]
+    
     df[src_col] = df[src_col].str.lower()
     df[trg_col] = df[trg_col].str.lower()
 
+    # Punctuation isolation regex
     punct_regex = r"([.,!?\"':;)(])"
-    df[src_col] = df[src_col].str.replace(punct_regex, r" \1 ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
-    df[trg_col] = df[trg_col].str.replace(punct_regex, r" \1 ", regex=True).str.replace(r"\s+", " ", regex=True).str.strip()
+    df[src_col] = (
+        df[src_col]
+        .str.replace(punct_regex, r" \1 ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    df[trg_col] = (
+        df[trg_col]
+        .str.replace(punct_regex, r" \1 ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    
     df = df.drop_duplicates()
 
-    # Optimized vectorized word count without creating intermediate Python lists
+    # Optimized vectorized word count
     def get_word_len(series):
         return series.str.count(" ") + 1
 
@@ -221,6 +238,10 @@ def process_and_save_pair(
 
 
 def execute_offline_caching(processed_dir, token_type="word"):
+    """
+    Pre-tokenizes CSV splits and caches binary tensors (.pt matrix files)
+    and pre-computed Word2Vec embedding weights locally.
+    """
     print("\n" + "─" * 75)
     print("⚡ [OFFLINE BINARY CACHING & TENSOR PRE-SERIALIZATION]")
     print("─" * 75)
@@ -306,8 +327,6 @@ def main():
                         try:
                             os.symlink(os.path.join(root, f), glove_dest)
                         except Exception:
-                            import shutil
-
                             shutil.copy(os.path.join(root, f), glove_dest)
                     break
 
