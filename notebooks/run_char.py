@@ -75,7 +75,7 @@ os.system("git log -1 --oneline")
 _shared_data_dir = "/workspace/machine-translation/data"
 if os.path.isdir(_shared_data_dir):
     for _name in ("raw", "GoogleNews-vectors-negative300.bin", "glove.6B.300d.txt",
-                  "wiki.de.vec", "wiki.en.vec", "wiki.sv.vec", ".embeddings_cache"):
+                  "german.word2vec.bin", "swedish.word2vec.bin", ".embeddings_cache"):
         _target = os.path.join(_shared_data_dir, _name)
         _link = os.path.join(REPO_PATH, "data", _name)
         if os.path.exists(_target) and not os.path.exists(_link):

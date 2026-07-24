@@ -166,22 +166,31 @@ def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"
     return weights
 
 
-# Per-language pretrained vector files. English has genuine Word2Vec (GoogleNews)
-# and GloVe (Stanford glove.6B) releases; German/Swedish have neither publicly, so
-# both embedding_source options fall back to the same fastText Wikipedia vectors
-# for those languages (wiki.de.vec / wiki.sv.vec) - the closest available pretrained
-# substitute. This means "word2vec" and "glove" only differ on the English side of
+# Per-language pretrained vector files. English has genuine Word2Vec (GoogleNews,
+# 300d) and GloVe (Stanford glove.6B, 300d) releases. German/Swedish have no
+# public GloVe release, and no public release of the ORIGINAL GoogleNews-style
+# Word2Vec either - so both embedding_source options fall back to the best real
+# Word2Vec models available for those languages instead: German from devmount's
+# GermanWordEmbeddings (gensim word2vec .bin, 300d, German Wikipedia + news
+# corpus, MIT license - https://devmount.github.io/GermanWordEmbeddings/) and
+# Swedish from the NLPL Word Vectors Repository (word2vec Continuous Skipgram,
+# 100d, Swedish CoNLL17 corpus - http://vectors.nlpl.eu/repository/, model id
+# 69). Note the Swedish model is only 100d vs 300d for English/German -
+# populate_embedding_matrix() zero-pads it out to whatever emb_dim is requested,
+# which is a minor real limitation worth naming in the report, not a bug.
+# This means "word2vec" and "glove" are IDENTICAL on the German/Swedish side
+# (no separate real GloVe exists there) and only differ on the English side of
 # a pair; report this explicitly rather than presenting it as a full ablation on
 # the non-English side.
 _WORD2VEC_FILES = {
     "en": ("GoogleNews-vectors-negative300.bin", True),
-    "de": ("wiki.de.vec", False),
-    "sv": ("wiki.sv.vec", False),
+    "de": ("german.word2vec.bin", True),
+    "sv": ("swedish.word2vec.bin", True),
 }
 _GLOVE_FILES = {
     "en": ("glove.6B.300d.txt", "glove_txt"),
-    "de": ("wiki.de.vec", False),
-    "sv": ("wiki.sv.vec", False),
+    "de": ("german.word2vec.bin", True),
+    "sv": ("swedish.word2vec.bin", True),
 }
 
 
@@ -249,10 +258,11 @@ def precompute_word2vec_embeddings(
 def _load_pretrained_vector_dict(lang, source, emb_dim, data_dir, silent):
     """Resolves and loads the language-correct pretrained vector dict for
     embedding_source in {'glove', 'word2vec'}. English uses the real GloVe/
-    Word2Vec release; German/Swedish fall back to fastText Wikipedia vectors
-    (wiki.de.vec / wiki.sv.vec) since no public German/Swedish GloVe or
-    Word2Vec release exists here - using the English file for those languages
-    (the previous behavior) would silently score near-zero real coverage."""
+    Word2Vec release; German uses devmount's German Word2Vec, Swedish uses the
+    NLPL Swedish Word2Vec (see _WORD2VEC_FILES/_GLOVE_FILES above) since no
+    public German/Swedish GloVe release exists - using the English file for
+    those languages (the original behavior) would silently score near-zero
+    real coverage."""
     files = _GLOVE_FILES if source == "glove" else _WORD2VEC_FILES
     filename, mode = files.get(lang, files["en"])
     filepath = os.path.join(data_dir, filename)
