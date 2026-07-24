@@ -43,7 +43,7 @@ def download_and_extract_glove(glove_dir="data", emb_dim=300):
 
 
 def load_word2vec_keyed_vectors(filepath, binary=False):
-    """Loads KeyedVectors using fast binary PyTorch disk caching to eliminate 12-min parse overhead."""
+    """Loads KeyedVectors using fast binary PyTorch disk caching to eliminate parse overhead."""
     cache_dir = _get_cache_dir()
     base_name = os.path.basename(filepath).replace(".", "_")
     pt_cache_path = os.path.join(cache_dir, f"cache_{base_name}.pt")
@@ -63,8 +63,7 @@ def load_word2vec_keyed_vectors(filepath, binary=False):
     from gensim.models import KeyedVectors
 
     print(
-        f"📦 Loading pre-trained vectors from {filepath} (Building fast binary"
-        " cache)..."
+        f"📦 Loading pre-trained vectors from {filepath} (Building fast binary cache)..."
     )
     wv = KeyedVectors.load_word2vec_format(filepath, binary=binary)
 
@@ -79,6 +78,7 @@ def load_word2vec_keyed_vectors(filepath, binary=False):
 
 
 def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"):
+    """Maps pre-trained vector dictionary to a vocabulary tensor matrix."""
     vocab_size = len(vocab)
     weights = torch.randn(vocab_size, emb_dim) * 0.01
 
@@ -103,7 +103,7 @@ def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"
             token.lower(),
             clean_token.lower(),
             token.capitalize(),
-            clean_token.capitalize()
+            clean_token.capitalize(),
         ]
 
         matched_vec = None
@@ -138,6 +138,7 @@ def generate_word2vec_embeddings(
     pair_prefix=None,
     token_type="word",
 ):
+    """Generates Word2Vec embeddings for a given language vocabulary."""
     if token_type == "char":
         if not silent:
             print("⚠️ Token level is 'char'. Skipping Word2Vec loading.")
@@ -187,6 +188,41 @@ def precompute_word2vec_embeddings(
     )
 
 
+def load_glove_embeddings(
+    vocab,
+    glove_file_path=None,
+    emb_dim=300,
+    silent=False,
+    token_type="word",
+    glove_dir="data",
+):
+    """Loads GloVe embeddings for a single vocabulary."""
+    if token_type == "char":
+        if not silent:
+            print("⚠️ Token level is 'char'. Skipping GloVe loading.")
+        return None
+
+    if glove_file_path and os.path.exists(glove_file_path):
+        glove_path = glove_file_path
+    else:
+        glove_path = download_and_extract_glove(glove_dir=glove_dir, emb_dim=emb_dim)
+
+    if not glove_path or not os.path.exists(glove_path):
+        if not silent:
+            print("⚠️ GloVe embeddings file unavailable.")
+        return None
+
+    try:
+        vector_dict = load_word2vec_keyed_vectors(glove_path, binary=False)
+        return populate_embedding_matrix(
+            vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
+        )
+    except Exception as e:
+        if not silent:
+            print(f"⚠️ Failed to load GloVe embeddings: {e}")
+        return None
+
+
 def load_glove_embeddings_pair(
     src_vocab,
     trg_vocab,
@@ -197,6 +233,7 @@ def load_glove_embeddings_pair(
     silent=False,
     token_type="word",
 ):
+    """Loads GloVe embeddings for source and target vocabulary pair."""
     if token_type == "char":
         if not silent:
             print("⚠️ Token level is 'char'. Skipping GloVe loading.")
@@ -210,8 +247,12 @@ def load_glove_embeddings_pair(
 
     try:
         vector_dict = load_word2vec_keyed_vectors(glove_path, binary=False)
-        src_emb = populate_embedding_matrix(src_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type)
-        trg_emb = populate_embedding_matrix(trg_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type)
+        src_emb = populate_embedding_matrix(
+            src_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
+        )
+        trg_emb = populate_embedding_matrix(
+            trg_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
+        )
         return src_emb, trg_emb
     except Exception as e:
         if not silent:
