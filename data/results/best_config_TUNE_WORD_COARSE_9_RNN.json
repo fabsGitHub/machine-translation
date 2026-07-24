@@ -1,15 +1,15 @@
 {
-    "experiment": "TUNE_WORD_COARSE_1",
-    "rnn_type": "LSTM",
+    "experiment": "TUNE_WORD_COARSE_9",
+    "rnn_type": "RNN",
     "bidirectional": false,
     "epochs": 5,
     "patience": 3,
     "min_delta": 0.0001,
-    "lr": 0.0005,
+    "lr": 0.001,
     "warmup_epochs": 1,
     "weight_decay": 0.0001,
-    "dropout": 0.2,
-    "emb_dim": 256,
+    "dropout": 0.3,
+    "emb_dim": 512,
     "hidden_dim": 1024,
     "batch_size": 128,
     "grad_accum_steps": 4,
@@ -25,28 +25,28 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": 76.5,
-    "best_val_loss": 6.90279483795166,
-    "val_loss": 6.90279483795166,
+    "train_time": 70.2,
+    "best_val_loss": 8.150923728942871,
+    "val_loss": 8.150923728942871,
     "epochs_trained": 1,
     "loss_history": {
         "train": [
-            7.0334153175354,
-            5.870416641235352,
-            5.089959621429443,
-            4.7311601638793945
+            6.322494983673096,
+            5.287636756896973,
+            4.824828624725342,
+            4.592962741851807
         ],
         "val": [
-            6.90279483795166,
-            7.647517204284668,
-            7.692837238311768,
-            7.6009039878845215
+            8.150923728942871,
+            9.13348388671875,
+            8.887295722961426,
+            8.82541561126709
         ],
         "lr": [
-            0.0001,
-            0.0005,
-            0.0004282411613907041,
-            0.000255
+            0.0002,
+            0.001,
+            0.000855017856687341,
+            0.000505
         ],
         "tf_ratio": [
             1.0,
@@ -57,12 +57,12 @@
     },
     "hardware_precision": "bf16",
     "gpu_name": "NVIDIA GeForce RTX 4090",
-    "vram_model_mb": 581.17,
-    "vram_gradients_mb": 581.17,
-    "vram_optimizer_mb": 1162.34,
-    "vram_activations_mb": 4068.51,
-    "vram_allocated_mb": 3422.74,
-    "vram_reserved_mb": 14968.0,
-    "vram_peak_mb": 6393.19,
-    "vram_peak_gb": 14.617
+    "vram_model_mb": 630.03,
+    "vram_gradients_mb": 630.03,
+    "vram_optimizer_mb": 1260.06,
+    "vram_activations_mb": 3970.37,
+    "vram_allocated_mb": 3618.17,
+    "vram_reserved_mb": 15026.0,
+    "vram_peak_mb": 6490.49,
+    "vram_peak_gb": 14.674
 }

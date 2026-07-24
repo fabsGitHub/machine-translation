@@ -1,8 +1,8 @@
 {
-    "experiment": "WORD_A1",
+    "experiment": "TUNE_WORD_COARSE_11",
     "rnn_type": "RNN",
     "bidirectional": false,
-    "epochs": 6,
+    "epochs": 5,
     "patience": 3,
     "min_delta": 0.0001,
     "lr": 0.0005,
@@ -25,34 +25,34 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": 46.7,
-    "best_val_loss": 6.863210201263428,
-    "val_loss": 6.863210201263428,
+    "train_time": 46.8,
+    "best_val_loss": 6.863200664520264,
+    "val_loss": 6.863200664520264,
     "epochs_trained": 1,
     "loss_history": {
         "train": [
-            7.955519199371338,
-            6.283232688903809,
-            5.788949012756348,
-            5.606800556182861
+            7.955520153045654,
+            6.284893035888672,
+            5.81381893157959,
+            5.664651870727539
         ],
         "val": [
-            6.863210201263428,
-            7.6248674392700195,
-            8.07334041595459,
-            7.959244251251221
+            6.863200664520264,
+            7.624500274658203,
+            7.851948261260986,
+            7.751152038574219
         ],
         "lr": [
             0.0001,
             0.0005,
-            0.00045320916362186214,
-            0.00033070916362186215
+            0.0004282411613907041,
+            0.000255
         ],
         "tf_ratio": [
             1.0,
-            0.94,
-            0.88,
-            0.82
+            0.925,
+            0.85,
+            0.7749999999999999
         ]
     },
     "hardware_precision": "bf16",
@@ -60,15 +60,9 @@
     "vram_model_mb": 152.52,
     "vram_gradients_mb": 152.52,
     "vram_optimizer_mb": 305.03,
-    "vram_activations_mb": 7194.18,
-    "vram_allocated_mb": 2675.5,
-    "vram_reserved_mb": 13140.0,
-    "vram_peak_mb": 7804.24,
-    "vram_peak_gb": 12.832,
-    "bleu": 0.0,
-    "Target Metric (BLEU)": 0.0,
-    "bleu_score": 0.0,
-    "overall_corpus_bleu": 0.0,
-    "meteor": 0.0359,
-    "mean_meteor": 0.0359
+    "vram_activations_mb": 3792.1,
+    "vram_allocated_mb": 1708.11,
+    "vram_reserved_mb": 13100.0,
+    "vram_peak_mb": 4402.16,
+    "vram_peak_gb": 12.793
 }

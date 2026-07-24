@@ -1,16 +1,22 @@
 {
     "experiment": "TUNE_WORD_COARSE_8",
     "rnn_type": "GRU",
-    "bidirectional": true,
-    "epochs": 4,
-    "lr": 0.0005,
+    "bidirectional": false,
+    "epochs": 5,
+    "patience": 3,
+    "min_delta": 0.0001,
+    "lr": 0.0003,
+    "warmup_epochs": 1,
+    "weight_decay": 0.0001,
     "dropout": 0.4,
     "emb_dim": 512,
     "hidden_dim": 1024,
     "batch_size": 128,
-    "grad_accum_steps": 8,
+    "grad_accum_steps": 4,
     "clip": 1.0,
-    "tf_ratio": 0.5,
+    "tf_start": 1.0,
+    "tf_end": 0.7,
+    "tf_decay_mode": "linear",
     "attention_type": "none",
     "token_type": "word",
     "embedding_source": "scratch",
@@ -19,28 +25,48 @@
     "trg_lang": "de",
     "resume": true,
     "precision": "auto",
-    "train_time": "158.0",
-    "best_val_loss": 7.496535301208496,
-    "val_loss": 7.496535301208496,
-    "epochs_trained": 1,
+    "train_time": 481.0,
+    "best_val_loss": 7.645403861999512,
+    "val_loss": 7.645403861999512,
+    "epochs_trained": 5,
     "loss_history": {
         "train": [
-            7.174787521362305,
-            7.03623104095459
+            7.0812578201293945,
+            5.606660842895508,
+            4.911075592041016,
+            4.642366886138916,
+            4.591971397399902
         ],
         "val": [
-            7.496535301208496,
-            7.945467472076416
+            8.037642478942871,
+            8.16089153289795,
+            8.073607444763184,
+            7.92764949798584,
+            7.645403861999512
+        ],
+        "lr": [
+            5.9999999999999995e-05,
+            0.0003,
+            0.00025753048327204934,
+            0.00015499999999999995,
+            5.2469516727950605e-05
+        ],
+        "tf_ratio": [
+            1.0,
+            0.925,
+            0.85,
+            0.7749999999999999,
+            0.7
         ]
     },
     "hardware_precision": "bf16",
     "gpu_name": "NVIDIA GeForce RTX 4090",
-    "vram_model_mb": 760.14,
-    "vram_gradients_mb": 760.14,
-    "vram_optimizer_mb": 1520.29,
-    "vram_activations_mb": 8388.99,
-    "vram_allocated_mb": 5018.07,
-    "vram_reserved_mb": 15788.0,
-    "vram_peak_mb": 11429.56,
-    "vram_peak_gb": 15.418
+    "vram_model_mb": 686.09,
+    "vram_gradients_mb": 686.09,
+    "vram_optimizer_mb": 1372.19,
+    "vram_activations_mb": 9536.18,
+    "vram_allocated_mb": 5029.67,
+    "vram_reserved_mb": 16146.0,
+    "vram_peak_mb": 12280.55,
+    "vram_peak_gb": 15.768
 }

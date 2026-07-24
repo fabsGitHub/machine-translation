@@ -1,8 +1,12 @@
 {
-    "lr": 0.0005,
-    "dropout": 0.4,
-    "emb_dim": 256,
-    "hidden_dim": 256,
-    "rnn_type": "RNN",
-    "val_loss": 6.962872505187988
+    "lr": 0.0001,
+    "dropout": 0.2,
+    "emb_dim": 128,
+    "hidden_dim": 512,
+    "rnn_type": "LSTM",
+    "attention_type": "none",
+    "bidirectional": "False",
+    "embedding_source": "scratch",
+    "freeze_emb": "False",
+    "val_loss": 6.824098587036133
 }

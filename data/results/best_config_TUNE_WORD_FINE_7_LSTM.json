@@ -1,0 +1,68 @@
+{
+    "experiment": "TUNE_WORD_FINE_7",
+    "rnn_type": "LSTM",
+    "bidirectional": false,
+    "epochs": 6,
+    "patience": 3,
+    "min_delta": 0.0001,
+    "lr": 0.0005,
+    "warmup_epochs": 1,
+    "weight_decay": 0.0001,
+    "dropout": 0.2,
+    "emb_dim": 512,
+    "hidden_dim": 1024,
+    "batch_size": 128,
+    "grad_accum_steps": 4,
+    "clip": 1.0,
+    "tf_start": 1.0,
+    "tf_end": 0.7,
+    "tf_decay_mode": "linear",
+    "attention_type": "none",
+    "token_type": "word",
+    "embedding_source": "word2vec",
+    "freeze_emb": true,
+    "src_lang": "en",
+    "trg_lang": "de",
+    "resume": true,
+    "precision": "auto",
+    "train_time": 104.8,
+    "best_val_loss": 6.853507041931152,
+    "val_loss": 6.853507041931152,
+    "epochs_trained": 1,
+    "loss_history": {
+        "train": [
+            7.041591167449951,
+            6.0000810623168945,
+            5.261351585388184,
+            4.8964643478393555
+        ],
+        "val": [
+            6.853507041931152,
+            7.756470680236816,
+            8.00670051574707,
+            7.899094104766846
+        ],
+        "lr": [
+            0.0001,
+            0.0005,
+            0.00045320916362186214,
+            0.00033070916362186215
+        ],
+        "tf_ratio": [
+            1.0,
+            0.94,
+            0.88,
+            0.82
+        ]
+    },
+    "hardware_precision": "bf16",
+    "gpu_name": "NVIDIA GeForce RTX 4090",
+    "vram_model_mb": 611.82,
+    "vram_gradients_mb": 465.39,
+    "vram_optimizer_mb": 930.79,
+    "vram_activations_mb": 10171.21,
+    "vram_allocated_mb": 4068.94,
+    "vram_reserved_mb": 17002.0,
+    "vram_peak_mb": 12179.22,
+    "vram_peak_gb": 16.604
+}
