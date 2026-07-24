@@ -1493,6 +1493,14 @@ def main():
         action="store_true",
         help="Skip data preprocessing step if cached dataset files exist",
     )
+    parser.add_argument(
+        "--auto_shutdown",
+        action="store_true",
+        help="Stop this RunPod pod via the RunPod API once the pipeline finishes "
+             "successfully, to avoid paying for idle GPU time. Safe with data on a "
+             "persistent Network Volume. Only fires on a clean full completion - an "
+             "exception anywhere in the pipeline skips it. Off by default.",
+    )
 
     args = parser.parse_args()
 
@@ -1514,6 +1522,10 @@ def main():
         " CLUSTER"
     )
     print("═" * 80 + "\n")
+
+    if args.auto_shutdown:
+        from auto_shutdown import stop_this_pod
+        stop_this_pod()
 
 
 if __name__ == "__main__":
