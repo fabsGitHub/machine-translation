@@ -1307,18 +1307,35 @@ def execute_study_e(
 
 
 def run_pipeline_for_token_type(target_token_type, args):
-    """Executes the full pipeline for a single target token type (word or char)."""
+    """Executes the full pipeline for a single target token type (word or char).
+
+    Epoch/trial budget is split between "search" stages (tuning - only need to rank
+    configs relative to each other, not reach good absolute quality) and "report"
+    stages (Studies A-E - these ARE the numbers that go in the report, so they get
+    more training depth). Fine-tuning specifically gets fewer trials than coarse:
+    it re-searches the identical lr/dropout/emb_dim/hidden_dim grid coarse tuning
+    already sampled, just restricted to Study C's single winning architecture
+    instead of three, so it needs less exploration, not more.
+    """
     # Dynamic epoch schedule definitions
-    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 5
-    TUNE_2_EPOCHS = args.epochs if args.epochs is not None else 6
-    STUDY_ABC_EPOCHS = args.epochs if args.epochs is not None else 6
-    STUDY_DE_EPOCHS = args.epochs if args.epochs is not None else 6
+    TUNE_1_EPOCHS = args.epochs if args.epochs is not None else 4
+    TUNE_2_EPOCHS = args.epochs if args.epochs is not None else 5
+    STUDY_A_EPOCHS = args.epochs if args.epochs is not None else 8
+    STUDY_B_EPOCHS = args.epochs if args.epochs is not None else 8
+    # Study C's winner determines every downstream stage (fine-tuning, D, E) - a noisy
+    # pick here cascades, so it gets extra margin beyond A/B.
+    STUDY_C_EPOCHS = args.epochs if args.epochs is not None else 10
+    # Study D/E are the final deliverable models AND D2 (DE->EN) + E1 (EN->SV) feed the
+    # pivot evaluation chain directly - undertraining here caps pivot quality too.
+    STUDY_DE_EPOCHS = args.epochs if args.epochs is not None else 10
 
     print("\n" + "═" * 80)
     print(f"🚀 EXECUTING PIPELINE FOR TOKEN LEVEL: {target_token_type.upper()}")
     print(
         f"   Mode: {args.study.upper()}"
-        f" | Dynamic Epoch Strategy: [Tune1: {TUNE_1_EPOCHS}, Studies A-C: {STUDY_ABC_EPOCHS}, Tune2: {TUNE_2_EPOCHS}, Studies D-E: {STUDY_DE_EPOCHS}]"
+        f" | Epoch Strategy: [Tune-coarse: {TUNE_1_EPOCHS} ({args.tune_trials} trials),"
+        f" A: {STUDY_A_EPOCHS}, B: {STUDY_B_EPOCHS}, C: {STUDY_C_EPOCHS},"
+        f" Tune-fine: {TUNE_2_EPOCHS} ({args.fine_tune_trials} trials), D/E: {STUDY_DE_EPOCHS}]"
         f" | GPUs: {torch.cuda.device_count() if torch.cuda.is_available() else 0}"
     )
     print("═" * 80 + "\n")
@@ -1340,13 +1357,13 @@ def run_pipeline_for_token_type(target_token_type, args):
 
     # 2. Studies A, B, C - 6 Epochs
     if args.study in ["all", "A"]:
-        execute_study_a(STUDY_ABC_EPOCHS, target_token_type, eval_queue)
+        execute_study_a(STUDY_A_EPOCHS, target_token_type, eval_queue)
 
     best_settings = get_best_empirical_settings(target_token_type)
 
     if args.study in ["all", "B"]:
         execute_study_b(
-            STUDY_ABC_EPOCHS,
+            STUDY_B_EPOCHS,
             best_settings["rnn_type"],
             best_settings["bidirectional"],
             target_token_type,
@@ -1357,7 +1374,7 @@ def run_pipeline_for_token_type(target_token_type, args):
 
     if args.study in ["all", "C"]:
         execute_study_c(
-            STUDY_ABC_EPOCHS,
+            STUDY_C_EPOCHS,
             target_token_type,
             best_settings["rnn_type"],
             best_settings["bidirectional"],
@@ -1373,8 +1390,8 @@ def run_pipeline_for_token_type(target_token_type, args):
             stage="fine",
             token_type=target_token_type,
             epochs=TUNE_2_EPOCHS,
-            num_trials=args.tune_trials,
-            configs_per_rnn=args.configs_per_rnn,
+            num_trials=args.fine_tune_trials,
+            configs_per_rnn=None,
         )
 
     best_settings = get_best_empirical_settings(target_token_type)
@@ -1454,7 +1471,16 @@ def main():
         "--tune_trials",
         type=int,
         default=12,
-        help="Total number of hyperparameter search trials (e.g. 12 trials)",
+        help="Number of coarse hyperparameter search trials, split across RNN/GRU/LSTM (e.g. 12 trials)",
+    )
+    parser.add_argument(
+        "--fine_tune_trials",
+        type=int,
+        default=6,
+        help="Number of fine hyperparameter search trials for the single Study C winner "
+             "architecture. Deliberately decoupled from --tune_trials: fine-tuning re-searches "
+             "the same lr/dropout/emb_dim/hidden_dim grid coarse tuning already sampled, just "
+             "for one fixed architecture instead of three, so it needs fewer trials.",
     )
     parser.add_argument(
         "--configs_per_rnn",
