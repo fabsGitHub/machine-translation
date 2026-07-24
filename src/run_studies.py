@@ -694,6 +694,9 @@ def execute_tuning(
 
     for idx, (lr, drop, emb_d, hid_d, rnn, attn, bidi, emb_src, freeze) in enumerate(selected_trials, 1):
         exp_id = f"TUNE_{token_type.upper()}_{stage.upper()}_{idx}"
+        ckpt_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_id}_{rnn}.pt")
+        cfg_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_id}_{rnn}.json")
+
         print(
             f"\n🧪 [Trial {idx}/{len(selected_trials)}] -> LR={lr}, Dropout={drop},"
             f" Emb={emb_d}, Hidden={hid_d}, Cell={rnn}, Attn={attn}, BiDir={bidi}"
@@ -733,15 +736,19 @@ def execute_tuning(
         ]
 
         try:
-            run_cmd(cmd)
+            if is_cache_valid(ckpt_path, cfg_path):
+                print(
+                    f"📦 [Cache Hit] Trial {idx} ({exp_id}) already completed."
+                    " Skipping training."
+                )
+            else:
+                run_cmd(cmd)
+
             status = "Success"
 
-            json_cfg_file = os.path.join(
-                OUTPUT_DIR, f"best_config_{exp_id}_{rnn}.json"
-            )
             val_loss = float("inf")
-            if os.path.exists(json_cfg_file):
-                with open(json_cfg_file, "r", encoding="utf-8") as f:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
                     cdata = json.load(f)
                     val_loss = float(
                         cdata.get("best_val_loss", cdata.get("val_loss", 999.0))
