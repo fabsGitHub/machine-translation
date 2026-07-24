@@ -3,8 +3,14 @@ Standalone throughput/VRAM microbenchmark for the NMT training step, isolated fr
 run_studies.py / train.py's full CLI (checkpointing, DDP launch, eval backfill) so
 timing reflects only the actual train_epoch work under different configs.
 
-Run from the src/ directory: ../.venv/bin/python ../bench.py <variant>
-Variants: baseline, threads_scoped, workers2, workers4, workers6, noamp, compile, compile_off
+Run from the repo root: .venv/bin/python bench.py <variant> [options]
+Variants: baseline, threads_scoped, workers2, workers4, workers6, noamp, compile_on, compile_off
+
+Model-shape options (so different Study A-E configs' VRAM/throughput can be checked
+individually - a fixed batch_size in run_studies.py gets applied to every experiment
+in a sweep, so the worst-case config, not just the default one, needs to fit):
+  --rnn_type {RNN,GRU,LSTM}  --bidirectional {true,false}
+  --attention_type {none,luong,bahdanau}  --emb_dim N  --hidden_dim N
 """
 import os
 import sys
@@ -25,6 +31,12 @@ parser.add_argument("variant", choices=[
 parser.add_argument("--steps", type=int, default=40)
 parser.add_argument("--warmup", type=int, default=5)
 parser.add_argument("--batch_size", type=int, default=64)
+parser.add_argument("--rnn_type", type=str, default="LSTM", choices=["RNN", "GRU", "LSTM"])
+parser.add_argument("--bidirectional", type=lambda v: v.lower() != "false", default=True)
+parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
+parser.add_argument("--emb_dim", type=int, default=256)
+parser.add_argument("--hidden_dim", type=int, default=512)
+parser.add_argument("--token_type", type=str, default="word", choices=["word", "char"])
 args = parser.parse_args()
 
 # Import AFTER deciding whether to patch torch.set_num_threads, since dataset.py
@@ -47,13 +59,14 @@ num_workers = num_workers_map.get(args.variant, 8)
 train_csv = "data/processed/train_de_en.csv"
 train_loader, src_vocab, trg_vocab = get_dataloader(
     train_csv, batch_size=args.batch_size, shuffle=True,
-    src_lang="de", trg_lang="en", token_type="word",
+    src_lang="de", trg_lang="en", token_type=args.token_type,
     num_workers=num_workers,
 )
 
-emb_dim, hidden_dim = 256, 512
-encoder = Encoder(len(src_vocab), emb_dim, hidden_dim, 2, 0.3, "LSTM", True)
-decoder = Decoder(len(trg_vocab), emb_dim, hidden_dim * 2, hidden_dim, 2, 0.3, "LSTM", "none")
+emb_dim, hidden_dim = args.emb_dim, args.hidden_dim
+num_directions = 2 if args.bidirectional else 1
+encoder = Encoder(len(src_vocab), emb_dim, hidden_dim, 2, 0.3, args.rnn_type, args.bidirectional)
+decoder = Decoder(len(trg_vocab), emb_dim, hidden_dim * num_directions, hidden_dim, 2, 0.3, args.rnn_type, args.attention_type)
 model = Seq2Seq(encoder, decoder, device).to(device)
 
 use_compile = args.variant == "compile_on"
@@ -67,6 +80,8 @@ scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
 print(f"=== variant={args.variant} device={device} num_workers={num_workers} "
       f"batch_size={args.batch_size} amp={use_amp} compile={use_compile} "
+      f"rnn_type={args.rnn_type} bidirectional={args.bidirectional} "
+      f"attention_type={args.attention_type} emb_dim={emb_dim} hidden_dim={hidden_dim} "
       f"torch_num_threads={torch.get_num_threads()} ===")
 
 if device.type == "cuda":
