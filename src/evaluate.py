@@ -221,6 +221,15 @@ def generate_all_reports(token_type="word", output_dir=None):
             if token_type and data.get("token_type", "word") != token_type:
                 continue
 
+            # Skip stage-level bookkeeping files (e.g. best_config_TUNE_CHAR_
+            # COARSE.json, written by run_studies.py's execute_tuning() to
+            # record which hyperparameters won a tuning stage) - they have no
+            # "experiment" key at all (real per-experiment files always do,
+            # via vars(args) in train.py), so they'd otherwise show up as a
+            # garbage "N/A" row full of NaN in the aggregated report.
+            if not data.get("experiment"):
+                continue
+
             records.append({
                 "Experiment": data.get("experiment", "N/A"),
                 "RNN Type": data.get("rnn_type", "LSTM"),
