@@ -432,6 +432,20 @@ def main():
     if start_epoch >= args.epochs:
         if rank == 0:
             print(f"📦 Checkpoint already fully trained ({start_epoch}/{args.epochs} epochs). Skipping epoch loop.")
+            # Close a narrow race: if a prior invocation crashed after its last
+            # epoch but before reaching the post-loop sync below, "completed"
+            # would never get set even though training genuinely finished -
+            # start_epoch >= args.epochs is proof enough on its own.
+            if os.path.exists(config_json_path):
+                try:
+                    with open(config_json_path, 'r') as f:
+                        c_data = json.load(f)
+                    if not c_data.get("completed"):
+                        c_data["completed"] = True
+                        with open(config_json_path, 'w') as f:
+                            json.dump(c_data, f, indent=4)
+                except Exception:
+                    pass
     else:
         for epoch in range(start_epoch, args.epochs):
             if is_distributed and train_sampler is not None:
@@ -494,13 +508,24 @@ def main():
 
         # Sync the complete per-epoch history (including any epochs after the
         # last improvement) into the saved config, so best_config_*.json reflects
-        # the whole run rather than stopping at the last checkpoint save.
+        # the whole run rather than stopping at the last checkpoint save. Also
+        # mark "completed": True here - this is the only place that means "the
+        # full requested epoch budget actually finished" (the save-on-improve
+        # block above fires after epoch 1 too, long before the run is done).
+        # is_cache_valid() in utils.py reads this flag to decide whether
+        # run_studies.py can skip an already-finished experiment on a restart
+        # after a crash - without it, every already-completed experiment gets
+        # needlessly relaunched and (for non-TUNE_ experiments) has its full
+        # test-set BLEU/METEOR re-evaluated from scratch every time the
+        # pipeline is re-run, even though train.py's own start_epoch check
+        # already protects the actual training work from being redone.
         if rank == 0 and os.path.exists(config_json_path):
             try:
                 with open(config_json_path, 'r') as f:
                     c_data = json.load(f)
                 c_data["loss_history"] = loss_history
                 c_data["epochs_trained"] = len(loss_history["train"])
+                c_data["completed"] = True
                 with open(config_json_path, 'w') as f:
                     json.dump(c_data, f, indent=4)
             except Exception:
