@@ -1,30 +1,25 @@
-import argparse
-import json
-import math
 import os
-import random
+import json
+import yaml
+import argparse
 import time
+import random
+import numpy as np
+import pandas as pd
 import torch
-
-# Enable TensorFloat-32 (TF32) for Ampere Tensor Cores immediately at startup
-torch.set_float32_matmul_precision('high')
-
-import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Sampler
-from utils import set_seed, setup_logging
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data import Sampler, DataLoader, Subset
 
-from config import load_config
-from dataset import PAD_IDX, get_dataloader
-from embeddings import generate_word2vec_embeddings, load_glove_embeddings_pair
-from models import Decoder, Encoder, Seq2Seq
+from dataset import get_dataloader, PAD_IDX
+from models import Encoder, Decoder, Seq2Seq
+from utils import load_config, set_seed
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 OUTPUT_DIR = os.path.join(ROOT_DIR, "data", "results")
-
 
 class DistributedBatchSamplerWrapper(Sampler):
     def __init__(self, batch_sampler, num_replicas, rank, shuffle=True):
@@ -40,7 +35,8 @@ class DistributedBatchSamplerWrapper(Sampler):
             self.batch_sampler.set_epoch(epoch)
 
     def __iter__(self):
-        rng = random.Random(self.epoch + 42 + self.rank)
+        # Seed MUST be identical across all ranks so every process shuffles the list identically!
+        rng = random.Random(self.epoch + 42)
         batches = list(self.batch_sampler)
         if self.shuffle:
             rng.shuffle(batches)
@@ -53,179 +49,26 @@ class DistributedBatchSamplerWrapper(Sampler):
             yield batches[i]
 
     def __len__(self):
+        import math
         return math.ceil(len(self.batch_sampler) / self.num_replicas)
 
-
-def unwrap_model(model):
-    """Recursively unwraps DistributedDataParallel and torch.compile wrappers."""
-    while hasattr(model, "module") or hasattr(model, "_orig_mod"):
-        if hasattr(model, "module"):
-            model = model.module
-        if hasattr(model, "_orig_mod"):
-            model = model._orig_mod
-    return model
-
-
-def get_clean_state_dict(model):
-    raw_model = unwrap_model(model)
-    state_dict = raw_model.state_dict()
-    clean_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    return clean_dict
-
-
 def str2bool(v):
-    if isinstance(v, bool): 
-        return v
+    if isinstance(v, bool): return v
     return v.lower() in ('yes', 'true', 't', 'y', '1')
-
-
-def setup_hardware_precision(device, precision_arg="auto"):
-    """
-    Dynamically configures hardware precision (FP32, FP16 AMP, BF16 AMP) 
-    and hardware features (TF32, torch.compile) based on CUDA Compute Capability.
-    """
-    if device.type != "cuda":
-        return "fp32", torch.float32, None, False, False
-
-    major_cap, minor_cap = torch.cuda.get_device_capability(device)
-    supports_tf32 = False
-    
-    if major_cap >= 8:
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        supports_tf32 = True
-
-    if precision_arg == "auto":
-        if major_cap >= 8 and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-            chosen_precision = "bf16"
-        elif major_cap >= 7:
-            chosen_precision = "fp16"
-        else:
-            chosen_precision = "fp32"
-    else:
-        chosen_precision = precision_arg.lower()
-
-    if chosen_precision == "fp16":
-        autocast_dtype = torch.float16
-        scaler = torch.amp.GradScaler("cuda")
-    elif chosen_precision == "bf16":
-        autocast_dtype = torch.bfloat16
-        scaler = None
-    else:
-        chosen_precision = "fp32"
-        autocast_dtype = torch.float32
-        scaler = None
-
-    supports_compile = (major_cap >= 7) and hasattr(torch, "compile")
-    return chosen_precision, autocast_dtype, scaler, supports_compile, supports_tf32
-
-
-def get_vram_breakdown(model, optimizer, device):
-    """Calculates PyTorch CUDA tensor memory allocation breakdown."""
-    if not torch.cuda.is_available() or device.type != "cuda":
-        return {
-            "gpu_name": "CPU",
-            "vram_model_mb": 0.0,
-            "vram_gradients_mb": 0.0,
-            "vram_optimizer_mb": 0.0,
-            "vram_activations_mb": 0.0,
-            "vram_allocated_mb": 0.0,
-            "vram_reserved_mb": 0.0,
-            "vram_peak_mb": 0.0,
-            "vram_peak_gb": 0.0
-        }
-    
-    raw_model = unwrap_model(model)
-    
-    model_bytes = sum(p.numel() * p.element_size() for p in raw_model.parameters())
-    grad_bytes = sum(p.grad.numel() * p.grad.element_size() for p in raw_model.parameters() if p.grad is not None)
-    
-    opt_bytes = 0
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                opt_bytes += v.numel() * v.element_size()
-                
-    allocated_bytes = torch.cuda.memory_allocated(device)
-    peak_allocated_bytes = torch.cuda.max_memory_allocated(device)
-    peak_reserved_bytes = torch.cuda.max_memory_reserved(device)
-    
-    model_mb = model_bytes / (1024 ** 2)
-    grad_mb = grad_bytes / (1024 ** 2)
-    opt_mb = opt_bytes / (1024 ** 2)
-    peak_allocated_mb = peak_allocated_bytes / (1024 ** 2)
-    peak_reserved_mb = peak_reserved_bytes / (1024 ** 2)
-    
-    activations_mb = max(0.0, peak_allocated_mb - (model_mb + grad_mb + opt_mb))
-    gpu_name = torch.cuda.get_device_name(device)
-    
-    return {
-        "gpu_name": gpu_name,
-        "vram_model_mb": round(model_mb, 2),
-        "vram_gradients_mb": round(grad_mb, 2),
-        "vram_optimizer_mb": round(opt_mb, 2),
-        "vram_activations_mb": round(activations_mb, 2),
-        "vram_allocated_mb": round(allocated_bytes / (1024 ** 2), 2),
-        "vram_reserved_mb": round(peak_reserved_mb, 2),
-        "vram_peak_mb": round(peak_allocated_mb, 2),
-        "vram_peak_gb": round(peak_reserved_bytes / (1024 ** 3), 3)
-    }
-
-
-def configure_param_groups(model, weight_decay=1e-4):
-    """
-    Separates parameters into 2D weight matrices (weight decay enabled)
-    and 1D bias, norm, or embedding parameters (weight decay disabled).
-    """
-    decay_params = []
-    no_decay_params = []
-    
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        # 1D tensors (biases, layer norms) or embedding lookup tables
-        if param.ndim <= 1 or "embedding" in name.lower() or "emb" in name.lower():
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
-            
-    return [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0}
-    ]
-
-
-def compute_scheduled_tf_ratio(epoch, total_epochs, initial_tf=1.0, final_tf=0.7, mode="linear"):
-    """Calculates scheduled teacher forcing ratio per epoch."""
-    if total_epochs <= 1:
-        return initial_tf
-    progress = epoch / max(1, total_epochs - 1)
-    if mode == "exponential":
-        return initial_tf * ((final_tf / initial_tf) ** progress)
-    else:  # Linear decay
-        return initial_tf - progress * (initial_tf - final_tf)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Unified Seq2Seq NMT Training Interface")
     parser.add_argument("--experiment", type=str, required=True)
     parser.add_argument("--rnn_type", type=str, default="LSTM", choices=["RNN", "LSTM", "GRU"])
     parser.add_argument("--bidirectional", type=str2bool, default=True)
-    parser.add_argument("--epochs", type=int, default=5, help="Total training epochs (default set to 5)")
-    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience (epochs without loss improvement)")
-    parser.add_argument("--min_delta", type=float, default=1e-4, help="Minimum validation loss change to count as improvement")
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--warmup_epochs", type=int, default=1, help="Warmup epochs for LR scheduler (1 epoch default for 5-epoch run)")
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Gradient accumulation steps")
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--clip", type=float, default=1.0)
-    parser.add_argument("--tf_start", type=float, default=1.0, help="Initial teacher forcing ratio")
-    parser.add_argument("--tf_end", type=float, default=0.7, help="Final teacher forcing ratio (0.3 tuned for ~5 epochs)")
-    parser.add_argument("--tf_decay_mode", type=str, default="linear", choices=["linear", "exponential"])
+    parser.add_argument("--tf_ratio", type=float, default=0.5)
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
     parser.add_argument("--token_type", type=str, default="word", choices=["word", "char"])
     parser.add_argument("--embedding_source", type=str, default="scratch", choices=["scratch", "word2vec", "glove"])
@@ -233,116 +76,152 @@ def parse_args():
     parser.add_argument("--src_lang", type=str, default="de")
     parser.add_argument("--trg_lang", type=str, default="en")
     parser.add_argument("--resume", type=str2bool, default=True, help="Resume from existing checkpoint if present")
-    parser.add_argument("--precision", type=str, default="auto", choices=["auto", "fp32", "fp16", "bf16"])
+    
+    # Subsampling Controls
+    parser.add_argument("--eval_max_samples", type=int, default=1000, 
+                        help="Max samples for backfill test evaluation script (default: 1000)")
+    parser.add_argument("--val_max_samples", type=int, default=None, 
+                        help="Max samples for per-epoch validation split (default: None for full val)")
     return parser.parse_args()
+    
+def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=False):
+    try:
+        from gensim.models import Word2Vec
+        if not silent:
+            print(f"⌛ Building Word2Vec representations for column: '{lang_col}'...")
+        df = pd.read_csv(csv_path)
+        sentences = [vocab.tokenize(str(text)) for text in df[lang_col].tolist()]
+        w2v_model = Word2Vec(sentences=sentences, vector_size=emb_dim, window=5, min_count=1, workers=4)
+        weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
+        for word, idx in vocab.stoi.items():
+            if word in w2v_model.wv:
+                weight_matrix[idx] = w2v_model.wv[word]
+        return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
+    except Exception as e:
+        if not silent:
+            print(f"⚠️ Word2Vec skipped ({e}). Defaulting to standard distributions.")
+        return None
 
+def load_glove_embeddings(vocab, glove_file_path, emb_dim, silent=False):
+    if not silent:
+        print(f"⌛ Mapping GloVe embeddings from {glove_file_path} to vocabulary...")
+    weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
+    glove_cache_bin = glove_file_path + ".matrix_cache.pt"
+    
+    if os.path.exists(glove_cache_bin):
+        glove_dict = torch.load(glove_cache_bin, weights_only=False)
+    else:
+        if not os.path.exists(glove_file_path):
+            if not silent:
+                print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
+            return torch.tensor(weight_matrix, dtype=torch.float32)
+        glove_dict = {}
+        with open(glove_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == emb_dim + 1:
+                    glove_dict[parts[0]] = np.array(parts[1:], dtype=np.float32)
+        try:
+            torch.save(glove_dict, glove_cache_bin)
+        except Exception:
+            pass
 
-def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, 
-                scaler=None, autocast_dtype=torch.float32, vram_stats_out=None, grad_accum_steps=1):
+    for word, idx in vocab.stoi.items():
+        if word in glove_dict:
+            weight_matrix[idx] = glove_dict[word]
+    return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
+
+def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None):
     model.train()
-    epoch_loss_tensor = torch.zeros((), device=device)
-    optimizer.zero_grad(set_to_none=True)
-    
-    use_amp = (device.type == "cuda") and (autocast_dtype in (torch.float16, torch.bfloat16))
-    
-    for batch_idx, (src, trg) in enumerate(dataloader):
+    epoch_loss = 0
+    for src, trg in dataloader:
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
-        
-        if batch_idx == 1 and device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-        
-        if use_amp:
-            with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None and device.type == "cuda":
+            with torch.amp.autocast(device_type=device.type):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
                 output_dim = output.shape[-1]
-                output_flat = output[:, 1:].reshape(-1, output_dim)
-                trg_flat = trg[:, 1:].reshape(-1)
-
-                loss = criterion(output_flat, trg_flat)
-                loss = loss / grad_accum_steps
                 
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-                
-            if batch_idx == 1 and vram_stats_out is not None:
-                with torch.no_grad():
-                    vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
-                
-            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-                    scaler.step(optimizer)
-                    scaler.update()
+                # Check whether output includes prediction for <sos> or aligns dynamically
+                if output.shape[1] == trg.shape[1]:
+                    output = output[:, :-1].reshape(-1, output_dim)
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                    output = output.reshape(-1, output_dim)
+                    
+                trg = trg[:, 1:].reshape(-1)
+                loss = criterion(output, trg)
+                
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            scaler.step(optimizer)
+            scaler.update()
         else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
             output_dim = output.shape[-1]
-            output_flat = output[:, 1:].reshape(-1, output_dim)
-            trg_flat = trg[:, 1:].reshape(-1)
-
-            loss = criterion(output_flat, trg_flat)
-            loss = loss / grad_accum_steps
-            loss.backward()
             
-            if batch_idx == 1 and vram_stats_out is not None and device.type == "cuda":
-                with torch.no_grad():
-                    vram_stats_out.update(get_vram_breakdown(model, optimizer, device))
+            # Check whether output includes prediction for <sos> or aligns dynamically
+            if output.shape[1] == trg.shape[1]:
+                output = output[:, :-1].reshape(-1, output_dim)
+            else:
+                output = output.reshape(-1, output_dim)
                 
-            if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(dataloader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+            trg = trg[:, 1:].reshape(-1)
+            loss = criterion(output, trg)
             
-        epoch_loss_tensor += (loss.detach() * grad_accum_steps)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            optimizer.step()
+        epoch_loss += loss.item()
     
-    total_loss = (epoch_loss_tensor / len(dataloader)).item()
+    total_loss = epoch_loss / len(dataloader)
     
     if dist.is_initialized() and dist.get_world_size() > 1:
         loss_tensor = torch.tensor(total_loss, device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        return (loss_tensor / dist.get_world_size()).item()
+        return loss_tensor.item() / dist.get_world_size()
     
     return total_loss
 
-
-def evaluate_validation(model, dataloader, criterion, device, autocast_dtype=torch.float32):
+def evaluate_validation(model, dataloader, criterion, device):
     model.eval()
-    epoch_loss_tensor = torch.zeros((), device=device)
-    use_amp = (device.type == "cuda") and (autocast_dtype in (torch.float16, torch.bfloat16))
-
+    epoch_loss = 0
     with torch.no_grad():
         for src, trg in dataloader:
             src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
-            if use_amp:
-                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+            if device.type == "cuda":
+                with torch.amp.autocast(device_type=device.type):
                     output = model(src, trg, teacher_forcing_ratio=0.0)
                     output_dim = output.shape[-1]
-                    output_flat = output[:, 1:].reshape(-1, output_dim)
-                    trg_flat = trg[:, 1:].reshape(-1)
-                    loss = criterion(output_flat, trg_flat)
+                    
+                    if output.shape[1] == trg.shape[1]:
+                        output = output[:, :-1].reshape(-1, output_dim)
+                    else:
+                        output = output.reshape(-1, output_dim)
+                        
+                    trg = trg[:, 1:].reshape(-1)
+                    loss = criterion(output, trg)
             else:
                 output = model(src, trg, teacher_forcing_ratio=0.0)
                 output_dim = output.shape[-1]
-                output_flat = output[:, 1:].reshape(-1, output_dim)
-                trg_flat = trg[:, 1:].reshape(-1)
-                loss = criterion(output_flat, trg_flat)
-            epoch_loss_tensor += loss.detach()
+                
+                if output.shape[1] == trg.shape[1]:
+                    output = output[:, :-1].reshape(-1, output_dim)
+                else:
+                    output = output.reshape(-1, output_dim)
+                    
+                trg = trg[:, 1:].reshape(-1)
+                loss = criterion(output, trg)
+            epoch_loss += loss.item()
             
-    total_loss = (epoch_loss_tensor / len(dataloader)).item()
+    total_loss = epoch_loss / len(dataloader)
     
     if dist.is_initialized() and dist.get_world_size() > 1:
         loss_tensor = torch.tensor(total_loss, device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-        return (loss_tensor / dist.get_world_size()).item()
+        return loss_tensor.item() / dist.get_world_size()
         
     return total_loss
-
 
 def main():
     args = parse_args()
@@ -360,12 +239,8 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
     else:
         device = torch.device("cpu")
-
-    chosen_precision, autocast_dtype, scaler, can_compile, supports_tf32 = setup_hardware_precision(device, args.precision)
         
     set_seed(42 + rank)
     
@@ -378,26 +253,48 @@ def main():
     train_csv = os.path.join(processed_dir, f"train_{args.src_lang}_{args.trg_lang}.csv")
     val_csv = os.path.join(processed_dir, f"val_{args.src_lang}_{args.trg_lang}.csv")
 
+    if not os.path.exists(train_csv):
+        legacy_suffix = "_sv" if (args.src_lang == "sv" or args.trg_lang == "sv") else ""
+        legacy_train = os.path.join(processed_dir, f"train{legacy_suffix}.csv")
+        legacy_val = os.path.join(processed_dir, f"val{legacy_suffix}.csv")
+        
+        if os.path.exists(legacy_train):
+            train_csv, val_csv = legacy_train, legacy_val
+        else:
+            train_csv = os.path.join(processed_dir, "train.csv")
+            val_csv = os.path.join(processed_dir, "val.csv")
+
     if rank == 0:
-        exp_tag = args.experiment if f"_{args.rnn_type}" in args.experiment else f"{args.experiment}_{args.rnn_type}"
-        setup_logging(log_filename=f"train_{exp_tag}.log", log_dir=OUTPUT_DIR, rank=rank)
         print(f"📁 Resolving train split: {train_csv}")
         print(f"📁 Resolving val split:   {val_csv}")
 
-    num_workers = 8
+    raw_train_loader, src_vocab, trg_vocab = get_dataloader(
+        train_csv, batch_size=args.batch_size, shuffle=True, 
+        src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
+    )
+    raw_val_loader, _, _ = get_dataloader(
+        val_csv, batch_size=args.batch_size, shuffle=False, 
+        src_vocab=src_vocab, trg_vocab=trg_vocab, 
+        src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
+    )
+    
+    # Validation Subsampling Logic (Optional)
+    if args.val_max_samples and args.val_max_samples < len(raw_val_loader.dataset):
+        if rank == 0:
+            print(f"⚡ Subsampling validation set: randomly sampling {args.val_max_samples}/{len(raw_val_loader.dataset)} items.")
+        random.seed(42)
+        val_indices = random.sample(range(len(raw_val_loader.dataset)), args.val_max_samples)
+        raw_val_loader = DataLoader(
+            Subset(raw_val_loader.dataset, val_indices),
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=raw_val_loader.collate_fn,
+            num_workers=raw_val_loader.num_workers,
+            pin_memory=raw_val_loader.pin_memory,
+            persistent_workers=(raw_val_loader.num_workers > 0)
+        )
+
     if is_distributed:
-        raw_train_loader, src_vocab, trg_vocab = get_dataloader(
-            train_csv, batch_size=args.batch_size, shuffle=True, 
-            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
-            num_workers=0
-        )
-        raw_val_loader, _, _ = get_dataloader(
-            val_csv, batch_size=args.batch_size, shuffle=False, 
-            src_vocab=src_vocab, trg_vocab=trg_vocab, 
-            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
-            num_workers=0
-        )
-        
         train_sampler = DistributedBatchSamplerWrapper(
             raw_train_loader.batch_sampler, num_replicas=world_size, rank=rank, shuffle=True
         )
@@ -409,117 +306,86 @@ def main():
             raw_train_loader.dataset,
             batch_sampler=train_sampler,
             collate_fn=raw_train_loader.collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
+            num_workers=raw_train_loader.num_workers,
+            pin_memory=raw_train_loader.pin_memory,
+            persistent_workers=(raw_train_loader.num_workers > 0)
         )
         val_loader = DataLoader(
             raw_val_loader.dataset,
             batch_sampler=val_sampler,
             collate_fn=raw_val_loader.collate_fn,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True
+            num_workers=raw_val_loader.num_workers,
+            pin_memory=raw_val_loader.pin_memory,
+            persistent_workers=(raw_val_loader.num_workers > 0)
         )
     else:
+        train_loader = raw_train_loader
+        val_loader = raw_val_loader
         train_sampler = None
         val_sampler = None
-        train_loader, src_vocab, trg_vocab = get_dataloader(
-            train_csv, batch_size=args.batch_size, shuffle=True, 
-            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
-            num_workers=num_workers
-        )
-        val_loader, _, _ = get_dataloader(
-            val_csv, batch_size=args.batch_size, shuffle=False, 
-            src_vocab=src_vocab, trg_vocab=trg_vocab, 
-            src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type,
-            num_workers=num_workers
-        )
     
     pretrained_src_emb, pretrained_trg_emb = None, None
     silent_logging = rank > 0
-    pair_prefix = f"{args.src_lang}_{args.trg_lang}"
     
     if args.embedding_source == "word2vec":
-        pretrained_src_emb = generate_word2vec_embeddings(
-            src_vocab, train_csv, lang=args.src_lang, emb_dim=300, silent=silent_logging, pair_prefix=pair_prefix
-        )
-        pretrained_trg_emb = generate_word2vec_embeddings(
-            trg_vocab, train_csv, lang=args.trg_lang, emb_dim=300, silent=silent_logging, pair_prefix=pair_prefix
-        )
+        pretrained_src_emb = generate_word2vec_embeddings(src_vocab, train_csv, args.src_lang, args.emb_dim, silent=silent_logging)
+        pretrained_trg_emb = generate_word2vec_embeddings(trg_vocab, train_csv, args.trg_lang, args.emb_dim, silent=silent_logging)
     elif args.embedding_source == "glove":
-        glove_dir = os.path.join(ROOT_DIR, "data")
-        pretrained_src_emb, pretrained_trg_emb = load_glove_embeddings_pair(
-            src_vocab, trg_vocab, src_lang=args.src_lang, trg_lang=args.trg_lang, 
-            emb_dim=300, glove_dir=glove_dir, silent=silent_logging
-        )
+        glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
+        pretrained_src_emb = load_glove_embeddings(src_vocab, glove_path, 300, silent=silent_logging)
+        pretrained_trg_emb = load_glove_embeddings(trg_vocab, glove_path, 300, silent=silent_logging)
         
     num_directions = 2 if args.bidirectional else 1
-
-    src_vocab_size = src_vocab.padded_size if hasattr(src_vocab, 'padded_size') else len(src_vocab)
-    trg_vocab_size = trg_vocab.padded_size if hasattr(trg_vocab, 'padded_size') else len(trg_vocab)
-
-    pretrained_src_dim = pretrained_src_emb.shape[1] if pretrained_src_emb is not None else None
-    pretrained_trg_dim = pretrained_trg_emb.shape[1] if pretrained_trg_emb is not None else None
-
     encoder = Encoder(
-        src_vocab_size, args.emb_dim, args.hidden_dim, 2, args.dropout, 
+        len(src_vocab), args.emb_dim, args.hidden_dim, 2, args.dropout, 
         args.rnn_type, args.bidirectional, pretrained_src_emb, args.freeze_emb, 
-        custom_emb_dim=pretrained_src_dim
+        300 if args.embedding_source == "glove" else None
     )
     decoder = Decoder(
-        trg_vocab_size, args.emb_dim, args.hidden_dim * num_directions, args.hidden_dim, 2, 
+        len(trg_vocab), args.emb_dim, args.hidden_dim * num_directions, args.hidden_dim, 2, 
         args.dropout, args.rnn_type, args.attention_type, pretrained_trg_emb, args.freeze_emb, 
-        custom_emb_dim=pretrained_trg_dim
+        300 if args.embedding_source == "glove" else None
     )
     
     model = Seq2Seq(encoder, decoder, device).to(device)
 
+    # ------------------------------------------------------------------------
+    # Dynamic Calculation of Model Footprint and Runtime Batch Tensor Sizes
+    # ------------------------------------------------------------------------
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         model_size_mb = (total_params * 4) / (1024 ** 2)
-        gpu_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
-        effective_batch_per_gpu = args.batch_size * args.grad_accum_steps
-        global_effective_batch = effective_batch_per_gpu * world_size
+        
+        sample_src, sample_trg = next(iter(train_loader))
+        
+        src_bytes = sample_src.element_size() * sample_src.nelement()
+        trg_bytes = sample_trg.element_size() * sample_trg.nelement()
+        total_batch_bytes = src_bytes + trg_bytes
+        
+        src_mb = src_bytes / (1024 ** 2)
+        trg_mb = trg_bytes / (1024 ** 2)
+        total_batch_mb = total_batch_bytes / (1024 ** 2)
+
+        char_index_bytes = 8
+        char_emb_bytes = args.emb_dim * 4
+        
+        global_batch_size = args.batch_size * world_size
 
         print("\n" + "─" * 75)
-        print(f"📐 [DYNAMIC MODEL & HARDWARE ANALYSIS]")
-        print(f" ├─ Target Device:              {gpu_name}")
-        print(f" ├─ Precision Strategy:         {chosen_precision.upper()} (TF32 Support: {supports_tf32})")
-        print(f" ├─ Dynamic Compilation:        {'Supported' if can_compile else 'Disabled / Incompatible CC < 7.0'}")
+        print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
         print(f" ├─ Experiment ID:              {args.experiment}")
-        print(f" ├─ Architecture:               {args.rnn_type} ({'Bidirectional' if args.bidirectional else 'Unidirectional'})")
-        print(f" ├─ Base Learning Rate:         {args.lr}")
+        print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
-        print(f" ├─ Grad Accumulation Steps:    {args.grad_accum_steps}")
-        print(f" ├─ Global Effective Batch:     {global_effective_batch} sequence(s) across {world_size} rank(s)")
-        print(f" ├─ Scheduled Teacher Forcing:  {args.tf_start:.2f} ➔ {args.tf_end:.2f} ({args.tf_decay_mode.capitalize()} Decay)")
-        print(f" ├─ Early Stopping Patience:    {args.patience} epochs (Min Delta: {args.min_delta})")
+        print(f" ├─ Global Batch Size (Total):   {global_batch_size} sequence(s) across {world_size} rank(s)")
+        print(f" ├─ Single Char/Token ID Size:  {char_index_bytes} bytes (int64 tensor index)")
+        print(f" ├─ Single Char Embedding Size: {char_emb_bytes} bytes (Emb={args.emb_dim} float32 vector)")
+        print(f" ├─ Dynamic 'src' Tensor Shape: {list(sample_src.shape)} -> {src_mb:.6f} MB")
+        print(f" ├─ Dynamic 'trg' Tensor Shape: {list(sample_trg.shape)} -> {trg_mb:.6f} MB")
+        print(f" ├─ Total Batch Pair Footprint: {total_batch_mb:.6f} MB ({total_batch_bytes:,} bytes)")
         print(f" ├─ Total Trainable Parameters: {total_params:,}")
-        print(f" └─ Parameter Weights (FP32):   {model_size_mb:.2f} MB")
+        print(f" └─ Total Model Memory (FP32):  {model_size_mb:.2f} MB")
         print("─" * 75 + "\n")
     
-    best_val_loss = float("inf")
-    patience_counter = 0
-    start_train_time = time.time()
-    loss_history = {"train": [], "val": [], "lr": [], "tf_ratio": []}
-    
-    exp_tag = args.experiment if f"_{args.rnn_type}" in args.experiment else f"{args.experiment}_{args.rnn_type}"
-    checkpoint_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_tag}.pt")
-    config_json_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_tag}.json")
-    start_epoch = 0
-
-    if can_compile:
-        try:
-            model.encoder = torch.compile(model.encoder, mode="default")
-            if rank == 0:
-                print("⚡ Compiled Encoder Graph with TorchInductor.")
-        except Exception as e:
-            if rank == 0:
-                print(f"⚠️ torch.compile skipped: {e}")
-
     if is_distributed:
         if device.type == "cuda":
             model = nn.parallel.DistributedDataParallel(
@@ -528,140 +394,91 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    # Configure parameter groups with filtered weight decay
-    param_groups = configure_param_groups(model, weight_decay=args.weight_decay)
-    
-    if device.type == "cuda":
-        optimizer = optim.AdamW(param_groups, lr=args.lr, fused=True)
-        if rank == 0:
-            print("⚡ Using Native PyTorch Fused AdamW Optimizer with Weight Decay filtering.")
-    else:
-        optimizer = optim.AdamW(param_groups, lr=args.lr)
-
-    # Dynamic Warmup + Cosine Annealing LR Scheduler suited for short 5-epoch runs
-    warmup_epochs = min(args.warmup_epochs, max(1, args.epochs // 4))
-    cosine_epochs = max(1, args.epochs - warmup_epochs)
-    
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.2, end_factor=1.0, total_iters=warmup_epochs)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=1e-5)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
-
+    if hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, dynamic=True)
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ torch.compile skipped or failed: {e}")
+        
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    
+    best_val_loss = float("inf")
+    start_train_time = time.time()
+    loss_history = {"train": [], "val": []}
+    
+    exp_tag = args.experiment if f"_{args.rnn_type}" in args.experiment else f"{args.experiment}_{args.rnn_type}"
+    checkpoint_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_tag}.pt")
+    config_json_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_tag}.json")
+    start_epoch = 0
 
     if args.resume and os.path.exists(checkpoint_path):
         if rank == 0:
             print(f"🔄 Resuming model weights from existing checkpoint: {checkpoint_path}")
         
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        state_dict = checkpoint['model_state_dict']
-        clean_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        raw_model = model.module if hasattr(model, "module") else model
+        if hasattr(raw_model, "_orig_mod"):
+            raw_model = raw_model._orig_mod
         
-        target_state = model.state_dict()
-        adapted_state_dict = {}
-        for k, v in clean_state_dict.items():
-            if k in target_state:
-                adapted_state_dict[k] = v
-            elif k.replace("encoder.", "encoder._orig_mod.") in target_state:
-                adapted_state_dict[k.replace("encoder.", "encoder._orig_mod.")] = v
-            else:
-                adapted_state_dict[k] = v
-
-        model.load_state_dict(adapted_state_dict)
+        # Clean torch.compile (_orig_mod.) and DDP (module.) prefixes during state_dict restoration
+        clean_state_dict = {
+            k.replace("_orig_mod.", "").replace("module.", ""): v 
+            for k, v in checkpoint['model_state_dict'].items()
+        }
+        raw_model.load_state_dict(clean_state_dict)
         
-        if 'optimizer_state_dict' in checkpoint:
-            try:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except Exception:
-                if rank == 0:
-                    print("⚠️ Could not load optimizer state; maintaining fresh optimizer state.")
-                    
-        if 'scheduler_state_dict' in checkpoint:
-            try:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            except Exception:
-                pass
-
         if 'best_val_loss' in checkpoint.get('config', {}):
             best_val_loss = checkpoint['config']['best_val_loss']
         if 'loss_history' in checkpoint and isinstance(checkpoint['loss_history'], dict):
             loss_history = checkpoint['loss_history']
             start_epoch = len(loss_history.get("train", []))
-
-    vram_stats = {}
     
     if start_epoch >= args.epochs:
         if rank == 0:
             print(f"📦 Checkpoint already fully trained ({start_epoch}/{args.epochs} epochs). Skipping epoch loop.")
     else:
         for epoch in range(start_epoch, args.epochs):
-            epoch_start_time = time.time()
-            
-            # Dynamic Teacher Forcing Schedule Calculation
-            current_tf_ratio = compute_scheduled_tf_ratio(
-                epoch, args.epochs, initial_tf=args.tf_start, final_tf=args.tf_end, mode=args.tf_decay_mode
-            )
-            current_lr = optimizer.param_groups[0]['lr']
-
             if is_distributed and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
                 val_sampler.set_epoch(epoch)
                 
-            train_loss = train_epoch(
-                model, train_loader, optimizer, criterion, args.clip, device, current_tf_ratio, 
-                scaler=scaler, autocast_dtype=autocast_dtype, vram_stats_out=vram_stats,
-                grad_accum_steps=args.grad_accum_steps
-            )
-            val_loss = evaluate_validation(
-                model, val_loader, criterion, device, autocast_dtype=autocast_dtype
-            )
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, scaler)
+            val_loss = evaluate_validation(model, val_loader, criterion, device)
             
-            # Step the learning rate scheduler at epoch boundaries
-            scheduler.step()
-
-            epoch_duration = time.time() - epoch_start_time
             loss_history["train"].append(train_loss)
             loss_history["val"].append(val_loss)
-            loss_history["lr"].append(current_lr)
-            loss_history["tf_ratio"].append(current_tf_ratio)
             
-            if rank == 0 and epoch == start_epoch and vram_stats:
-                print("─" * 75)
-                print(f"📊 [PROFILED VRAM TENSOR MEMORY BREAKDOWN - {vram_stats.get('gpu_name', 'CUDA')}]")
-                print(f" ├─ Model Weights VRAM:          {vram_stats.get('vram_model_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Gradients VRAM (p.grad):      {vram_stats.get('vram_gradients_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Optimizer State VRAM (Adam):  {vram_stats.get('vram_optimizer_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Dynamic Activations & Logits: {vram_stats.get('vram_activations_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Total Active Allocations:    {vram_stats.get('vram_allocated_mb', 0.0):>8.2f} MB")
-                print(f" ├─ Reserved Memory Pool:         {vram_stats.get('vram_reserved_mb', 0.0):>8.2f} MB")
-                print(f" └─ Peak Measured VRAM Footprint: {vram_stats.get('vram_peak_mb', 0.0):>8.2f} MB ({vram_stats.get('vram_peak_gb', 0.0):.3f} GB)")
-                print("─" * 75 + "\n")
-
             if rank == 0:
-                mins, secs = divmod(int(epoch_duration), 60)
-                time_fmt = f"{mins:02d}m {secs:02d}s" if mins > 0 else f"{epoch_duration:.2f}s"
-                print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.6f} | TF: {current_tf_ratio:.2f} | Time: {time_fmt}")
+                print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
                 
-            # Early stopping check with patience and min_delta tolerance
-            if val_loss < (best_val_loss - args.min_delta):
+            if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                patience_counter = 0
                 if rank == 0:
                     config_dict = vars(args).copy()
                     config_dict.update({
-                        "train_time": round(time.time() - start_train_time, 1), 
+                        "train_time": f"{time.time() - start_train_time:.1f}s", 
                         "best_val_loss": best_val_loss, 
                         "val_loss": best_val_loss,
                         "epochs_trained": len(loss_history["train"]),
-                        "loss_history": loss_history,
-                        "hardware_precision": chosen_precision
+                        "loss_history": loss_history
                     })
-                    config_dict.update(vram_stats)
                     
+                    # Strip wrapper layers (DDP / torch.compile) before saving state dict
+                    raw_model = model.module if hasattr(model, "module") else model
+                    if hasattr(raw_model, "_orig_mod"):
+                        raw_model = raw_model._orig_mod
+
+                    clean_state_dict = {
+                        k.replace("_orig_mod.", "").replace("module.", ""): v 
+                        for k, v in raw_model.state_dict().items()
+                    }
+
                     torch.save({
                         'config': config_dict, 
-                        'model_state_dict': get_clean_state_dict(model), 
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
+                        'model_state_dict': clean_state_dict, 
                         'src_vocab': src_vocab, 
                         'trg_vocab': trg_vocab,
                         'loss_history': loss_history
@@ -670,37 +487,41 @@ def main():
                     with open(config_json_path, 'w') as f:
                         json.dump(config_dict, f, indent=4)
             else:
-                patience_counter += 1
                 if rank == 0:
-                    print(f"⚠️ Validation loss did not improve ({val_loss:.4f} >= {best_val_loss:.4f}). Patience: {patience_counter}/{args.patience}")
+                    print(f"🛑 Early stopping triggered: Loss did not improve from {best_val_loss:.4f}.")
                     try:
                         if os.path.exists(config_json_path):
                             with open(config_json_path, 'r') as f:
                                 c_data = json.load(f)
                             c_data["loss_history"] = loss_history
-                            c_data.update(vram_stats)
                             with open(config_json_path, 'w') as f:
                                 json.dump(c_data, f, indent=4)
                     except Exception:
                         pass
-                        
-                if patience_counter >= args.patience:
-                    if rank == 0:
-                        print(f"🛑 Early stopping triggered after {patience_counter} epoch(s) without improvement.")
-                    break
+                break
 
     if rank == 0:
         if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
             try:
-                import re
                 import subprocess
+                import re
                 import sys
                 
                 evaluate_script = os.path.join(SCRIPT_DIR, "evaluate.py")
                 if os.path.exists(evaluate_script):
-                    print("\n⌛ Automated Backfill: Executing evaluation metrics extraction (BLEU & METEOR)...")
-                    cmd = [sys.executable, evaluate_script, "evaluate", "--checkpoint", checkpoint_path]
+                    print(f"\n⌛ Automated Backfill: Executing evaluation metrics extraction...")
+                    cmd = [
+                        sys.executable, evaluate_script, "evaluate", 
+                        "--checkpoint", checkpoint_path,
+                        "--max_samples", str(args.eval_max_samples)
+                    ]
+                    
+                    # --------------------------------------------------------
+                    # Measure Inference & Translation Time
+                    # --------------------------------------------------------
+                    start_eval_time = time.time()
                     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    inference_duration = time.time() - start_eval_time
                     
                     bleu_match = re.search(r"BLEU:\s*([\d\.]+)", result.stdout)
                     meteor_match = re.search(r"METEOR:\s*([\d\.]+)", result.stdout)
@@ -722,16 +543,32 @@ def main():
                                 c_data["meteor"] = meteor_score
                                 c_data["mean_meteor"] = meteor_score
                                 
+                            # Save inference duration into JSON metadata ledger
+                            c_data["inference_time"] = f"{inference_duration:.2f}s"
+                                
                             with open(config_json_path, 'w') as f:
                                 json.dump(c_data, f, indent=4)
                                 
-                            print(f"✅ Backfill Successful: Saved BLEU={bleu_score} inside local JSON ledger.")
+                            checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                            checkpoint_payload['config'].update({
+                                "bleu": bleu_score,
+                                "Target Metric (BLEU)": bleu_score,
+                                "bleu_score": bleu_score,
+                                "overall_corpus_bleu": bleu_score,
+                                "inference_time": f"{inference_duration:.2f}s"
+                            })
+                            if meteor_score is not None:
+                                checkpoint_payload['config'].update({
+                                    "meteor": meteor_score,
+                                    "mean_meteor": meteor_score
+                                })
+                            torch.save(checkpoint_payload, checkpoint_path)
+                            print(f"✅ Backfill Successful: Saved BLEU={bleu_score} and inference_time={inference_duration:.2f}s inside local JSON ledger.")
             except Exception as e:
                 print(f"⚠️ Automated metrics backfill skipped: {e}")
 
     if is_distributed and dist.is_initialized():
         dist.destroy_process_group()
-
 
 if __name__ == "__main__":
     main()

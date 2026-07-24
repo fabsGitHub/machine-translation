@@ -1,722 +1,539 @@
 import os
 import json
-import re
-import time
-import glob
-import multiprocessing
+import yaml
 import argparse
+import time
+import random
 import numpy as np
 import pandas as pd
 import torch
-import torch._dynamo
-from torch.utils.data import DataLoader, Subset
-import nltk
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
-from nltk.translate.meteor_score import meteor_score
-from utils import setup_logging
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.utils.data import Sampler, DataLoader, Subset
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-from dataset import get_dataloader, SOS_IDX, EOS_IDX, PAD_IDX
+from dataset import get_dataloader, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
+from utils import load_config, set_seed
 
-# Enable TensorCore TF32 execution globally for Ampere GPUs
-torch.set_float32_matmul_precision('high')
-# Increase Dynamo cache limit to safely handle dynamic autoregressive step shapes
-torch._dynamo.config.cache_size_limit = 64
-
-nltk.download('wordnet', quiet=True)
-nltk.download('omw-1.4', quiet=True)
+# Import embedding generators externally so we don't recreate existing functions
+from embeddings import generate_word2vec_embeddings, load_glove_embeddings
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 OUTPUT_DIR = os.path.join(ROOT_DIR, "data", "results")
 
+class DistributedBatchSamplerWrapper(Sampler):
+    def __init__(self, batch_sampler, num_replicas, rank, shuffle=True):
+        self.batch_sampler = batch_sampler
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.epoch = 0
 
-def _worker_meteor_chunk(pairs_chunk):
-    """Processes a chunk of reference/hypothesis pairs to eliminate granular IPC pickling overhead."""
-    return [meteor_score(ref, hyp) for ref, hyp in pairs_chunk]
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        if hasattr(self.batch_sampler, 'set_epoch'):
+            self.batch_sampler.set_epoch(epoch)
 
+    def __iter__(self):
+        # Fix #2: Seed MUST be identical across all ranks so every process shuffles the list identically!
+        rng = random.Random(self.epoch + 42)
+        batches = list(self.batch_sampler)
+        if self.shuffle:
+            rng.shuffle(batches)
+            
+        if len(batches) % self.num_replicas != 0:
+            padding_size = self.num_replicas - (len(batches) % self.num_replicas)
+            batches += batches[:padding_size]
+            
+        for i in range(self.rank, len(batches), self.num_replicas):
+            yield batches[i]
 
-def translate_sentence(model, src_tensor, trg_vocab, device, max_len=50):
-    model.eval()
-    is_cuda = device.type == "cuda"
-    batch_size = src_tensor.size(0)
+    def __len__(self):
+        import math
+        return math.ceil(len(self.batch_sampler) / self.num_replicas)
+
+def str2bool(v):
+    if isinstance(v, bool): return v
+    return v.lower() in ('yes', 'true', 't', 'y', '1')
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Unified Seq2Seq NMT Training Interface")
+    parser.add_argument("--experiment", type=str, required=True)
+    parser.add_argument("--rnn_type", type=str, default="LSTM", choices=["RNN", "LSTM", "GRU"])
+    parser.add_argument("--bidirectional", type=str2bool, default=True)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--emb_dim", type=int, default=256)
+    parser.add_argument("--hidden_dim", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--clip", type=float, default=1.0)
+    parser.add_argument("--tf_ratio", type=float, default=0.5)
+    parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
+    parser.add_argument("--token_type", type=str, default="word", choices=["word", "char"])
+    parser.add_argument("--embedding_source", type=str, default="scratch", choices=["scratch", "word2vec", "glove"])
+    parser.add_argument("--freeze_emb", type=str2bool, default=False)
+    parser.add_argument("--src_lang", type=str, default="de")
+    parser.add_argument("--trg_lang", type=str, default="en")
+    parser.add_argument("--resume", type=str2bool, default=True, help="Resume from existing checkpoint if present")
     
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=is_cuda):
-        encoder_outputs, hidden = model.encoder(src_tensor)
-        hidden = model._bridge_hidden(hidden)
+    # Subsampling Controls
+    parser.add_argument("--eval_max_samples", type=int, default=1000, 
+                        help="Max samples for backfill test evaluation script (default: 1000)")
+    parser.add_argument("--val_max_samples", type=int, default=None, 
+                        help="Max samples for per-epoch validation split (default: None for full val)")
+    return parser.parse_args()
+    
+def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None):
+    model.train()
+    epoch_loss = 0
+    for src, trg in dataloader:
+        src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
         
-        current_token = torch.full((1,), SOS_IDX, dtype=torch.long, device=device)
-        generated_indices = []
-        
-        # Pre-compute Bahdanau projection once for the sequence
-        proj_enc = (
-            model.decoder.attention.U_a(encoder_outputs)
-            if getattr(model.decoder, "attention_type", None) == "bahdanau"
-            else None
-        )
-        
-        # Step-by-step decoding while propagating hidden state forward
-        for _ in range(max_len):
-            out = model.decoder.forward_step(current_token, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
-            if isinstance(out, tuple):
-                prediction = out[0]
-                hidden = out[1]
-            else:
-                prediction = out
+        if scaler is not None and device.type == "cuda":
+            with torch.amp.autocast(device_type=device.type):
+                output = model(src, trg, teacher_forcing_ratio=tf_ratio)
+                output_dim = output.shape[-1]
                 
-            best_guess_tensor = prediction.argmax(dim=1)
-            generated_indices.append(best_guess_tensor)
-            current_token = best_guess_tensor.contiguous()
-
-        if generated_indices:
-            indices_cpu = torch.stack(generated_indices, dim=1).cpu().numpy()
-        else:
-            indices_cpu = np.empty((batch_size, 0), dtype=np.int64)
-            
-        itos = trg_vocab.itos
-        tokens = []
-        for idx in indices_cpu[0]:
-            if idx == EOS_IDX:
-                break
-            if idx != PAD_IDX:
-                tokens.append(itos.get(idx, "<unk>"))
-    return tokens
-
-
-def translate_batch(model, src_tensor, trg_vocab, device, max_len=50):
-    model.eval()
-    batch_size = src_tensor.size(0)
-    is_cuda = device.type == "cuda"
-    
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=is_cuda):
-        encoder_outputs, hidden = model.encoder(src_tensor)
-        hidden = model._bridge_hidden(hidden)
-        
-        current_tokens = torch.full((batch_size,), SOS_IDX, dtype=torch.long, device=device)
-        output_list = []
-        
-        # Pre-compute Bahdanau projection once for the entire batch
-        proj_enc = (
-            model.decoder.attention.U_a(encoder_outputs)
-            if getattr(model.decoder, "attention_type", None) == "bahdanau"
-            else None
-        )
-        
-        # Decode max_len tokens updating hidden states each step
-        for t in range(max_len):
-            out = model.decoder.forward_step(current_tokens, hidden, encoder_outputs, proj_enc_outputs=proj_enc)
-            if isinstance(out, tuple):
-                prediction = out[0]
-                hidden = out[1]
-            else:
-                prediction = out
-
-            best_guess = prediction.argmax(dim=1)
-            output_list.append(best_guess)
-            current_tokens = best_guess.contiguous()
-        
-        outputs = torch.stack(output_list, dim=1) if output_list else torch.empty((batch_size, 0), dtype=torch.long, device=device)
-        
-    # Defer GPU-to-CPU host transfer until full batch sequence decoding finishes
-    outputs_cpu = outputs.cpu().numpy()
-    itos = trg_vocab.itos
-    translated_sentences = []
-    
-    for i in range(batch_size):
-        tokens = []
-        for idx in outputs_cpu[i]:
-            idx_int = int(idx)
-            if idx_int == EOS_IDX: 
-                break
-            if idx_int != PAD_IDX:
-                tokens.append(itos.get(idx_int, "<unk>"))
-        translated_sentences.append(tokens)
-    return translated_sentences
-
-
-def run_evaluation(checkpoint_path, test_csv=None, sample_size=0.1, seed=42):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"⌛ Loading checkpoint for evaluation: '{os.path.basename(checkpoint_path)}'")
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    config = checkpoint['config']
-    state_dict = checkpoint['model_state_dict']
-    src_vocab = checkpoint.get('src_vocab')
-    trg_vocab = checkpoint.get('trg_vocab')
-
-    src_lang, trg_lang = config.get('src_lang', 'en'), config.get('trg_lang', 'de')
-    token_type, experiment_id = config.get('token_type', 'word'), config.get('experiment', 'Unknown')
-
-    max_len = 250 if token_type == "char" else 50
-
-    if not test_csv:
-        test_csv = os.path.join(ROOT_DIR, "data", "processed", f"test_{src_lang}_{trg_lang}.csv")
-        if not os.path.exists(test_csv):
-            legacy_file = "test_sv.csv" if ("sv" in (src_lang, trg_lang)) else "test.csv"
-            test_csv = os.path.join(ROOT_DIR, "data", "processed", legacy_file)
-            
-    if not os.path.exists(test_csv): 
-        print(f"❌ Test dataset CSV file not found at: {test_csv}")
-        return
-        
-    eval_batch_size = config.get('batch_size_char', 4096) if token_type == "char" else config.get('batch_size_word', 1024)
-    test_loader, _, _ = get_dataloader(
-        test_csv, batch_size=eval_batch_size, shuffle=False, 
-        src_vocab=src_vocab, trg_vocab=trg_vocab, src_lang=src_lang, trg_lang=trg_lang, token_type=token_type,
-        num_workers=8
-    )
-    
-    if sample_size is not None:
-        total_len = len(test_loader.dataset)
-        if isinstance(sample_size, float) and 0.0 < sample_size <= 1.0:
-            target_count = int(total_len * sample_size)
-        else:
-            target_count = min(int(sample_size), total_len)
-        
-        if target_count < total_len:
-            print(f"🎲 Subsampling test dataset: evaluating on {target_count}/{total_len} samples (seed={seed})")
-            generator = torch.Generator().manual_seed(seed)
-            indices = torch.randperm(total_len, generator=generator)[:target_count].tolist()
-            subset_dataset = Subset(test_loader.dataset, indices)
-            
-            test_loader = DataLoader(
-                subset_dataset,
-                batch_size=test_loader.batch_size,
-                shuffle=False,
-                collate_fn=getattr(test_loader, 'collate_fn', None),
-                num_workers=8,
-                pin_memory=True,
-                persistent_workers=True,
-                prefetch_factor=2
-            )
-
-    is_bidi = config.get('bidirectional', True)
-    enc_hidden_dim = config['hidden_dim'] * (2 if is_bidi else 1)
-
-    enc_rnn_in_dim = state_dict['encoder.project.weight'].shape[0] if 'encoder.project.weight' in state_dict else state_dict['encoder.embedding.weight'].shape[1]
-    dec_rnn_in_dim = state_dict['decoder.project.weight'].shape[0] if 'decoder.project.weight' in state_dict else state_dict['decoder.embedding.weight'].shape[1]
-
-    enc = Encoder(state_dict['encoder.embedding.weight'].shape[0], enc_rnn_in_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], bidirectional=is_bidi)
-    dec = Decoder(state_dict['decoder.embedding.weight'].shape[0], dec_rnn_in_dim, enc_hidden_dim, config['hidden_dim'], config.get('n_layers', 2), config.get('dropout', 0.3), rnn_type=config['rnn_type'], attention_type=config.get('attention_type', 'none'))
-    
-    if 'encoder.project.weight' in state_dict: 
-        enc.embedding = torch.nn.Embedding(state_dict['encoder.embedding.weight'].shape[0], state_dict['encoder.embedding.weight'].shape[1])
-        enc.project = torch.nn.Linear(state_dict['encoder.project.weight'].shape[1], state_dict['encoder.project.weight'].shape[0])
-    if 'decoder.project.weight' in state_dict: 
-        dec.embedding = torch.nn.Embedding(state_dict['decoder.embedding.weight'].shape[0], state_dict['decoder.embedding.weight'].shape[1])
-        dec.project = torch.nn.Linear(state_dict['decoder.project.weight'].shape[1], state_dict['decoder.project.weight'].shape[0])
-    if 'decoder.fc_out.weight' in state_dict: 
-        dec.fc_out = torch.nn.Linear(state_dict['decoder.fc_out.weight'].shape[1], state_dict['decoder.fc_out.weight'].shape[0])
-    
-    model = Seq2Seq(enc, dec, device).to(device)
-    model.load_state_dict(state_dict)
-    
-    # Safe Hardware Capabilities & Torch Compile Handling
-    if device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7 and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-        except Exception as e:
-            print(f"Skipping torch.compile during evaluation: {e}")
-    
-    references, hypotheses = [], []
-    meta_info = []
-    trg_itos = trg_vocab.itos
-    src_itos = src_vocab.itos
-    
-    start_time = time.time()
-    for src, trg in test_loader:
-        src_dev = src.to(device, non_blocking=True)
-        batch_hyps = translate_batch(model, src_dev, trg_vocab, device, max_len=max_len)
-        hypotheses.extend(batch_hyps)
-
-        trg_np = trg.detach().cpu().numpy()
-        src_np = src.detach().cpu().numpy()
-        
-        for i in range(len(trg_np)):
-            ref_tokens = [trg_itos[idx] for idx in trg_np[i] if idx not in (PAD_IDX, SOS_IDX, EOS_IDX)]
-            references.append([ref_tokens])
-            
-            src_tokens = [src_itos[idx] for idx in src_np[i] if idx not in (PAD_IDX, SOS_IDX, EOS_IDX)]
-            meta_info.append(len(src_tokens))
+                # Fix #1: Conditional slicing based on output sequence length
+                if output.shape[1] == trg.shape[1]:
+                    output_flat = output[:, :-1].reshape(-1, output_dim)
+                else:
+                    output_flat = output.reshape(-1, output_dim)
+                    
+                trg_flat = trg[:, 1:].reshape(-1)
+                loss = criterion(output_flat, trg_flat)
                 
-    avg_inference_ms = ((time.time() - start_time) / max(1, len(hypotheses))) * 1000
-    
-    print("📊 Computing METEOR scores in batched chunks across CPU cores...")
-    meteor_pairs = list(zip(references, hypotheses))
-    num_workers = min(32, os.cpu_count() or 16)
-    
-    chunk_size = max(100, len(meteor_pairs) // (num_workers * 4))
-    chunks = [meteor_pairs[i:i + chunk_size] for i in range(0, len(meteor_pairs), chunk_size)] if meteor_pairs else []
-    
-    if chunks:
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            chunk_results = pool.map(_worker_meteor_chunk, chunks)
-        meteor_scores = [score for sublist in chunk_results for score in sublist]
-    else:
-        meteor_scores = []
-        
-    bleu_score = corpus_bleu(references, hypotheses, smoothing_function=SmoothingFunction().method1) * 100 if hypotheses else 0.0
-    mean_meteor = np.mean(meteor_scores) if meteor_scores else 0.0
-    
-    print(f"✨ Score Summary [{experiment_id}] -> BLEU: {bleu_score:.2f} | METEOR: {mean_meteor:.4f}")
-    
-    buckets = {
-        "Short (1-10 tokens)": {"refs": [], "hyps": [], "meteors": []},
-        "Medium (11-20 tokens)": {"refs": [], "hyps": [], "meteors": []},
-        "Long (21-30 tokens)": {"refs": [], "hyps": [], "meteors": []},
-        "Very Long (31+ tokens)": {"refs": [], "hyps": [], "meteors": []}
-    }
-    
-    for idx, src_len in enumerate(meta_info):
-        if src_len <= 10:
-            b_key = "Short (1-10 tokens)"
-        elif src_len <= 20:
-            b_key = "Medium (11-20 tokens)"
-        elif src_len <= 30:
-            b_key = "Long (21-30 tokens)"
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            b_key = "Very Long (31+ tokens)"
+            output = model(src, trg, teacher_forcing_ratio=tf_ratio)
+            output_dim = output.shape[-1]
             
-        buckets[b_key]["refs"].append(references[idx])
-        buckets[b_key]["hyps"].append(hypotheses[idx])
-        buckets[b_key]["meteors"].append(meteor_scores[idx])
-
-    bucket_analysis_results = {}
-    for b_name, b_data in buckets.items():
-        if len(b_data["hyps"]) > 0:
-            b_bleu = corpus_bleu(b_data["refs"], b_data["hyps"], smoothing_function=SmoothingFunction().method1) * 100
-            b_meteor = np.mean(b_data["meteors"])
-            bucket_analysis_results[b_name] = {
-                "sample_count": len(b_data["hyps"]),
-                "bleu": round(b_bleu, 2),
-                "meteor": round(b_meteor, 4)
-            }
-        else:
-            bucket_analysis_results[b_name] = {"sample_count": 0, "bleu": 0.0, "meteor": 0.0}
-
-    # Derive study group suffix (A, B, C, D, E, PIVOT) for isolated study ledgers
-    match = re.search(r"_(A|B|C|D|E)\d*|_(PIVOT)", experiment_id.upper())
-    study_suffix = (match.group(1) or match.group(2)) if match else "MISC"
-
-    # Preserving exact individual training study ledger format with added "completed": True
-    ledger_entry = {
-        "experiment": experiment_id,
-        "rnn_type": config.get("rnn_type"),
-        "bidirectional": is_bidi,
-        "epochs": config.get("epochs"),
-        "lr": config.get("lr"),
-        "dropout": config.get("dropout"),
-        "emb_dim": config.get("emb_dim"),
-        "hidden_dim": config.get("hidden_dim"),
-        "batch_size": config.get("batch_size"),
-        "grad_accum_steps": config.get("grad_accum_steps"),
-        "clip": config.get("clip"),
-        "tf_ratio": config.get("tf_ratio"),
-        "attention_type": config.get("attention_type", "none"),
-        "token_type": token_type,
-        "embedding_source": config.get("embedding_source", "scratch"),
-        "freeze_emb": config.get("freeze_emb", False),
-        "src_lang": src_lang,
-        "trg_lang": trg_lang,
-        "resume": config.get("resume", False),
-        "precision": config.get("precision", "auto"),
-        "train_time": config.get("train_time", -1),
-        "best_val_loss": config.get("best_val_loss"),
-        "val_loss": config.get("val_loss"),
-        "epochs_trained": config.get("epochs_trained"),
-        "completed": True,
-        "loss_history": config.get("loss_history", {"train": [], "val": []}),
-        "hardware_precision": config.get("hardware_precision", "unknown"),
-        "gpu_name": config.get("gpu_name", "unknown"),
-        "vram_model_mb": config.get("vram_model_mb", 0.0),
-        "vram_gradients_mb": config.get("vram_gradients_mb", 0.0),
-        "vram_optimizer_mb": config.get("vram_optimizer_mb", 0.0),
-        "vram_activations_mb": config.get("vram_activations_mb", 0.0),
-        "vram_allocated_mb": config.get("vram_allocated_mb", 0.0),
-        "vram_reserved_mb": config.get("vram_reserved_mb", 0.0),
-        "vram_peak_mb": config.get("vram_peak_mb", 0.0),
-        "vram_peak_gb": config.get("vram_peak_gb", 0.0),
-        "inference_time": round(avg_inference_ms, 2),
-        "metrics": {
-            "overall_corpus_bleu": round(bleu_score, 2),
-            "mean_meteor": round(mean_meteor, 4),
-            "bucket_analysis": bucket_analysis_results
-        },
-        "bleu": round(bleu_score, 2),
-        "meteor": round(mean_meteor, 4),
-        "avg_inference_ms": round(avg_inference_ms, 2)
-    }
-
-    # 1. Update Global Ledger
-    ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}.json")
-    os.makedirs(ROOT_DIR, exist_ok=True)
-
-    global_data = {}
-    if os.path.exists(ledger_path):
-        try:
-            with open(ledger_path, 'r', encoding='utf-8') as f:
-                global_data = json.load(f)
-        except Exception:
-            global_data = {}
-
-    global_data[experiment_id] = ledger_entry
-    with open(ledger_path, 'w', encoding='utf-8') as f:
-        json.dump(global_data, f, indent=4)
-
-    # 2. Update Isolated Study Group Ledger Directly
-    study_ledger_path = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}_{study_suffix}.json")
-    study_data = {}
-    if os.path.exists(study_ledger_path):
-        try:
-            with open(study_ledger_path, 'r', encoding='utf-8') as f:
-                study_data = json.load(f)
-        except Exception:
-            study_data = {}
-
-    study_data[experiment_id] = ledger_entry
-    with open(study_ledger_path, 'w', encoding='utf-8') as f:
-        json.dump(study_data, f, indent=4)
-
-    print(f"✅ Evaluation complete. Metrics saved to {ledger_path} and {study_ledger_path}")
-
-
-def load_evaluation_ledger_df(token_type: str) -> pd.DataFrame:
-    """Parses isolated study evaluation ledgers into a consolidated DataFrame."""
-    pattern = os.path.join(ROOT_DIR, f"evaluation_ledger_{token_type}*.json")
-    ledger_data = {}
-    
-    for filepath in glob.glob(pattern):
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                ledger_data.update(json.load(f))
-        except Exception:
-            pass
-
-    if not ledger_data:
-        return pd.DataFrame()
-
-    records = []
-    for run_id, node in ledger_data.items():
-        cell = node.get("rnn_type", "RNN")
-        bidi = "Bi" if str(node.get("bidirectional", "")).lower() == "true" else "Uni"
-        attn = node.get("attention_type", "none")
-        emb = node.get("embedding_source", "scratch")
-
-        if "PIVOT" in run_id.upper():
-            variant_desc = f"Pivot System (DE->EN->SV) using {cell}"
-            study_group = "PIVOT"
-        else:
-            variant_desc = f"{bidi}-{cell} (Embeds: {emb})"
-            if attn != "none":
-                variant_desc += f" w/ {attn.capitalize()} Attn"
-            match = re.search(r'_(A|B|C|D|E)\d*', run_id.upper())
-            study_group = match.group(1) if match else "MISC"
-
-        metrics = node.get("metrics", {})
-        bleu = float(metrics.get("overall_corpus_bleu", 0.0))
-        meteor = float(metrics.get("mean_meteor", 0.0))
-        sid = run_id.split("_")[1] if "_" in run_id else run_id
-
-        records.append({
-            "Run ID": run_id,
-            "Tokenization": f"{token_type.capitalize()}-Level",
-            "Study ID": f"Study {sid}",
-            "Top Study Run": f"Study {sid}",
-            "Study Group": study_group,
-            "Architectural Variant": variant_desc,
-            "Best Architectural Variant": variant_desc,
-            "BLEU Score": round(bleu, 2),
-            "Metric 2 (METEOR)": round(meteor, 2),
-            "Train Time": node.get("train_time", "N/A"),
-            "Inference Time": node.get("inference_time", "N/A"),
-            "_composite_score": bleu + (meteor * 100.0)
-        })
-
-    return pd.DataFrame(records)
-
-
-def generate_all_reports(token_type="word"):
-    """Compiles isolated ledgers into CSV summary reports."""
-    df = load_evaluation_ledger_df(token_type)
-    
-    if df.empty:
-        print(f"ℹ️ No empirical results recorded yet in your isolated {token_type} study ledgers.")
-        return
-
-    print("\n" + "="*80 + f"\n📊 GENERATING ALL EVALUATION REPORTS ({token_type.upper()})\n" + "="*80)
-    
-    export_cols = ["Tokenization", "Study ID", "Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
-
-    consolidated_path = os.path.join(ROOT_DIR, f"consolidated_evaluation_report_{token_type}.csv")
-    df[export_cols].to_csv(consolidated_path, index=False)
-    print(f"💾 Consolidated Report Saved -> {consolidated_path}")
-
-    for group_name, group_df in df.groupby("Study Group"):
-        study_path = os.path.join(ROOT_DIR, f"study_{group_name}_report_{token_type}.csv")
-        group_df[export_cols].to_csv(study_path, index=False)
-        print(f"💾 Isolated Study Matrix Saved -> study_{group_name}_report_{token_type}.csv")
-
-    best_idx = df.groupby("Study Group")["_composite_score"].idxmax()
-    best_df = df.loc[best_idx].sort_values("Study Group")
-    
-    best_export_cols = ["Tokenization", "Top Study Run", "Best Architectural Variant", "BLEU Score", "Metric 2 (METEOR)", "Train Time", "Inference Time"]
-    best_path = os.path.join(ROOT_DIR, f"best_of_studies_report_{token_type}.csv")
-    best_df[best_export_cols].to_csv(best_path, index=False)
-    
-    print(f"\n💾 Aggregated champion ledger saved successfully to: {best_path}\n")
-
-
-import os
-import torch
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-
-def visualize_attention(model_path, sample_text=None, output_path=None):
-    """Extracts attention alignments from model checkpoint and saves Seaborn heatmap visualization."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not os.path.exists(model_path):
-        print(f"⚠️ Checkpoint file for visualization not found: {model_path}")
-        return
-
-    print(f"📊 Generating attention heatmap for model: '{os.path.basename(model_path)}'")
-
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    config = checkpoint["config"]
-    state_dict = checkpoint["model_state_dict"]
-    src_vocab = checkpoint.get("src_vocab")
-    trg_vocab = checkpoint.get("trg_vocab")
-
-    token_type = config.get("token_type", "word")
-    is_bidi = config.get("bidirectional", True)
-    enc_hidden_dim = config["hidden_dim"] * (2 if is_bidi else 1)
-
-    enc_rnn_in_dim = (
-        state_dict["encoder.project.weight"].shape[0]
-        if "encoder.project.weight" in state_dict
-        else state_dict["encoder.embedding.weight"].shape[1]
-    )
-    dec_rnn_in_dim = (
-        state_dict["decoder.project.weight"].shape[0]
-        if "decoder.project.weight" in state_dict
-        else state_dict["decoder.embedding.weight"].shape[1]
-    )
-
-    enc = Encoder(
-        state_dict["encoder.embedding.weight"].shape[0],
-        enc_rnn_in_dim,
-        config["hidden_dim"],
-        config.get("n_layers", 2),
-        config.get("dropout", 0.3),
-        rnn_type=config["rnn_type"],
-        bidirectional=is_bidi,
-    )
-    dec = Decoder(
-        state_dict["decoder.embedding.weight"].shape[0],
-        dec_rnn_in_dim,
-        enc_hidden_dim,
-        config["hidden_dim"],
-        config.get("n_layers", 2),
-        config.get("dropout", 0.3),
-        rnn_type=config["rnn_type"],
-        attention_type=config.get("attention_type", "none"),
-    )
-
-    if "encoder.project.weight" in state_dict:
-        enc.embedding = torch.nn.Embedding(
-            state_dict["encoder.embedding.weight"].shape[0],
-            state_dict["encoder.embedding.weight"].shape[1],
-        )
-        enc.project = torch.nn.Linear(
-            state_dict["encoder.project.weight"].shape[1],
-            state_dict["encoder.project.weight"].shape[0],
-        )
-    if "decoder.project.weight" in state_dict:
-        dec.embedding = torch.nn.Embedding(
-            state_dict["decoder.embedding.weight"].shape[0],
-            state_dict["decoder.embedding.weight"].shape[1],
-        )
-        dec.project = torch.nn.Linear(
-            state_dict["decoder.project.weight"].shape[1],
-            state_dict["decoder.project.weight"].shape[0],
-        )
-    if "decoder.fc_out.weight" in state_dict:
-        dec.fc_out = torch.nn.Linear(
-            state_dict["decoder.fc_out.weight"].shape[1],
-            state_dict["decoder.fc_out.weight"].shape[0],
-        )
-
-    model = Seq2Seq(enc, dec, device).to(device)
-    model.load_state_dict(state_dict)
-    model.eval()
-
-    if not sample_text:
-        sample_text = (
-            "das ist ein beispiel zur visualisierung"
-            if token_type == "word"
-            else "beispiel"
-        )
-
-    if token_type == "char":
-        src_tokens = list(sample_text)
-    else:
-        src_tokens = sample_text.strip().split()
-
-    # Build sequence with special tokens
-    display_src_tokens = ["<sos>"] + src_tokens + ["<eos>"]
-    src_indices = (
-        [SOS_IDX]
-        + [
-            src_vocab.stoi.get(t, src_vocab.stoi.get("<unk>", 0))
-            for t in src_tokens
-        ]
-        + [EOS_IDX]
-    )
-    src_tensor = torch.tensor(
-        src_indices, dtype=torch.long, device=device
-    ).unsqueeze(0)
-
-    attentions = []
-    trg_tokens = []
-    max_len = 50 if token_type == "word" else 250
-    is_cuda = device.type == "cuda"
-
-    with torch.inference_mode(), torch.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=is_cuda
-    ):
-        encoder_outputs, hidden = model.encoder(src_tensor)
-        hidden = model._bridge_hidden(hidden)
-
-        current_token = torch.full(
-            (1,), SOS_IDX, dtype=torch.long, device=device
-        )
-
-        proj_enc = (
-            model.decoder.attention.U_a(encoder_outputs)
-            if getattr(model.decoder, "attention_type", None) == "bahdanau"
-            else None
-        )
-
-        pred_tensors = []
-        for _ in range(max_len):
-            out = model.decoder.forward_step(
-                current_token,
-                hidden,
-                encoder_outputs,
-                proj_enc_outputs=proj_enc,
-            )
-            attn_w = None
-            if isinstance(out, tuple):
-                prediction = out[0]
-                hidden = out[1]
-                if len(out) >= 3:
-                    attn_w = out[2]
+            # Fix #1: Conditional slicing based on output sequence length
+            if output.shape[1] == trg.shape[1]:
+                output_flat = output[:, :-1].reshape(-1, output_dim)
             else:
-                prediction = out
-
-            if attn_w is not None:
-                attentions.append(attn_w.squeeze(0))
-
-            pred_tensor = prediction.argmax(dim=1)
-            pred_tensors.append(pred_tensor)
-            current_token = pred_tensor.contiguous()
-
-            if pred_tensor.item() == EOS_IDX:
-                break
-
-        # Bulk GPU-to-CPU transfer
-        if pred_tensors:
-            pred_indices = torch.cat(pred_tensors).cpu().tolist()
-        else:
-            pred_indices = []
-
-        for pred_val in pred_indices:
-            if pred_val == EOS_IDX:
-                trg_tokens.append("<eos>")
-                break
-            trg_tokens.append(trg_vocab.itos.get(pred_val, "<unk>"))
-
-    if not attentions:
-        print(
-            "⚠️ Model does not output attention weights (attention_type='none')."
-        )
-        return
-
-    # Safely convert stacked attention tensors (handling CUDA + bfloat16 -> float32 CPU -> NumPy)
-    attn_matrix = (
-        torch.stack(attentions[: len(trg_tokens)]).float().cpu().numpy()
-    )
-
-    # Plotting
-    fig_width = max(8, len(display_src_tokens) * 0.5)
-    fig_height = max(6, len(trg_tokens) * 0.4)
-
-    plt.figure(figsize=(fig_width, fig_height))
-    sns.heatmap(
-        attn_matrix,
-        xticklabels=display_src_tokens,
-        yticklabels=trg_tokens,
-        cmap="viridis",
-        annot=False,
-        cbar=True,
-    )
-    plt.xlabel("Source Tokens", fontsize=11, fontweight="bold")
-    plt.ylabel("Target Tokens", fontsize=11, fontweight="bold")
-    plt.title(
-        f"Attention Heatmap ({config.get('experiment', 'NMT')})",
-        fontsize=12,
-        fontweight="bold",
-        pad=12,
-    )
-    plt.xticks(rotation=45, ha="right")
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-
-    if not output_path:
-        output_path = os.path.join(
-            OUTPUT_DIR, f"attention_{config.get('experiment', 'viz')}.png"
-        )
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close()
-    print(f"✅ Attention visualization saved -> {output_path}")
+                output_flat = output.reshape(-1, output_dim)
+                
+            trg_flat = trg[:, 1:].reshape(-1)
+            loss = criterion(output_flat, trg_flat)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+            optimizer.step()
+            
+        epoch_loss += loss.item()
     
+    total_loss = epoch_loss / len(dataloader)
+    
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        loss_tensor = torch.tensor(total_loss, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        return loss_tensor.item() / dist.get_world_size()
+    
+    return total_loss
+
+def evaluate_validation(model, dataloader, criterion, device):
+    model.eval()
+    epoch_loss = 0
+    with torch.no_grad():
+        for src, trg in dataloader:
+            src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
+            if device.type == "cuda":
+                with torch.amp.autocast(device_type=device.type):
+                    output = model(src, trg, teacher_forcing_ratio=0.0)
+                    output_dim = output.shape[-1]
+                    
+                    # Fix #1: Conditional slicing based on output sequence length
+                    if output.shape[1] == trg.shape[1]:
+                        output_flat = output[:, :-1].reshape(-1, output_dim)
+                    else:
+                        output_flat = output.reshape(-1, output_dim)
+                        
+                    trg_flat = trg[:, 1:].reshape(-1)
+                    loss = criterion(output_flat, trg_flat)
+            else:
+                output = model(src, trg, teacher_forcing_ratio=0.0)
+                output_dim = output.shape[-1]
+                
+                # Fix #1: Conditional slicing based on output sequence length
+                if output.shape[1] == trg.shape[1]:
+                    output_flat = output[:, :-1].reshape(-1, output_dim)
+                else:
+                    output_flat = output.reshape(-1, output_dim)
+                    
+                trg_flat = trg[:, 1:].reshape(-1)
+                loss = criterion(output_flat, trg_flat)
+                
+            epoch_loss += loss.item()
+            
+    total_loss = epoch_loss / len(dataloader)
+    
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        loss_tensor = torch.tensor(total_loss, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        return loss_tensor.item() / dist.get_world_size()
+        
+    return total_loss
 
 def main():
-    setup_logging(log_filename="evaluation.log", log_dir=OUTPUT_DIR)
-    parser = argparse.ArgumentParser(description="NMT Evaluation & Analysis Interface")
-    subparsers = parser.add_subparsers(dest="mode")
+    args = parse_args()
+    
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = world_size > 1
 
-    eval_parser = subparsers.add_parser("evaluate")
-    eval_parser.add_argument("--checkpoint", type=str, default=None)
-    eval_parser.add_argument("--token_type", type=str, default="word")
-    eval_parser.add_argument("--sample_size", type=float, default=None)
+    if is_distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+    
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+        
+    set_seed(42 + rank)
+    
+    if rank == 0:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    cfg_data = load_config()
+    processed_dir = cfg_data.get("data", {}).get("processed_dir", "data/processed")
+    
+    train_csv = os.path.join(processed_dir, f"train_{args.src_lang}_{args.trg_lang}.csv")
+    val_csv = os.path.join(processed_dir, f"val_{args.src_lang}_{args.trg_lang}.csv")
 
-    viz_parser = subparsers.add_parser("visualize")
-    viz_parser.add_argument("--checkpoint", type=str, required=True)
-    viz_parser.add_argument("--text", type=str, default=None)
-    viz_parser.add_argument("--output", type=str, default=None)
-
-    args = parser.parse_args()
-
-    if args.mode == "evaluate":
-        if args.checkpoint:
-            run_evaluation(args.checkpoint, sample_size=args.sample_size)
+    if not os.path.exists(train_csv):
+        legacy_suffix = "_sv" if (args.src_lang == "sv" or args.trg_lang == "sv") else ""
+        legacy_train = os.path.join(processed_dir, f"train{legacy_suffix}.csv")
+        legacy_val = os.path.join(processed_dir, f"val{legacy_suffix}.csv")
+        
+        if os.path.exists(legacy_train):
+            train_csv, val_csv = legacy_train, legacy_val
         else:
-            pattern = os.path.join(OUTPUT_DIR, f"best_model_{args.token_type.upper()}_*.pt")
-            checkpoints = glob.glob(pattern)
-            for ckpt in checkpoints:
-                run_evaluation(ckpt, sample_size=args.sample_size)
-            generate_all_reports(args.token_type)
-    elif args.mode == "visualize":
-        visualize_attention(args.checkpoint, sample_text=args.text, output_path=args.output)
+            train_csv = os.path.join(processed_dir, "train.csv")
+            val_csv = os.path.join(processed_dir, "val.csv")
 
+    if rank == 0:
+        print(f"📁 Resolving train split: {train_csv}")
+        print(f"📁 Resolving val split:   {val_csv}")
+
+    raw_train_loader, src_vocab, trg_vocab = get_dataloader(
+        train_csv, batch_size=args.batch_size, shuffle=True, 
+        src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
+    )
+    raw_val_loader, _, _ = get_dataloader(
+        val_csv, batch_size=args.batch_size, shuffle=False, 
+        src_vocab=src_vocab, trg_vocab=trg_vocab, 
+        src_lang=args.src_lang, trg_lang=args.trg_lang, token_type=args.token_type
+    )
+    
+    # Validation Subsampling Logic (Optional)
+    if args.val_max_samples and args.val_max_samples < len(raw_val_loader.dataset):
+        if rank == 0:
+            print(f"⚡ Subsampling validation set: randomly sampling {args.val_max_samples}/{len(raw_val_loader.dataset)} items.")
+        random.seed(42)
+        val_indices = random.sample(range(len(raw_val_loader.dataset)), args.val_max_samples)
+        raw_val_loader = DataLoader(
+            Subset(raw_val_loader.dataset, val_indices),
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=raw_val_loader.collate_fn,
+            num_workers=raw_val_loader.num_workers,
+            pin_memory=raw_val_loader.pin_memory,
+            persistent_workers=(raw_val_loader.num_workers > 0)
+        )
+
+    if is_distributed:
+        train_sampler = DistributedBatchSamplerWrapper(
+            raw_train_loader.batch_sampler, num_replicas=world_size, rank=rank, shuffle=True
+        )
+        val_sampler = DistributedBatchSamplerWrapper(
+            raw_val_loader.batch_sampler, num_replicas=world_size, rank=rank, shuffle=False
+        )
+        
+        train_loader = DataLoader(
+            raw_train_loader.dataset,
+            batch_sampler=train_sampler,
+            collate_fn=raw_train_loader.collate_fn,
+            num_workers=raw_train_loader.num_workers,
+            pin_memory=raw_train_loader.pin_memory,
+            persistent_workers=(raw_train_loader.num_workers > 0)
+        )
+        val_loader = DataLoader(
+            raw_val_loader.dataset,
+            batch_sampler=val_sampler,
+            collate_fn=raw_val_loader.collate_fn,
+            num_workers=raw_val_loader.num_workers,
+            pin_memory=raw_val_loader.pin_memory,
+            persistent_workers=(raw_val_loader.num_workers > 0)
+        )
+    else:
+        train_loader = raw_train_loader
+        val_loader = raw_val_loader
+        train_sampler = None
+        val_sampler = None
+    
+    pretrained_src_emb, pretrained_trg_emb = None, None
+    silent_logging = rank > 0
+    
+    if args.embedding_source == "word2vec":
+        pretrained_src_emb = generate_word2vec_embeddings(
+            vocab=src_vocab, train_csv=train_csv, lang=args.src_lang, emb_dim=args.emb_dim, silent=silent_logging, token_type=args.token_type
+        )
+        pretrained_trg_emb = generate_word2vec_embeddings(
+            vocab=trg_vocab, train_csv=train_csv, lang=args.trg_lang, emb_dim=args.emb_dim, silent=silent_logging, token_type=args.token_type
+        )
+    elif args.embedding_source == "glove":
+        glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
+        pretrained_src_emb = load_glove_embeddings(vocab=src_vocab, glove_file_path=glove_path, emb_dim=300, silent=silent_logging)
+        pretrained_trg_emb = load_glove_embeddings(vocab=trg_vocab, glove_file_path=glove_path, emb_dim=300, silent=silent_logging)
+        
+    num_directions = 2 if args.bidirectional else 1
+    encoder = Encoder(
+        len(src_vocab), args.emb_dim, args.hidden_dim, 2, args.dropout, 
+        args.rnn_type, args.bidirectional, pretrained_src_emb, args.freeze_emb, 
+        300 if args.embedding_source == "glove" else None
+    )
+    decoder = Decoder(
+        len(trg_vocab), args.emb_dim, args.hidden_dim * num_directions, args.hidden_dim, 2, 
+        args.dropout, args.rnn_type, args.attention_type, pretrained_trg_emb, args.freeze_emb, 
+        300 if args.embedding_source == "glove" else None
+    )
+    
+    model = Seq2Seq(encoder, decoder, device).to(device)
+
+    # ------------------------------------------------------------------------
+    # Dynamic Calculation of Model Footprint and Runtime Batch Tensor Sizes
+    # ------------------------------------------------------------------------
+    if rank == 0:
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        model_size_mb = (total_params * 4) / (1024 ** 2)
+        
+        sample_src, sample_trg = next(iter(train_loader))
+        
+        src_bytes = sample_src.element_size() * sample_src.nelement()
+        trg_bytes = sample_trg.element_size() * sample_trg.nelement()
+        total_batch_bytes = src_bytes + trg_bytes
+        
+        src_mb = src_bytes / (1024 ** 2)
+        trg_mb = trg_bytes / (1024 ** 2)
+        total_batch_mb = total_batch_bytes / (1024 ** 2)
+
+        char_index_bytes = 8
+        char_emb_bytes = args.emb_dim * 4
+        
+        global_batch_size = args.batch_size * world_size
+
+        print("\n" + "─" * 75)
+        print(f"📐 [DYNAMIC MODEL & BATCH ANALYSIS]")
+        print(f" ├─ Experiment ID:              {args.experiment}")
+        print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
+        print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
+        print(f" ├─ Global Batch Size (Total):   {global_batch_size} sequence(s) across {world_size} rank(s)")
+        print(f" ├─ Single Char/Token ID Size:  {char_index_bytes} bytes (int64 tensor index)")
+        print(f" ├─ Single Char Embedding Size: {char_emb_bytes} bytes (Emb={args.emb_dim} float32 vector)")
+        print(f" ├─ Dynamic 'src' Tensor Shape: {list(sample_src.shape)} -> {src_mb:.6f} MB")
+        print(f" ├─ Dynamic 'trg' Tensor Shape: {list(sample_trg.shape)} -> {trg_mb:.6f} MB")
+        print(f" ├─ Total Batch Pair Footprint: {total_batch_mb:.6f} MB ({total_batch_bytes:,} bytes)")
+        print(f" ├─ Total Trainable Parameters: {total_params:,}")
+        print(f" └─ Total Model Memory (FP32):  {model_size_mb:.2f} MB")
+        print("─" * 75 + "\n")
+    
+    if is_distributed:
+        if device.type == "cuda":
+            model = nn.parallel.DistributedDataParallel(
+                model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True
+            )
+        else:
+            model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        
+    if hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, dynamic=True)
+        except Exception as e:
+            if rank == 0:
+                print(f"⚠️ torch.compile skipped or failed: {e}")
+        
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    
+    best_val_loss = float("inf")
+    start_train_time = time.time()
+    loss_history = {"train": [], "val": []}
+    
+    exp_tag = args.experiment if f"_{args.rnn_type}" in args.experiment else f"{args.experiment}_{args.rnn_type}"
+    checkpoint_path = os.path.join(OUTPUT_DIR, f"best_model_{exp_tag}.pt")
+    config_json_path = os.path.join(OUTPUT_DIR, f"best_config_{exp_tag}.json")
+    start_epoch = 0
+
+    if args.resume and os.path.exists(checkpoint_path):
+        if rank == 0:
+            print(f"🔄 Resuming model weights from existing checkpoint: {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        raw_model = model.module if hasattr(model, "module") else model
+        if hasattr(raw_model, "_orig_mod"):
+            raw_model = raw_model._orig_mod
+        
+        # Clean torch.compile (_orig_mod.) and DDP (module.) prefixes during state_dict restoration
+        clean_state_dict = {
+            k.replace("_orig_mod.", "").replace("module.", ""): v 
+            for k, v in checkpoint['model_state_dict'].items()
+        }
+        raw_model.load_state_dict(clean_state_dict)
+        
+        if 'best_val_loss' in checkpoint.get('config', {}):
+            best_val_loss = checkpoint['config']['best_val_loss']
+        if 'loss_history' in checkpoint and isinstance(checkpoint['loss_history'], dict):
+            loss_history = checkpoint['loss_history']
+            start_epoch = len(loss_history.get("train", []))
+    
+    if start_epoch >= args.epochs:
+        if rank == 0:
+            print(f"📦 Checkpoint already fully trained ({start_epoch}/{args.epochs} epochs). Skipping epoch loop.")
+    else:
+        for epoch in range(start_epoch, args.epochs):
+            if is_distributed and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+                val_sampler.set_epoch(epoch)
+                
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, scaler)
+            val_loss = evaluate_validation(model, val_loader, criterion, device)
+            
+            loss_history["train"].append(train_loss)
+            loss_history["val"].append(val_loss)
+            
+            if rank == 0:
+                print(f"Epoch {epoch+1:02d}/{args.epochs:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+                
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                if rank == 0:
+                    config_dict = vars(args).copy()
+                    config_dict.update({
+                        "train_time": f"{time.time() - start_train_time:.1f}s", 
+                        "best_val_loss": best_val_loss, 
+                        "val_loss": best_val_loss,
+                        "epochs_trained": len(loss_history["train"]),
+                        "loss_history": loss_history
+                    })
+                    
+                    # Strip wrapper layers (DDP / torch.compile) before saving state dict
+                    raw_model = model.module if hasattr(model, "module") else model
+                    if hasattr(raw_model, "_orig_mod"):
+                        raw_model = raw_model._orig_mod
+
+                    clean_state_dict = {
+                        k.replace("_orig_mod.", "").replace("module.", ""): v 
+                        for k, v in raw_model.state_dict().items()
+                    }
+
+                    torch.save({
+                        'config': config_dict, 
+                        'model_state_dict': clean_state_dict, 
+                        'src_vocab': src_vocab, 
+                        'trg_vocab': trg_vocab,
+                        'loss_history': loss_history
+                    }, checkpoint_path)
+                    
+                    with open(config_json_path, 'w') as f:
+                        json.dump(config_dict, f, indent=4)
+            else:
+                if rank == 0:
+                    print(f"🛑 Early stopping triggered: Loss did not improve from {best_val_loss:.4f}.")
+                    try:
+                        if os.path.exists(config_json_path):
+                            with open(config_json_path, 'r') as f:
+                                c_data = json.load(f)
+                            c_data["loss_history"] = loss_history
+                            with open(config_json_path, 'w') as f:
+                                json.dump(c_data, f, indent=4)
+                    except Exception:
+                        pass
+                break
+
+    if rank == 0:
+        if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
+            try:
+                import subprocess
+                import re
+                import sys
+                
+                evaluate_script = os.path.join(SCRIPT_DIR, "evaluate.py")
+                if os.path.exists(evaluate_script):
+                    print(f"\n⌛ Automated Backfill: Executing evaluation metrics extraction...")
+                    cmd = [
+                        sys.executable, evaluate_script, "evaluate", 
+                        "--checkpoint", checkpoint_path,
+                        "--max_samples", str(args.eval_max_samples)
+                    ]
+                    
+                    # --------------------------------------------------------
+                    # Measure Inference & Translation Time
+                    # --------------------------------------------------------
+                    start_eval_time = time.time()
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    inference_duration = time.time() - start_eval_time
+                    
+                    bleu_match = re.search(r"BLEU:\s*([\d\.]+)", result.stdout)
+                    meteor_match = re.search(r"METEOR:\s*([\d\.]+)", result.stdout)
+                    
+                    bleu_score = float(bleu_match.group(1)) if bleu_match else None
+                    meteor_score = float(meteor_match.group(1)) if meteor_match else None
+                    
+                    if bleu_score is not None:
+                        if os.path.exists(config_json_path):
+                            with open(config_json_path, 'r') as f:
+                                c_data = json.load(f)
+                            
+                            c_data["bleu"] = bleu_score
+                            c_data["Target Metric (BLEU)"] = bleu_score
+                            c_data["bleu_score"] = bleu_score
+                            c_data["overall_corpus_bleu"] = bleu_score
+                            
+                            if meteor_score is not None:
+                                c_data["meteor"] = meteor_score
+                                c_data["mean_meteor"] = meteor_score
+                                
+                            # Save inference duration into JSON metadata ledger
+                            c_data["inference_time"] = f"{inference_duration:.2f}s"
+                                
+                            with open(config_json_path, 'w') as f:
+                                json.dump(c_data, f, indent=4)
+                                
+                            checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                            checkpoint_payload['config'].update({
+                                "bleu": bleu_score,
+                                "Target Metric (BLEU)": bleu_score,
+                                "bleu_score": bleu_score,
+                                "overall_corpus_bleu": bleu_score,
+                                "inference_time": f"{inference_duration:.2f}s"
+                            })
+                            if meteor_score is not None:
+                                checkpoint_payload['config'].update({
+                                    "meteor": meteor_score,
+                                    "mean_meteor": meteor_score
+                                })
+                            torch.save(checkpoint_payload, checkpoint_path)
+                            print(f"✅ Backfill Successful: Saved BLEU={bleu_score} and inference_time={inference_duration:.2f}s inside local JSON ledger.")
+            except Exception as e:
+                print(f"⚠️ Automated metrics backfill skipped: {e}")
+
+    if is_distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
