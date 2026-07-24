@@ -200,8 +200,9 @@ class Decoder(nn.Module):
             else None
         )
 
+        # Fully traceable teacher-forcing check for non-attention mode
         use_teacher_forcing = self.training and (
-            (random.random() < teacher_forcing_ratio)
+            (torch.rand(1, device=trg.device).item() < teacher_forcing_ratio)
             if teacher_forcing_ratio > 0.0
             else False
         )
@@ -220,17 +221,17 @@ class Decoder(nn.Module):
             )
             return torch.cat([zero_step, predictions], dim=1)
 
-        # Pre-allocate output tensor directly in VRAM to eliminate dynamic list allocations & stacking
+        # Pre-allocate output tensor directly in VRAM
         outputs = torch.zeros(
             batch_size, trg_len, self.vocab_size, device=trg.device, dtype=encoder_outputs.dtype
         )
         input_token = trg[:, 0]
 
-        # Sample teacher-forcing decisions using CPU Python booleans to eliminate GPU-CPU sync stalls
+        # Generate teacher-forcing mask as a GPU boolean Tensor (1D)
         if self.training and teacher_forcing_ratio > 0.0:
-            use_tf_steps = [random.random() < teacher_forcing_ratio for _ in range(trg_len - 1)]
+            use_tf_steps = torch.rand(trg_len - 1, device=trg.device) < teacher_forcing_ratio
         else:
-            use_tf_steps = [False] * (trg_len - 1)
+            use_tf_steps = torch.zeros(trg_len - 1, dtype=torch.bool, device=trg.device)
 
         for t in range(1, trg_len):
             pred, hidden, _ = self.forward_step(
@@ -238,11 +239,11 @@ class Decoder(nn.Module):
             )
             outputs[:, t] = pred
             next_tf = trg[:, t]
-            # Pure Python boolean check; zero CUDA synchronization overhead
-            input_token = next_tf if use_tf_steps[t - 1] else pred.argmax(dim=1)
+
+            # Vectorized selection via torch.where (Traceable by torch.compile)
+            input_token = torch.where(use_tf_steps[t - 1], next_tf, pred.argmax(dim=1))
 
         return outputs
-
 
 class Seq2Seq(nn.Module):
     def __init__(self, encoder, decoder, device=None):
