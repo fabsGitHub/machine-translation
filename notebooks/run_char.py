@@ -127,6 +127,7 @@ os.system("git add src/ *.md requirements.txt")
 os.system("git add -f config/config.yaml") if os.path.exists("config/config.yaml") else None
 
 local_results_dir = os.path.join(REPO_PATH, "data", "results")
+paths_to_add = []
 if os.path.exists(local_results_dir):
     for root, _, files in os.walk(local_results_dir):
         for f in files:
@@ -134,9 +135,19 @@ if os.path.exists(local_results_dir):
             rel_path = os.path.relpath(file_path, REPO_PATH)
 
             if f.endswith((".json", ".csv", ".png", ".md")):
-                os.system(f'git add -f "{rel_path}"')
+                paths_to_add.append(rel_path)
             elif f.endswith(".pt") and (os.path.getsize(file_path) / (1024 * 1024) < 95.0):
-                os.system(f'git add -f "{rel_path}"')
+                paths_to_add.append(rel_path)
+
+# Single batched git add instead of one subprocess per file - with dozens of
+# result files, spawning a separate git process per file (each with its own
+# process-start + index-load overhead) took minutes; one call with all paths
+# is seconds.
+if paths_to_add:
+    for i in range(0, len(paths_to_add), 200):
+        chunk = paths_to_add[i:i + 200]
+        quoted = " ".join(f'"{p}"' for p in chunk)
+        os.system(f"git add -f {quoted}")
 
 commit_msg = f"Auto-commit ({TOKEN_TYPE.capitalize()} Run): Results updated"
 os.system(f'git commit -m "{commit_msg}" || echo "No changes to commit."')

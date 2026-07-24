@@ -820,20 +820,13 @@ def run_automated_post_processing(token_type, rnn_type):
     """Executes evaluation aggregation, pivot evaluation, and attention heatmap generation."""
     env = os.environ.copy()
 
-    try:
-        subprocess.run(
-            [
-                sys.executable,
-                os.path.join(SCRIPT_DIR, "evaluate.py"),
-                "evaluate",
-                "--token_type",
-                token_type,
-            ],
-            check=True,
-            env=env,
-        )
-    except Exception:
-        pass
+    # NOTE: there used to be a call here to `evaluate.py evaluate --token_type
+    # {token_type}` (no --checkpoint) as a safety-net re-evaluation pass. The
+    # current evaluate.py CLI requires --checkpoint and exits immediately
+    # without one, so that call always failed silently (swallowed by a bare
+    # except) - pure overhead, never did anything. Removed; per-experiment
+    # auto-backfill during training (see train.py) already handles evaluation,
+    # and generate_all_reports() below aggregates everything that produced.
 
     de_en_model = os.path.join(
         OUTPUT_DIR, f"best_model_{token_type.upper()}_D2_{rnn_type}.pt"
