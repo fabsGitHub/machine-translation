@@ -265,8 +265,27 @@ def generate_all_reports(token_type="word", output_dir=None):
 # Evaluation Pipeline
 # ------------------------------------------------------------------------
 
+def _bucket_for_length(n):
+    if n <= 10:
+        return "Short (1-10 tokens)"
+    elif n <= 20:
+        return "Medium (11-20 tokens)"
+    elif n <= 30:
+        return "Long (21-30 tokens)"
+    return "Very Long (31+ tokens)"
+
+
+def _config_json_path_for_checkpoint(checkpoint_path):
+    base = os.path.basename(checkpoint_path).replace("best_model_", "best_config_").replace(".pt", ".json")
+    return os.path.join(os.path.dirname(checkpoint_path), base)
+
+
 def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
-    """Evaluates BLEU and METEOR metrics for a saved checkpoint on test/val set."""
+    """Evaluates BLEU and METEOR metrics for a saved checkpoint on the held-out TEST set
+    (not validation - validation is for model selection during training, the PDF asks for
+    results on the 20 percent test split). Also buckets results by source sentence length
+    (Short/Medium/Long/Very Long) to answer whether sentence length impacts translation
+    quality, and persists the bucket breakdown directly into the checkpoint's config JSON."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -278,9 +297,9 @@ def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
     trg_lang = cfg.get("trg_lang", "en")
     token_type = cfg.get("token_type", "word")
 
-    test_csv = os.path.join(processed_dir, f"val_{src_lang}_{trg_lang}.csv")
+    test_csv = os.path.join(processed_dir, f"test_{src_lang}_{trg_lang}.csv")
     if not os.path.exists(test_csv):
-        test_csv = os.path.join(processed_dir, "val.csv")
+        test_csv = os.path.join(processed_dir, "test.csv")
 
     global_cfg = load_config()
     eval_batch_size = global_cfg.get("training", {}).get("eval_batch_size", 32)
@@ -294,6 +313,7 @@ def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
     targets = []
     hypotheses = []
     meteor_scores = []
+    src_lengths = []
 
     count = 0
     smoother = SmoothingFunction().method1
@@ -316,6 +336,7 @@ def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
 
             hypotheses.append(pred_tokens)
             targets.append([trg_tokens])
+            src_lengths.append(len(src_idxs))
 
             if meteor_score is not None:
                 try:
@@ -323,7 +344,9 @@ def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
                     hyp_str = " ".join(pred_tokens)
                     meteor_scores.append(meteor_score([ref_str.split()], hyp_str.split()))
                 except Exception:
-                    pass
+                    meteor_scores.append(0.0)
+            else:
+                meteor_scores.append(0.0)
 
             count += 1
 
@@ -333,7 +356,48 @@ def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
     print(f"BLEU: {bleu:.4f}")
     print(f"METEOR: {mean_meteor:.4f}")
 
-    return bleu, mean_meteor
+    # Bucket by source sentence length to answer "does length impact performance".
+    buckets = {}
+    for idx, length in enumerate(src_lengths):
+        key = _bucket_for_length(length)
+        buckets.setdefault(key, {"refs": [], "hyps": [], "meteors": []})
+        buckets[key]["refs"].append(targets[idx])
+        buckets[key]["hyps"].append(hypotheses[idx])
+        buckets[key]["meteors"].append(meteor_scores[idx])
+
+    bucket_order = ["Short (1-10 tokens)", "Medium (11-20 tokens)", "Long (21-30 tokens)", "Very Long (31+ tokens)"]
+    bucket_analysis = {}
+    for key in bucket_order:
+        data = buckets.get(key)
+        if not data or not data["hyps"]:
+            bucket_analysis[key] = {"sample_count": 0, "bleu": 0.0, "meteor": 0.0}
+            continue
+        b_bleu = corpus_bleu(data["refs"], data["hyps"], smoothing_function=smoother) * 100.0
+        b_meteor = (sum(data["meteors"]) / len(data["meteors"])) * 100.0
+        bucket_analysis[key] = {
+            "sample_count": len(data["hyps"]),
+            "bleu": round(b_bleu, 2),
+            "meteor": round(b_meteor, 2),
+        }
+        n = bucket_analysis[key]["sample_count"]
+        bb = bucket_analysis[key]["bleu"]
+        bm = bucket_analysis[key]["meteor"]
+        print(f"  [{key}] n={n} BLEU={bb:.2f} METEOR={bm:.2f}")
+
+    try:
+        config_json_path = _config_json_path_for_checkpoint(checkpoint_path)
+        c_data = {}
+        if os.path.exists(config_json_path):
+            with open(config_json_path, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+        c_data["bucket_analysis"] = bucket_analysis
+        c_data["eval_split"] = "test"
+        with open(config_json_path, "w", encoding="utf-8") as f:
+            json.dump(c_data, f, indent=4)
+    except Exception as e:
+        print(f"Warning: could not persist bucket_analysis to config JSON: {e}")
+
+    return bleu, mean_meteor, bucket_analysis
 
 
 # ------------------------------------------------------------------------
