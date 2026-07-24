@@ -8,7 +8,7 @@ DEFAULT_CONFIG = {
     },
     "data": {
         "sample_rate": 0.1,  # PDF requires a random 10% sample for training
-        "test_split": 0.1,
+        "test_split": 0.2,  # PDF requires 20 percent test set
         "seed": 42,
         "max_word_len": 50,
         "max_char_len": 300,
