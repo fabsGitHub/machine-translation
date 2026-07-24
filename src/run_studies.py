@@ -684,11 +684,30 @@ def execute_tuning(
         else:
             trials_per_rnn = max(1, num_trials // len(rnn_types))
 
+        # Each cell type must see a genuine spread of hyperparameters, not just
+        # `trials_per_rnn` random draws from the full grid - with a large grid
+        # (4*3*3*3=108 combos here) a plain random sample can by chance repeat
+        # the same lr/dropout/emb_dim/hidden_dim across most of its picks, which
+        # would starve get_best_hyperparameters() of real signal for that cell
+        # type and degrade every downstream stage (A-E) that inherits it. Cycle
+        # each hyperparameter dimension independently through its own shuffled
+        # order so `trials_per_rnn` picks are guaranteed to cover
+        # min(trials_per_rnn, len(values)) distinct values per dimension.
+        def _diverse_picks(values, n):
+            order = list(values)
+            random.shuffle(order)
+            return [order[i % len(order)] for i in range(n)]
+
         selected_combos = []
         for rnn in rnn_types:
-            combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, [rnn]))
-            random.shuffle(combos)
-            selected_combos.extend(combos[:trials_per_rnn])
+            lr_picks = _diverse_picks(lrs, trials_per_rnn)
+            dropout_picks = _diverse_picks(dropouts, trials_per_rnn)
+            emb_dim_picks = _diverse_picks(emb_dims, trials_per_rnn)
+            hidden_dim_picks = _diverse_picks(hidden_dims, trials_per_rnn)
+            for i in range(trials_per_rnn):
+                selected_combos.append(
+                    (lr_picks[i], dropout_picks[i], emb_dim_picks[i], hidden_dim_picks[i], rnn)
+                )
 
         if len(selected_combos) < num_trials and configs_per_rnn is None:
             all_combos = list(itertools.product(lrs, dropouts, emb_dims, hidden_dims, rnn_types))

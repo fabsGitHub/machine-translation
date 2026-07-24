@@ -77,6 +77,43 @@ def load_word2vec_keyed_vectors(filepath, binary=False):
     return vector_dict
 
 
+def _load_headerless_vector_dict(filepath, emb_dim=300):
+    """Parses classic GloVe .txt format (no leading '<vocab> <dim>' header line,
+    unlike word2vec/fastText .vec files), with the same .pt disk cache as
+    load_word2vec_keyed_vectors so re-runs don't re-parse the multi-GB file."""
+    cache_dir = _get_cache_dir()
+    base_name = os.path.basename(filepath).replace(".", "_")
+    pt_cache_path = os.path.join(cache_dir, f"cache_{base_name}.pt")
+
+    if os.path.exists(pt_cache_path):
+        try:
+            return torch.load(pt_cache_path, weights_only=False)
+        except Exception:
+            pass
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        torch.distributed.barrier()
+        if os.path.exists(pt_cache_path):
+            return torch.load(pt_cache_path, weights_only=False)
+
+    print(f"📦 Loading pre-trained vectors from {filepath} (Building fast binary cache)...")
+    vector_dict = {}
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip().split(" ")
+            if len(parts) != emb_dim + 1:
+                continue
+            vector_dict[parts[0]] = np.array(parts[1:], dtype=np.float32)
+
+    torch.save(vector_dict, pt_cache_path)
+    print(f"⚡ Saved fast binary embedding cache -> {pt_cache_path}")
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+        torch.distributed.barrier()
+
+    return vector_dict
+
+
 def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"):
     """Maps pre-trained vector dictionary to a vocabulary tensor matrix."""
     vocab_size = len(vocab)
@@ -129,6 +166,25 @@ def populate_embedding_matrix(vocab, vector_dict, emb_dim=300, token_type="word"
     return weights
 
 
+# Per-language pretrained vector files. English has genuine Word2Vec (GoogleNews)
+# and GloVe (Stanford glove.6B) releases; German/Swedish have neither publicly, so
+# both embedding_source options fall back to the same fastText Wikipedia vectors
+# for those languages (wiki.de.vec / wiki.sv.vec) - the closest available pretrained
+# substitute. This means "word2vec" and "glove" only differ on the English side of
+# a pair; report this explicitly rather than presenting it as a full ablation on
+# the non-English side.
+_WORD2VEC_FILES = {
+    "en": ("GoogleNews-vectors-negative300.bin", True),
+    "de": ("wiki.de.vec", False),
+    "sv": ("wiki.sv.vec", False),
+}
+_GLOVE_FILES = {
+    "en": ("glove.6B.300d.txt", "glove_txt"),
+    "de": ("wiki.de.vec", False),
+    "sv": ("wiki.sv.vec", False),
+}
+
+
 def generate_word2vec_embeddings(
     vocab,
     train_csv=None,
@@ -137,19 +193,21 @@ def generate_word2vec_embeddings(
     silent=False,
     pair_prefix=None,
     token_type="word",
+    data_dir="data",
 ):
-    """Generates Word2Vec embeddings for a given language vocabulary."""
+    """Loads pretrained Word2Vec-family embeddings for a given language vocabulary.
+
+    Language-correct: English uses real GoogleNews Word2Vec vectors; German/Swedish
+    use fastText Wikipedia vectors (no public German/Swedish Word2Vec release exists
+    here) instead of silently reusing the English file.
+    """
     if token_type == "char":
         if not silent:
             print("⚠️ Token level is 'char'. Skipping Word2Vec loading.")
         return None
 
-    if lang == "de":
-        vec_file = os.path.join("data", "wiki.de.vec")
-        binary = False
-    else:
-        vec_file = os.path.join("data", "GoogleNews-vectors-negative300.bin")
-        binary = True
+    filename, binary = _WORD2VEC_FILES.get(lang, _WORD2VEC_FILES["en"])
+    vec_file = os.path.join(data_dir, filename)
 
     if not os.path.exists(vec_file):
         if not silent:
@@ -188,6 +246,27 @@ def precompute_word2vec_embeddings(
     )
 
 
+def _load_pretrained_vector_dict(lang, source, emb_dim, data_dir, silent):
+    """Resolves and loads the language-correct pretrained vector dict for
+    embedding_source in {'glove', 'word2vec'}. English uses the real GloVe/
+    Word2Vec release; German/Swedish fall back to fastText Wikipedia vectors
+    (wiki.de.vec / wiki.sv.vec) since no public German/Swedish GloVe or
+    Word2Vec release exists here - using the English file for those languages
+    (the previous behavior) would silently score near-zero real coverage."""
+    files = _GLOVE_FILES if source == "glove" else _WORD2VEC_FILES
+    filename, mode = files.get(lang, files["en"])
+    filepath = os.path.join(data_dir, filename)
+
+    if not os.path.exists(filepath):
+        if not silent:
+            print(f"⚠️ Pretrained vector file {filepath} unavailable for lang={lang}.")
+        return None
+
+    if mode == "glove_txt":
+        return _load_headerless_vector_dict(filepath, emb_dim=emb_dim)
+    return load_word2vec_keyed_vectors(filepath, binary=bool(mode))
+
+
 def load_glove_embeddings(
     vocab,
     glove_file_path=None,
@@ -195,25 +274,27 @@ def load_glove_embeddings(
     silent=False,
     token_type="word",
     glove_dir="data",
+    lang="en",
 ):
-    """Loads GloVe embeddings for a single vocabulary."""
+    """Loads pretrained embeddings for a single vocabulary under the 'glove'
+    embedding_source condition, using the language-correct file (see
+    _load_pretrained_vector_dict)."""
     if token_type == "char":
         if not silent:
             print("⚠️ Token level is 'char'. Skipping GloVe loading.")
         return None
 
-    if glove_file_path and os.path.exists(glove_file_path):
-        glove_path = glove_file_path
+    if glove_file_path and os.path.exists(glove_file_path) and lang == "en":
+        vector_dict = _load_headerless_vector_dict(glove_file_path, emb_dim=emb_dim)
     else:
-        glove_path = download_and_extract_glove(glove_dir=glove_dir, emb_dim=emb_dim)
+        vector_dict = _load_pretrained_vector_dict(lang, "glove", emb_dim, glove_dir, silent)
 
-    if not glove_path or not os.path.exists(glove_path):
+    if vector_dict is None:
         if not silent:
             print("⚠️ GloVe embeddings file unavailable.")
         return None
 
     try:
-        vector_dict = load_word2vec_keyed_vectors(glove_path, binary=False)
         return populate_embedding_matrix(
             vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
         )
@@ -233,25 +314,32 @@ def load_glove_embeddings_pair(
     silent=False,
     token_type="word",
 ):
-    """Loads GloVe embeddings for source and target vocabulary pair."""
+    """Loads pretrained 'glove'-condition embeddings for a source/target vocab
+    pair, resolving each side to its own language-correct file (see
+    _load_pretrained_vector_dict) instead of applying one language's vectors
+    to both vocabularies."""
     if token_type == "char":
         if not silent:
             print("⚠️ Token level is 'char'. Skipping GloVe loading.")
         return None, None
 
-    glove_path = download_and_extract_glove(glove_dir=glove_dir, emb_dim=emb_dim)
-    if not glove_path or not os.path.exists(glove_path):
-        if not silent:
-            print("⚠️ GloVe embeddings file unavailable.")
-        return None, None
-
     try:
-        vector_dict = load_word2vec_keyed_vectors(glove_path, binary=False)
-        src_emb = populate_embedding_matrix(
-            src_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
+        src_dict = _load_pretrained_vector_dict(src_lang, "glove", emb_dim, glove_dir, silent)
+        trg_dict = (
+            src_dict
+            if trg_lang == src_lang
+            else _load_pretrained_vector_dict(trg_lang, "glove", emb_dim, glove_dir, silent)
         )
-        trg_emb = populate_embedding_matrix(
-            trg_vocab, vector_dict, emb_dim=emb_dim, token_type=token_type
+
+        src_emb = (
+            populate_embedding_matrix(src_vocab, src_dict, emb_dim=emb_dim, token_type=token_type)
+            if src_dict is not None
+            else None
+        )
+        trg_emb = (
+            populate_embedding_matrix(trg_vocab, trg_dict, emb_dim=emb_dim, token_type=token_type)
+            if trg_dict is not None
+            else None
         )
         return src_emb, trg_emb
     except Exception as e:

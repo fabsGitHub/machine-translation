@@ -17,6 +17,7 @@ from dataset import get_dataloader, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
 from config import load_config
 from utils import set_seed
+from embeddings import generate_word2vec_embeddings, load_glove_embeddings
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -86,53 +87,6 @@ def parse_args():
                         help="Max samples for per-epoch validation split (default: None for full val)")
     return parser.parse_args()
     
-def generate_word2vec_embeddings(vocab, csv_path, lang_col, emb_dim, silent=False):
-    try:
-        from gensim.models import Word2Vec
-        if not silent:
-            print(f"⌛ Building Word2Vec representations for column: '{lang_col}'...")
-        df = pd.read_csv(csv_path)
-        sentences = [vocab.tokenize(str(text)) for text in df[lang_col].tolist()]
-        w2v_model = Word2Vec(sentences=sentences, vector_size=emb_dim, window=5, min_count=1, workers=4)
-        weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
-        for word, idx in vocab.stoi.items():
-            if word in w2v_model.wv:
-                weight_matrix[idx] = w2v_model.wv[word]
-        return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
-    except Exception as e:
-        if not silent:
-            print(f"⚠️ Word2Vec skipped ({e}). Defaulting to standard distributions.")
-        return None
-
-def load_glove_embeddings(vocab, glove_file_path, emb_dim, silent=False):
-    if not silent:
-        print(f"⌛ Mapping GloVe embeddings from {glove_file_path} to vocabulary...")
-    weight_matrix = np.random.normal(scale=0.6, size=(len(vocab), emb_dim))
-    glove_cache_bin = glove_file_path + ".matrix_cache.pt"
-    
-    if os.path.exists(glove_cache_bin):
-        glove_dict = torch.load(glove_cache_bin, weights_only=False)
-    else:
-        if not os.path.exists(glove_file_path):
-            if not silent:
-                print(f"⚠️ GloVe file missing at {glove_file_path}. Initializing randomly.")
-            return torch.tensor(weight_matrix, dtype=torch.float32)
-        glove_dict = {}
-        with open(glove_file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) == emb_dim + 1:
-                    glove_dict[parts[0]] = np.array(parts[1:], dtype=np.float32)
-        try:
-            torch.save(glove_dict, glove_cache_bin)
-        except Exception:
-            pass
-
-    for word, idx in vocab.stoi.items():
-        if word in glove_dict:
-            weight_matrix[idx] = glove_dict[word]
-    return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
-
 def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None, grad_accum_steps=1):
     model.train()
     epoch_loss = 0
@@ -338,13 +292,30 @@ def main():
     pretrained_src_emb, pretrained_trg_emb = None, None
     silent_logging = rank > 0
     
+    # Language-correct pretrained loading (see embeddings.py): English has real
+    # GloVe/Word2Vec releases; German/Swedish fall back to fastText Wikipedia
+    # vectors since no public German/Swedish GloVe or Word2Vec release exists here
+    # - the source and target vocab are now resolved to DIFFERENT files by language
+    # instead of both being mapped against one (usually English-only) file.
+    data_dir = os.path.join(ROOT_DIR, "data")
     if args.embedding_source == "word2vec":
-        pretrained_src_emb = generate_word2vec_embeddings(src_vocab, train_csv, args.src_lang, args.emb_dim, silent=silent_logging)
-        pretrained_trg_emb = generate_word2vec_embeddings(trg_vocab, train_csv, args.trg_lang, args.emb_dim, silent=silent_logging)
+        pretrained_src_emb = generate_word2vec_embeddings(
+            src_vocab, train_csv, lang=args.src_lang, emb_dim=args.emb_dim,
+            silent=silent_logging, token_type=args.token_type, data_dir=data_dir,
+        )
+        pretrained_trg_emb = generate_word2vec_embeddings(
+            trg_vocab, train_csv, lang=args.trg_lang, emb_dim=args.emb_dim,
+            silent=silent_logging, token_type=args.token_type, data_dir=data_dir,
+        )
     elif args.embedding_source == "glove":
-        glove_path = os.path.join(ROOT_DIR, "data", "glove.6B.300d.txt")
-        pretrained_src_emb = load_glove_embeddings(src_vocab, glove_path, 300, silent=silent_logging)
-        pretrained_trg_emb = load_glove_embeddings(trg_vocab, glove_path, 300, silent=silent_logging)
+        pretrained_src_emb = load_glove_embeddings(
+            src_vocab, emb_dim=300, silent=silent_logging,
+            token_type=args.token_type, glove_dir=data_dir, lang=args.src_lang,
+        )
+        pretrained_trg_emb = load_glove_embeddings(
+            trg_vocab, emb_dim=300, silent=silent_logging,
+            token_type=args.token_type, glove_dir=data_dir, lang=args.trg_lang,
+        )
         
     num_directions = 2 if args.bidirectional else 1
     encoder = Encoder(
