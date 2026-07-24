@@ -363,8 +363,18 @@ class BucketBatchSampler(Sampler):
             sorted_order = mega_batch[np.argsort(lengths[mega_batch])]
             for j in range(0, len(sorted_order), self.batch_size):
                 batch = sorted_order[j : j + self.batch_size]
-                if len(batch) == self.batch_size or not self.shuffle:
-                    batches.append(batch)
+                batches.append(batch)
+
+        # Drop a trailing partial batch when shuffling (standard drop_last
+        # behavior, keeps batch statistics stable) - but only if there is at
+        # least one other batch to fall back on. Since mega_batch_size is a
+        # multiple of batch_size, at most the very last batch overall can ever
+        # be partial. Unconditionally dropping any partial batch breaks any
+        # dataset smaller than batch_size (e.g. --mock mode's 8 sentences) -
+        # every batch is partial, so all get dropped and the DataLoader
+        # silently yields nothing.
+        if self.shuffle and len(batches) > 1 and len(batches[-1]) < self.batch_size:
+            batches.pop()
 
         if self.shuffle:
             random.shuffle(batches)
