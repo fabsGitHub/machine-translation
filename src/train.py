@@ -15,7 +15,8 @@ from torch.utils.data import Sampler, DataLoader, Subset
 
 from dataset import get_dataloader, PAD_IDX
 from models import Encoder, Decoder, Seq2Seq
-from utils import load_config, set_seed
+from config import load_config
+from utils import set_seed
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
