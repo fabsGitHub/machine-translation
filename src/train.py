@@ -68,6 +68,7 @@ def parse_args():
     parser.add_argument("--emb_dim", type=int, default=256)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--grad_accum_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--tf_ratio", type=float, default=0.5)
     parser.add_argument("--attention_type", type=str, default="none", choices=["none", "luong", "bahdanau"])
@@ -132,12 +133,14 @@ def load_glove_embeddings(vocab, glove_file_path, emb_dim, silent=False):
             weight_matrix[idx] = glove_dict[word]
     return torch.tensor(weight_matrix, dtype=torch.float32).share_memory_()
 
-def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None):
+def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio, scaler=None, grad_accum_steps=1):
     model.train()
     epoch_loss = 0
-    for src, trg in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    
+    for i, (src, trg) in enumerate(dataloader):
         src, trg = src.to(device, non_blocking=True), trg.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
+        
         if scaler is not None and device.type == "cuda":
             with torch.amp.autocast(device_type=device.type):
                 output = model(src, trg, teacher_forcing_ratio=tf_ratio)
@@ -149,14 +152,17 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
                 else:
                     output = output.reshape(-1, output_dim)
                     
-                trg = trg[:, 1:].reshape(-1)
-                loss = criterion(output, trg)
+                trg_eval = trg[:, 1:].reshape(-1)
+                loss = criterion(output, trg_eval) / grad_accum_steps
                 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            scaler.step(optimizer)
-            scaler.update()
+            
+            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(dataloader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
         else:
             output = model(src, trg, teacher_forcing_ratio=tf_ratio)
             output_dim = output.shape[-1]
@@ -167,13 +173,17 @@ def train_epoch(model, dataloader, optimizer, criterion, clip, device, tf_ratio,
             else:
                 output = output.reshape(-1, output_dim)
                 
-            trg = trg[:, 1:].reshape(-1)
-            loss = criterion(output, trg)
+            trg_eval = trg[:, 1:].reshape(-1)
+            loss = criterion(output, trg_eval) / grad_accum_steps
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            optimizer.step()
-        epoch_loss += loss.item()
+            
+            if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(dataloader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                
+        epoch_loss += loss.item() * grad_accum_steps
     
     total_loss = epoch_loss / len(dataloader)
     
@@ -200,8 +210,8 @@ def evaluate_validation(model, dataloader, criterion, device):
                     else:
                         output = output.reshape(-1, output_dim)
                         
-                    trg = trg[:, 1:].reshape(-1)
-                    loss = criterion(output, trg)
+                    trg_eval = trg[:, 1:].reshape(-1)
+                    loss = criterion(output, trg_eval)
             else:
                 output = model(src, trg, teacher_forcing_ratio=0.0)
                 output_dim = output.shape[-1]
@@ -211,8 +221,8 @@ def evaluate_validation(model, dataloader, criterion, device):
                 else:
                     output = output.reshape(-1, output_dim)
                     
-                trg = trg[:, 1:].reshape(-1)
-                loss = criterion(output, trg)
+                trg_eval = trg[:, 1:].reshape(-1)
+                loss = criterion(output, trg_eval)
             epoch_loss += loss.item()
             
     total_loss = epoch_loss / len(dataloader)
@@ -377,7 +387,8 @@ def main():
         print(f" ├─ Experiment ID:              {args.experiment}")
         print(f" ├─ Tokenizer Mode:             {args.token_type.upper()}")
         print(f" ├─ Micro-Batch Size (p/GPU):   {args.batch_size}")
-        print(f" ├─ Global Batch Size (Total):   {global_batch_size} sequence(s) across {world_size} rank(s)")
+        print(f" ├─ Grad Accumulation Steps:    {args.grad_accum_steps}")
+        print(f" ├─ Global Batch Size (Total):   {global_batch_size * args.grad_accum_steps} sequence(s) across {world_size} rank(s)")
         print(f" ├─ Single Char/Token ID Size:  {char_index_bytes} bytes (int64 tensor index)")
         print(f" ├─ Single Char Embedding Size: {char_emb_bytes} bytes (Emb={args.emb_dim} float32 vector)")
         print(f" ├─ Dynamic 'src' Tensor Shape: {list(sample_src.shape)} -> {src_mb:.6f} MB")
@@ -446,7 +457,10 @@ def main():
                 train_sampler.set_epoch(epoch)
                 val_sampler.set_epoch(epoch)
                 
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, args.clip, device, args.tf_ratio, scaler)
+            train_loss = train_epoch(
+                model, train_loader, optimizer, criterion, args.clip, device, 
+                args.tf_ratio, scaler, grad_accum_steps=args.grad_accum_steps
+            )
             val_loss = evaluate_validation(model, val_loader, criterion, device)
             
             loss_history["train"].append(train_loss)
