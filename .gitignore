@@ -24,3 +24,9 @@ data/glove.6B.300d.txt
 data/results/
 
 kaggle_dataset_staging
+# Per-machine hardware settings (batch size etc. differ per GPU) - not shared via git
+config/
+
+# Large pretrained embedding vectors - never commit
+data/*.vec
+data/*.bin

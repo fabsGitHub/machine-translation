@@ -39,8 +39,20 @@ eval_lock = threading.Lock()
 
 
 def get_batch_size(study, token_type):
-    """Centralized handler for batch size configuration across studies and token levels."""
-    config_batch = config.get('training', {}).get('batch_size')
+    """Centralized handler for batch size configuration across studies and token levels.
+
+    Resolution order: per-token-type override (batch_size_word/batch_size_char) ->
+    generic override (batch_size) -> hardware-agnostic hardcoded default. This lets each
+    machine keep its own local config/config.yaml (e.g. smaller batches on 8GB cards)
+    without touching shared code that other machines rely on.
+    """
+    training_cfg = config.get("training", {})
+
+    per_type_batch = training_cfg.get(f"batch_size_{token_type}")
+    if per_type_batch is not None:
+        return str(per_type_batch)
+
+    config_batch = training_cfg.get("batch_size")
     if config_batch is not None:
         return str(config_batch)
 

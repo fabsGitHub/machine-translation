@@ -313,8 +313,15 @@ def _cache_single_pair(src, trg, processed_dir, token_type):
                 trg_vocab=train_ds.trg_vocab,
             )
 
-        # Precompute and disk-cache resulting embedding matrices
-        if token_type in ["word", "both"]:
+        # Precompute and disk-cache resulting embedding matrices.
+        # NOTE: this precomputes matrices from the huge pretrained wiki.*.vec /
+        # GoogleNews.bin files, which train.py currently does NOT consume (it has
+        # its own separate on-the-fly Word2Vec generator - see train.py's local
+        # generate_word2vec_embeddings). Loading those multi-GB files via gensim
+        # takes 10+ minutes and several GB of RAM regardless of dataset size, so
+        # this is opt-in only (config: data.precompute_word2vec_cache: true).
+        precompute_enabled = load_config().get("data", {}).get("precompute_word2vec_cache", False)
+        if token_type in ["word", "both"] and precompute_enabled:
             matrix_cache_dir = os.path.join(processed_dir, ".matrix_cache")
             os.makedirs(matrix_cache_dir, exist_ok=True)
 

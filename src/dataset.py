@@ -1,3 +1,4 @@
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import os
 import random
@@ -6,7 +7,17 @@ import pandas as pd
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, Sampler
-torch.set_num_threads(1)
+from config import load_config
+
+
+def _worker_init_fn(_worker_id):
+    # Cap intra-op threads *inside DataLoader worker processes only* - without this,
+    # each forked worker independently tries to use all CPU cores for its own tensor
+    # ops, and num_workers copies of that compete for the same physical cores. The
+    # main training process must stay unrestricted (it does the actual GPU dispatch
+    # and any CPU-side collation), which a process-wide torch.set_num_threads(1)
+    # at import time would have also throttled.
+    torch.set_num_threads(1)
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
@@ -24,14 +35,16 @@ def pad_vocab_size(size, multiple=16):
 
 
 def _build_vocab_worker(chunk, token_type):
-    unique_tokens = set()
+    """Returns token->frequency counts (not just a unique set) so build_vocab
+    can rank and cap the vocabulary by frequency across worker chunks."""
+    counts = Counter()
     if token_type == "char":
         for sentence in chunk:
-            unique_tokens.update(str(sentence).strip())
+            counts.update(str(sentence).strip())
     else:
         for sentence in chunk:
-            unique_tokens.update(str(sentence).strip().split())
-    return unique_tokens
+            counts.update(str(sentence).strip().split())
+    return counts
 
 
 def _numericalize_chunk_worker(
@@ -80,9 +93,10 @@ def _numericalize_chunk_worker(
 
 class Vocabulary:
 
-    def __init__(self, token_type="word", pad_multiple=16):
+    def __init__(self, token_type="word", pad_multiple=16, max_size=None):
         self.token_type = token_type
         self.pad_multiple = pad_multiple
+        self.max_size = max_size
         self.itos = {
             PAD_IDX: PAD_TOKEN,
             UNK_IDX: UNK_TOKEN,
@@ -111,6 +125,8 @@ class Vocabulary:
 
     def build_vocab(self, sentence_list):
         num_sentences = len(sentence_list)
+        total_counts = Counter()
+
         if num_sentences >= 10000:
             num_workers = min(32, os.cpu_count() or 16)
             chunk_size = (num_sentences + num_workers - 1) // num_workers
@@ -126,22 +142,21 @@ class Vocabulary:
                     )
                     for chunk in chunks
                 ]
-                all_unique = set()
                 for future in futures:
-                    all_unique.update(future.result())
-
-            for token in all_unique:
-                if token not in self.stoi:
-                    idx = len(self.itos)
-                    self.stoi[token] = idx
-                    self.itos[idx] = token
+                    total_counts.update(future.result())
         else:
             for sentence in sentence_list:
-                for token in self.tokenize(sentence):
-                    if token not in self.stoi:
-                        idx = len(self.itos)
-                        self.stoi[token] = idx
-                        self.itos[idx] = token
+                total_counts.update(self.tokenize(sentence))
+
+        # Rank by frequency so max_size truncation (if set) keeps the most useful
+        # tokens and drops the long tail (typos, one-off names/numbers) into <UNK>
+        # instead of growing the embedding/output-projection layers unboundedly.
+        ranked_tokens = [tok for tok, _ in total_counts.most_common(self.max_size)]
+        for token in ranked_tokens:
+            if token not in self.stoi:
+                idx = len(self.itos)
+                self.stoi[token] = idx
+                self.itos[idx] = token
 
     def numericalize(self, text):
         tokenized = self.tokenize(text)
@@ -201,14 +216,16 @@ class PretokenizedNMTDataset(Dataset):
         trg_texts = df[trg_lang].astype(str).tolist()
         del df
 
+        max_vocab_size = load_config().get("data", {}).get("max_vocab_size", 30000)
+
         if src_vocab is None:
-            self.src_vocab = Vocabulary(token_type)
+            self.src_vocab = Vocabulary(token_type, max_size=max_vocab_size)
             self.src_vocab.build_vocab(src_texts)
         else:
             self.src_vocab = src_vocab
 
         if trg_vocab is None:
-            self.trg_vocab = Vocabulary(token_type)
+            self.trg_vocab = Vocabulary(token_type, max_size=max_vocab_size)
             self.trg_vocab.build_vocab(trg_texts)
         else:
             self.trg_vocab = trg_vocab
@@ -375,8 +392,19 @@ def get_dataloader(
     src_lang="de",
     trg_lang="en",
     token_type="word",
-    num_workers=8,
+    num_workers=None,
 ):
+    if num_workers is None:
+        configured = load_config().get("data", {}).get("num_workers")
+        if configured is not None:
+            num_workers = int(configured)
+        else:
+            # Leave a core free for the main process/OS; cap the upper end since
+            # returns diminish past a dozen or so workers for this dataset's light
+            # per-batch collation cost. Override via data.num_workers in config.yaml
+            # if a specific machine benefits from going higher/lower.
+            num_workers = max(1, min((os.cpu_count() or 4) - 1, 12))
+
     dataset = PretokenizedNMTDataset(
         csv_path=csv_path,
         src_lang=src_lang,
@@ -398,6 +426,7 @@ def get_dataloader(
             pin_memory=True,
             prefetch_factor=4 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
+            worker_init_fn=_worker_init_fn if num_workers > 0 else None,
         )
     else:
         loader = DataLoader(
@@ -409,6 +438,7 @@ def get_dataloader(
             pin_memory=True,
             prefetch_factor=4 if num_workers > 0 else None,
             persistent_workers=True if num_workers > 0 else False,
+            worker_init_fn=_worker_init_fn if num_workers > 0 else None,
         )
 
     return loader, dataset.src_vocab, dataset.trg_vocab

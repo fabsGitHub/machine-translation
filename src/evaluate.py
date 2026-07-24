@@ -22,7 +22,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.append(SCRIPT_DIR)
 
-from dataset import get_dataloader, PAD_IDX, SOS_IDX, EOS_IDX
+from dataset import get_dataloader, PAD_IDX, SOS_IDX, EOS_IDX, UNK_IDX
 from models import Encoder, Decoder, Seq2Seq
 from config import load_config
 
@@ -94,7 +94,9 @@ def translate_sentence(model, src_tokens, src_vocab, trg_vocab, device, max_len=
     model.eval()
 
     # Numericalize source
-    if hasattr(src_vocab, '__getitem__'):
+    if hasattr(src_vocab, 'stoi'):
+        src_indices = [SOS_IDX] + [src_vocab.stoi.get(tok, UNK_IDX) for tok in src_tokens] + [EOS_IDX]
+    elif hasattr(src_vocab, '__getitem__'):
         src_indices = [SOS_IDX] + [src_vocab[tok] if tok in src_vocab else src_vocab.get('<unk>', 0) for tok in src_tokens] + [EOS_IDX]
     else:
         src_indices = [SOS_IDX] + [src_vocab.get(tok, 0) for tok in src_tokens] + [EOS_IDX]
@@ -102,17 +104,31 @@ def translate_sentence(model, src_tokens, src_vocab, trg_vocab, device, max_len=
     src_tensor = torch.LongTensor(src_indices).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        if hasattr(model.encoder, 'get_encoder'):
-            encoder_outputs, hidden = model.encoder(src_tensor)
-        else:
-            encoder_outputs, hidden = model.encoder(src_tensor)
+        encoder_outputs, hidden = model.encoder(src_tensor)
+        # Bidirectional encoder hidden states must be bridged into the decoder's
+        # expected shape before decoding - Seq2Seq.forward() does this internally,
+        # but calling model.encoder(...) directly here bypasses that step.
+        hidden = model._bridge_hidden(hidden)
 
         trg_indexes = [SOS_IDX]
         attentions = []
 
+        # Pre-compute Bahdanau's encoder projection once (forward_step would otherwise
+        # recompute it on every single decoding step).
+        proj_enc = (
+            model.decoder.attention.U_a(encoder_outputs)
+            if getattr(model.decoder, 'attention_type', None) == 'bahdanau'
+            else None
+        )
+
         for _ in range(max_len):
             trg_tensor = torch.LongTensor([trg_indexes[-1]]).to(device)
-            output, hidden, attn = model.decoder(trg_tensor, hidden, encoder_outputs)
+            # Decoder.forward() expects a full [batch, seq_len] teacher-forced target
+            # sequence (used during training); single-token greedy decoding must go
+            # through forward_step() instead.
+            output, hidden, attn = model.decoder.forward_step(
+                trg_tensor, hidden, encoder_outputs, proj_enc_outputs=proj_enc
+            )
 
             if attn is not None:
                 attentions.append(attn.squeeze(0).cpu().detach().numpy())
@@ -266,8 +282,11 @@ def evaluate_checkpoint(checkpoint_path, max_samples=1000, device=None):
     if not os.path.exists(test_csv):
         test_csv = os.path.join(processed_dir, "val.csv")
 
+    global_cfg = load_config()
+    eval_batch_size = global_cfg.get("training", {}).get("eval_batch_size", 32)
+
     test_loader, _, _ = get_dataloader(
-        test_csv, batch_size=32, shuffle=False,
+        test_csv, batch_size=eval_batch_size, shuffle=False,
         src_vocab=src_vocab, trg_vocab=trg_vocab,
         src_lang=src_lang, trg_lang=trg_lang, token_type=token_type
     )

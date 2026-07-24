@@ -406,12 +406,22 @@ def main():
         else:
             model = nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
         
-    if hasattr(torch, "compile"):
+    # Triton (torch.compile's default backend) hard-requires CUDA compute capability
+    # >= 7.0 - on older GPUs (e.g. Pascal GTX 10-series, CC 6.1) it doesn't warn and
+    # fall back, it raises GPUTooOldForTriton on the first forward pass, which is
+    # *after* this try/except has already exited. Gate on capability first instead
+    # of relying on the try/except to catch a failure it structurally cannot catch.
+    supports_compile = hasattr(torch, "compile") and (
+        device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 7
+    )
+    if supports_compile:
         try:
             model = torch.compile(model, dynamic=True)
         except Exception as e:
             if rank == 0:
                 print(f"⚠️ torch.compile skipped or failed: {e}")
+    elif rank == 0 and hasattr(torch, "compile") and device.type == "cuda":
+        print("ℹ️ torch.compile skipped: GPU compute capability < 7.0 (no Triton support).")
         
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)

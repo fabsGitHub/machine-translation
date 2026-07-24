@@ -7,11 +7,12 @@ DEFAULT_CONFIG = {
         "float32_matmul_precision": "high",
     },
     "data": {
-        "sample_rate": 0.001,
+        "sample_rate": 0.1,  # PDF requires a random 10% sample for training
         "test_split": 0.1,
         "seed": 42,
         "max_word_len": 50,
         "max_char_len": 300,
+        "max_vocab_size": 30000,
         "raw_dir": "data/raw",
         "processed_dir": "data/processed",
         "num_workers": 4,
