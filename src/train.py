@@ -482,19 +482,29 @@ def main():
                     
                     with open(config_json_path, 'w') as f:
                         json.dump(config_dict, f, indent=4)
-            else:
-                if rank == 0:
-                    print(f"🛑 Early stopping triggered: Loss did not improve from {best_val_loss:.4f}.")
-                    try:
-                        if os.path.exists(config_json_path):
-                            with open(config_json_path, 'r') as f:
-                                c_data = json.load(f)
-                            c_data["loss_history"] = loss_history
-                            with open(config_json_path, 'w') as f:
-                                json.dump(c_data, f, indent=4)
-                    except Exception:
-                        pass
-                break
+            elif rank == 0:
+                # No early stop: epoch budgets here (4-10) are already short, so a
+                # single noisy non-improving epoch (common before the loss curve
+                # settles, with no LR warmup/decay in play) shouldn't cost most of
+                # the run - and Study A-E compare configs head-to-head, so every
+                # config needs the SAME number of epochs for the comparison to be
+                # fair. Keep training the full budget; only the best-val-loss
+                # checkpoint above gets saved/used downstream.
+                print(f"↪️ No improvement this epoch (best remains {best_val_loss:.4f}). Continuing - training the full requested budget regardless.")
+
+        # Sync the complete per-epoch history (including any epochs after the
+        # last improvement) into the saved config, so best_config_*.json reflects
+        # the whole run rather than stopping at the last checkpoint save.
+        if rank == 0 and os.path.exists(config_json_path):
+            try:
+                with open(config_json_path, 'r') as f:
+                    c_data = json.load(f)
+                c_data["loss_history"] = loss_history
+                c_data["epochs_trained"] = len(loss_history["train"])
+                with open(config_json_path, 'w') as f:
+                    json.dump(c_data, f, indent=4)
+            except Exception:
+                pass
 
     if rank == 0:
         if os.path.exists(checkpoint_path) and not args.experiment.startswith("TUNE_"):
